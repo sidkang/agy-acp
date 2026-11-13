@@ -46,6 +46,9 @@ import {
 /** Header carrying the caller's opaque session id (used for ACP session reuse). */
 export const SESSION_ID_HEADER = "x-agy-session-id";
 
+/** Magpie gateway's own session header, accepted as a fallback for `SESSION_ID_HEADER`. */
+export const ALT_SESSION_ID_HEADER = "x-magpie-session";
+
 /** Header carrying an explicit effort override (lowest-precedence explicit source). */
 export const EFFORT_HEADER = "x-magpie-effort";
 
@@ -959,8 +962,9 @@ export function parseAnthropicRequest(
     }
   }
 
-  const sessionIdHeader = headerValue(SESSION_ID_HEADER);
-  const sessionId = sessionIdHeader === null ? null : nonEmptyString(sessionIdHeader);
+  const sessionId =
+    nonEmptyString(headerValue(SESSION_ID_HEADER)) ??
+    nonEmptyString(headerValue(ALT_SESSION_ID_HEADER));
 
   // Subagent / workdir are Claude Code tool-loop context: forwarded, never required.
   // Magpie percent-encodes `X-Magpie-Work-Dir` (`url.PathEscape(dir)`); decode once here.
@@ -1801,7 +1805,10 @@ export async function collectAnthropicJsonResponse(
     }
   }
 
-  if (content.length === 0 && stopReason === "end_turn") {
+  const hasTextOrToolBlock = content.some(
+    (b) => b.type === "text" || b.type === "tool_use",
+  );
+  if (!hasTextOrToolBlock && stopReason === "end_turn") {
     content.push({ type: "text", text: "" });
   }
 

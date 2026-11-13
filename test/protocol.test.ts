@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  ALT_SESSION_ID_HEADER,
   ALT_SUBAGENT_HEADER,
   collectAnthropicJsonResponse,
   createSyntheticThinkingSignature,
@@ -1084,9 +1085,20 @@ describe("parseAnthropicRequest: tools", () => {
 describe("parseAnthropicRequest: session & metadata", () => {
   test("session id header is trimmed, blank headers become null", () => {
     expect(SESSION_ID_HEADER).toBe("x-agy-session-id");
+    expect(ALT_SESSION_ID_HEADER).toBe("x-magpie-session");
     expect(parse(requestBody(), {}, { [SESSION_ID_HEADER]: "  sess-1  " }).sessionId).toBe("sess-1");
     expect(parse(requestBody(), {}, { [SESSION_ID_HEADER]: "   " }).sessionId).toBe(null);
     expect(parse(requestBody()).sessionId).toBe(null);
+    expect(parse(requestBody(), {}, { [ALT_SESSION_ID_HEADER]: "  magpie-sess-1  " }).sessionId).toBe(
+      "magpie-sess-1",
+    );
+    expect(
+      parse(
+        requestBody(),
+        {},
+        { [SESSION_ID_HEADER]: "primary-sess", [ALT_SESSION_ID_HEADER]: "fallback-sess" },
+      ).sessionId,
+    ).toBe("primary-sess");
   });
 
   test("metadata.user_id and max_tokens are forwarded", () => {
@@ -1922,6 +1934,24 @@ describe("collectAnthropicJsonResponse", () => {
     expect(response.status).toBe(401);
     expect(response.headers.get(SIGN_IN_HEADER)).toBe("expired");
     expect(asRecord((await readJson(response)).error).message).toBe("re-auth required");
+  });
+
+  test("thinking-only end_turn stream appends a trailing empty text block", async () => {
+    const response = await collectAnthropicJsonResponse(
+      MODEL,
+      streamOf([
+        { type: "thinking_delta", thinking: "pondering" },
+        { type: "thinking_signature", signature: "sig-only" },
+        { type: "finish", stopReason: "end_turn", usage: USAGE },
+      ]),
+    );
+    expect(response.status).toBe(200);
+    const body = await readJson(response);
+    expect(body.stop_reason).toBe("end_turn");
+    expect(body.content).toEqual([
+      { type: "thinking", thinking: "pondering", signature: "sig-only" },
+      { type: "text", text: "" },
+    ]);
   });
 });
 

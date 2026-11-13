@@ -117,8 +117,8 @@ async function AntigravityMagpiePlugin(
   const getCoordinator = (): SessionCoordinator => {
     if (!coordinator) {
       const scheduler = new GlobalScheduler({
-        maxGlobalWorkers: positiveInt(pkgOptions?.maxGlobalWorkers),
-        maxPerAccountWorkers: positiveInt(pkgOptions?.maxPerAccountWorkers),
+        maxGlobalWorkers: positiveInt(pkgOptions?.maxGlobalWorkers) ?? 36,
+        maxPerAccountWorkers: positiveInt(pkgOptions?.maxPerAccountWorkers) ?? 18,
         idleTimeoutMs:
           positiveInt(pkgOptions?.idleTimeoutMs) ??
           positiveInt(pkgOptions?.idleTtlMs),
@@ -154,7 +154,7 @@ async function AntigravityMagpiePlugin(
     auth: {
       provider: PROVIDER_ID,
       single: false,
-      maxConcurrency: 16,
+      maxConcurrency: 36,
       maxAccounts: 0,
       options: buildProviderOptionSchemas(pkgOptions),
       importFrom: IMPORT_FROM_EN,

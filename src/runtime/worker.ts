@@ -24,6 +24,7 @@ import {
 import {
   settleStepUsage,
   readConversationStepUsages,
+  resolveConversationDbPath,
 } from "../usage/step-usage";
 import {
   spawnAgy,
@@ -69,7 +70,9 @@ export interface WorkerOptions {
   cloakPrompts?: boolean;
   workDir?: string;
   resumeSessionId?: string;
+  resumeSystemHistorySeed?: string;
   systemPrompt?: string;
+  systemHistorySeed?: string;
   tools?: Array<{
     name: string;
     description?: string;
@@ -237,12 +240,12 @@ function sweepStaleWorkspacesOnce(): void {
 }
 
 function buildWorkDirDisambiguationNote(callerWorkDir: string): string {
-  return `The caller's working directory is ${JSON.stringify(callerWorkDir)}. The environment the caller describes (working directory, platform, OS, shell, git status) is where every tool runs. The bridge's temporary workspace only holds its agent configuration; where an environment given elsewhere in this conversation differs, go by the caller's instructions without checking.`;
+  return `The caller's working directory is ${JSON.stringify(callerWorkDir)}. The environment the caller describes (working directory, platform, OS, shell, git status) is where every tool runs. The bridge's temporary workspace only holds its agent configuration; where an environment given elsewhere in this conversation differs, go by the caller's instructions without checking. Never write artifacts, reports, or scratch files to <appDataDir>/brain on the bridge host; all file reads and writes must target the caller's workspace through the provided tools.`;
 }
 
 export class AgySessionWorker {
   readonly account: AccountDescriptor;
-  readonly sessionId: string;
+  sessionId: string;
   workspaceDir: string = "";
   readonly workDir?: string;
   readonly minimalAgent: boolean;
@@ -275,6 +278,8 @@ export class AgySessionWorker {
     inputSchema: Record<string, unknown>;
   }> = [];
   systemPrompt?: string;
+  systemHistorySeedApplied: boolean = false;
+  appliedSystemHistorySeed?: string;
 
   readonly activeAcpToolCallIds = new Set<string>();
   pinned: boolean = false;
@@ -407,7 +412,7 @@ export class AgySessionWorker {
         "inheritCustomizations: false",
         `excludeDefaultComponents: ${minimalAgent ? "true" : "false"}`,
         "---",
-        "Use only the provided MCP tools when tools are needed. Never output raw XML/JSON tool-call markup as text.",
+        "Use only the provided MCP tools when tools are needed. Never output raw XML/JSON tool-call markup as text. Never write artifacts, reports, or scratch files to <appDataDir>/brain or the bridge's temporary workspace; write files only in the caller's workspace when requested.",
         "",
       ].join("\n");
       fs.writeFileSync(path.join(agentDir, "agent.md"), agentContent, "utf-8");
@@ -580,17 +585,28 @@ export class AgySessionWorker {
             cwd: this.workspaceDir,
             mcpServers: [{ name: "magpie", type: "http", url: this.mcpUrl }],
           };
-          if (this.appendSystemSupported && effectiveSystem) {
-            resumeParams._meta = {
-              antigravity: {
-                systemPrompt: {
-                  append: effectiveSystem,
+          if (this.appendSystemSupported) {
+            const resumeSystem = [
+              effectiveSystem,
+              this.options.resumeSystemHistorySeed,
+            ]
+              .filter(Boolean)
+              .join("\n\n");
+            if (resumeSystem) {
+              resumeParams._meta = {
+                antigravity: {
+                  systemPrompt: {
+                    append: resumeSystem,
+                  },
                 },
-              },
-            };
+              };
+            }
           }
           sessionRes = await this.conn.request("session/resume", resumeParams);
           this.resumedFromShelf = true;
+          if (this.appendSystemSupported && this.options.resumeSystemHistorySeed) {
+            this.appliedSystemHistorySeed = this.options.resumeSystemHistorySeed;
+          }
           this.nativeSessionId =
             sessionRes?.sessionId || this.options.resumeSessionId;
           const priorSteps = readConversationStepUsages(
@@ -611,14 +627,26 @@ export class AgySessionWorker {
           mcpServers: [{ name: "magpie", type: "http", url: this.mcpUrl }],
         };
 
-        if (this.appendSystemSupported && effectiveSystem) {
-          newParams._meta = {
-            antigravity: {
-              systemPrompt: {
-                append: effectiveSystem,
+        if (this.appendSystemSupported) {
+          const newSessionSystem = [
+            effectiveSystem,
+            this.options.systemHistorySeed,
+          ]
+            .filter(Boolean)
+            .join("\n\n");
+          if (newSessionSystem) {
+            newParams._meta = {
+              antigravity: {
+                systemPrompt: {
+                  append: newSessionSystem,
+                },
               },
-            },
-          };
+            };
+          }
+          if (this.options.systemHistorySeed) {
+            this.systemHistorySeedApplied = true;
+            this.appliedSystemHistorySeed = this.options.systemHistorySeed;
+          }
         }
 
         try {
@@ -878,7 +906,9 @@ export class AgySessionWorker {
   }
 
   private handleBatchReady(calls: ExposedToolCall[]): void {
-    if (!this.activeTurnQueue) return;
+    const q = this.activeTurnQueue;
+    if (!q) return;
+    this.activeTurnQueue = null;
 
     // 1. If thinking accumulated, yield thinking signature
     if (
@@ -889,13 +919,13 @@ export class AgySessionWorker {
         this.sessionId,
         this.currentThinkingAccumulator,
       );
-      this.activeTurnQueue.push({ type: "thinking_signature", signature });
+      q.push({ type: "thinking_signature", signature });
     }
     this.currentThinkingAccumulator = "";
 
     // 2. Yield tool_use events
     for (const call of calls) {
-      this.activeTurnQueue.push({
+      q.push({
         type: "tool_use",
         id: call.id,
         name: call.name,
@@ -907,33 +937,60 @@ export class AgySessionWorker {
     this.promptStepCount++;
     this.setState("AWAITING_TOOL_RESULTS");
 
-    // 4. Read exact per-step usage from agy's SQLite gen_metadata if already flushed
+    // 4. Settle per-step usage from agy's SQLite WAL (with micro-backoff if the
+    // conversation DB exists on disk and the current step WAL frame is mid-flush)
+    void this.settleAndCloseBatchTurn(q);
+  }
+
+  private async settleAndCloseBatchTurn(
+    q: AsyncEventQueue<TurnStreamEvent>,
+  ): Promise<void> {
     let toolStepUsage: TokenUsageSummary = {
       inputTokens: 0,
       outputTokens: 0,
       cacheReadInputTokens: 0,
       cacheCreationInputTokens: 0,
     };
-    const dbSteps = readConversationStepUsages(
-      this.account,
-      this.nativeSessionId,
-    ).filter((s) => s.idx > this.lastReportedStepIdx);
-    if (dbSteps.length > 0) {
-      const latest = dbSteps[dbSteps.length - 1]!;
-      this.lastReportedStepIdx = latest.idx;
-      toolStepUsage = settleStepUsage(undefined, 1, [latest]);
+    try {
+      let dbSteps = readConversationStepUsages(
+        this.account,
+        this.nativeSessionId,
+      ).filter((s) => s.idx > this.lastReportedStepIdx);
+
+      if (dbSteps.length === 0) {
+        const dbPath = resolveConversationDbPath(
+          this.account,
+          this.nativeSessionId,
+        );
+        if (dbPath && fs.existsSync(dbPath)) {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            if (this._state === "CLOSED") break;
+            await new Promise((r) => setTimeout(r, 25));
+            dbSteps = readConversationStepUsages(
+              this.account,
+              this.nativeSessionId,
+            ).filter((s) => s.idx > this.lastReportedStepIdx);
+            if (dbSteps.length > 0) break;
+          }
+        }
+      }
+
+      if (dbSteps.length > 0) {
+        const latest = dbSteps[dbSteps.length - 1]!;
+        this.lastReportedStepIdx = latest.idx;
+        toolStepUsage = settleStepUsage(undefined, 1, [latest]);
+      }
+    } catch {}
+
+    try {
+      q.push({
+        type: "finish",
+        stopReason: "tool_use",
+        usage: toolStepUsage,
+      });
+    } finally {
+      q.close();
     }
-
-    this.activeTurnQueue.push({
-      type: "finish",
-      stopReason: "tool_use",
-      usage: toolStepUsage,
-    });
-
-    // 5. Close the active HTTP turn queue WITHOUT cancelling session/prompt!
-    const q = this.activeTurnQueue;
-    this.activeTurnQueue = null;
-    q.close();
   }
 
   async applyModelSelection(

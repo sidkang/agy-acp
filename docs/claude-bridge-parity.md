@@ -9,8 +9,8 @@
 | 维度                            | Magpie 官方 `claude_subscription`                                                          | `agy-acp` 实现                                                                                                                                          |
 | ------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 开关名称与默认值                | `ClaudeLeanPrompt`（默认 **`false` 关闭**）                                                | `minimal_agent`（默认 **`false` 关闭**）                                                                                                                |
-| **保留原生提示词（默认）**      | 保留 Claude Code 内置系统提示词（约 ~1.1K tokens），上游看到的请求形态与真人交互式运行一致 | 隔离 Agent 配置 `excludeDefaultComponents: false`，保留 `agy` 原生组件（约 ~8.4K tokens，第 2 步起 86%~90% 走 Prompt Cache 命中），保持完整原生请求指纹 |
-| **精简/禁用原生提示词（开启）** | 传 `--system-prompt-file` 替换内置系统提示词，仅保留最小身份头与调用方提示词               | 设 `excludeDefaultComponents: true`，剥离 `agy` 内置组件，仅剩桥接的一行工具说明 + 调用方提示词（首步系统提示词降至 ~500 tokens）                       |
+| **保留原生提示词（默认）**      | 保留 Claude Code 内置系统提示词（约 ~1.1K tokens），上游看到的请求形态与真人交互式运行一致 | 隔离 Agent 配置 `excludeDefaultComponents: false`，保留 `agy` 原生组件（实测纯系统提示词约 ~1,991 tokens，第 2 步起 86%~96% 走 Prompt Cache 命中），保持完整原生请求指纹 |
+| **精简/禁用原生提示词（开启）** | 传 `--system-prompt-file` 替换内置系统提示词，仅保留最小身份头与调用方提示词               | 设 `excludeDefaultComponents: true`，剥离 `agy` 内置组件，仅剩桥接工具说明 + 调用方提示词（实测纯系统提示词降至 ~389 tokens，节省约 1.6K tokens）                       |
 | **动态切换隔离**                | `run.lean != req.leanPrompt` 时拒绝复用旧进程，立即重建会话                                | `worker.minimalAgent !== requestedMinimalAgent` 时立即关闭旧 Worker 并跳过异构冷会话缓存，按新模式重建                                                  |
 
 ---
@@ -38,7 +38,7 @@
 | 参数 / 机制                       | Magpie 官方 `claude_subscription`                                             | `agy-acp` 实现                                                                                                                                                                                                                                                                                                                                                                                                 |
 | --------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **热空闲超时（`idleTimeoutMs`）** | **`1 小时`**（`idleLongest = time.Hour`，对齐 1h Prompt Cache 窗口，`#463`）  | **`1 小时`**（`3,600,000 ms`，可在插件 Options 覆盖）                                                                                                                                                                                                                                                                                                                                                          |
-| **每账号热进程上限**              | `idleMost = 6`                                                                | `maxPerAccountWorkers = 6`（全局上限 `maxGlobalWorkers = 16`）                                                                                                                                                                                                                                                                                                                                                 |
+| **每账号热进程上限**              | `idleMost = 6`                                                                | `maxPerAccountWorkers = 18`（全局上限 `maxGlobalWorkers = 36`，`maxConcurrency = 36`）                                                                                                                                                                                                                                                                                                                         |
 | **挂起工具等待超时**              | `parkLongest = 5m`（最多保留 `parkedMost = 16`）                              | `awaitingToolTimeoutMs = 10m`（客户端中断未交 `tool_result` 自动回收）                                                                                                                                                                                                                                                                                                                                         |
 | **冷会话架（`parkedSessions`）**  | 落盘会话供 `--resume` 续接                                                    | 内存仅存轻量索引供 `session/resume`：**TTL 6 小时 + 最多 32 条 + 单会话 ≤ 4 MiB + 总预算 ≤ 16 MiB**（超大图会话冷却后立即释放堆内存）                                                                                                                                                                                                                                                                          |
 | **孤儿进程与临时目录清理**        | `proc.StartTree`（Unix Session / Windows Job）整树回收 + 启动清扫超时临时目录 | 1. `detached: false` 保持在 Magpie `StartTree` 进程组内，宿主遭 `SIGKILL` 时随组一并回收；<br>2. 单 Worker 关闭时按父子 PID 树自底向上清理后代进程；<br>3. 同时监听 `process.once("exit")` / `SIGINT` / `SIGTERM`（覆盖 `host.js` `stdin` 关闭时的 `process.exit(0)`），连短命 `/usage`、`models` 探测子进程与临时目录一并同步回收；<br>4. 临时目录写入 `.owner-pid`，启动及每分钟巡检自动清扫死进程遗留目录。 |
@@ -54,8 +54,8 @@
    - `subagent: false`：禁用内置子代理派生；
    - `inheritMcp: false` & `inheritCustomizations: false`：彻底隔离宿主机用户全局配置的 MCP、Skills 与 Hooks。
 2. **ACP 客户端能力硬关闭**：`initialize` 显式上报 `fs: { readTextFile: false, writeTextFile: false }, terminal: false`。
-3. **权限请求兜底拒绝（`src/runtime/acp-connection.ts`）**：任何 `session/request_permission` 请求一律自动选择 `reject/deny`（无拒绝项则返回 `cancelled`）。
-4. **物理目录隔离**：`agy` 进程的 `cwd` 始终锁定在空临时目录 `$TMPDIR/agy-magpie-ws-*`，绝不在用户真实工作目录启动。
+3. **权限请求按结构化工具身份精准鉴权（`src/runtime/worker.ts` & `src/runtime/acp-connection.ts`）**：仅当 `session/request_permission` 结构化字段确认是本桥挂载的 `magpie` MCP 工具时才自动放行 `allow_once`，任何内置工具、终端或未知来源权限请求一律自动 `reject/deny`（无拒绝项则返回 `cancelled`）。
+4. **物理目录隔离与跨机 Brain 写入禁令**：`agy` 进程的 `cwd` 始终锁定在空临时目录 `$TMPDIR/agy-magpie-ws-*`，并在 Agent Manifest 与工作目录消歧指令中明确禁止向桥接机本地 `<appDataDir>/brain` 落盘，所有文件操作仅通过客户端 MCP 工具在调用方机器执行。
 
 ---
 
@@ -69,7 +69,9 @@
 - **仅在完整终态提交会话账本与端到端取消联动**：仅当流正常收到 `finish` 终态事件时才更新 `committedMessages`，中途错误或客户端中断（含 `ReadableStream.cancel()`）会立即触发 `AbortController` 取消底层 ACP 回合并淘汰状态存疑的半截 Worker；同时为 `session/prompt` 配置 30 分钟看门狗超时。
 - **Pi / Claude Code 交互边界恢复**：支持工具执行中途 `steer` 打断（带 `promptSeq` 纪元隔离与取消超时自动重放）、`followUp` 续跑、工具后自动 `/compact` 压缩重开，以及 112 KiB 预算下保头保尾裁剪 `<conversation>`。
 - **结构化输出（`output_config.format` / `response_format`）**：支持 `json_schema` 与 `json_object` 格式约束注入（兼容 Claude Code Prompt Hooks）。
-- **WAL SQLite 逐 Step 用量与缓存读取**：通过只读 URI（Checkpointed WAL 自动走 `?immutable=1`）读取 `gen_metadata`，在 `tool_use` 与 `end_turn` 每一步精确上报 `input_tokens`、`output_tokens` 与 `cache_read_input_tokens`。
+- **超长冷会话无损衔接（`_meta.antigravity.systemPrompt.append` 溢出承载）**：`agy acp` 对单次 `session/prompt` 用户消息存在 128 KiB 截断上限，而 `session/new` 的 `_meta.antigravity.systemPrompt.append` 无此限制且享受上游 Prompt Cache（次轮缓存命中率 ~96.7%）。当冷启动历史超出 112 KiB `session/prompt` 预算时，自动将更早轮次溢出注入 `<prior_conversation_history>` 系统追加块（1M 模型最高 2 MiB，保留完整上下文不断裂），并在 `session/resume` 冷却恢复时同步保持。
+- **首轮动态会话 ID 切换热续接与存储过期清理**：当客户端未显式传会话头、网关合成会话 ID 在首轮 `tool_use` 与次轮 `tool_result` 之间稳定化切换时，按挂起的 96-bit `toolu_*` 调用 ID 与账本前缀精准重绑原 `AWAITING_TOOL_RESULTS` Worker，避免槽位泄漏引发 `503`；同时每小时自动清扫各账号下超过 48 小时且未活跃/未停靠的 `conversations/*.db*`、`brain/*` 与 `log/*.log`。
+- **WAL SQLite 逐 Step 用量与缓存读取**：通过只读 URI（Checkpointed WAL 自动走 `?immutable=1`，配合落盘微退避等待）读取 `gen_metadata`，在 `tool_use` 与 `end_turn` 每一步精确上报 `input_tokens`、`output_tokens` 与 `cache_read_input_tokens`。
 
 ### 后续可选演进项
 

@@ -9,9 +9,11 @@ import {
   getBrowserShimDir,
   getPluginDataRoot,
   killProcessTree,
+  readStoredAgyOAuthCredentials,
   redactSecrets,
   resolveAgyBinary,
   resolveIsolatedHomeDir,
+  sweepStaleAccountStorage,
 } from "../src/accounts/env";
 import {
   createAuthMethods,
@@ -33,6 +35,7 @@ import {
 } from "../src/usage/catalog";
 import {
   cadence,
+  formatCodeAssistPlan,
   parseResetTime,
   parseUsageReport,
   queryAccountUsage,
@@ -351,6 +354,149 @@ describe("src/accounts/env.ts", () => {
       .toBe("Google auth code: [REDACTED]");
     expect(redactSecrets("Bare refresh 1//04secretRefreshTokenValue and ya29.a0secretAccessToken"))
       .toBe("Bare refresh [REDACTED] and [REDACTED]");
+  });
+
+  test("readStoredAgyOAuthCredentials reads plain and base64 JSON with object or stringified token", () => {
+    const expiryIso = "2026-12-01T00:00:00.000Z";
+    const expectedMs = Date.parse(expiryIso);
+    const tokenObj = {
+      access_token: "ya29.test-access",
+      refresh_token: "1//04test-refresh",
+      expiry: expiryIso,
+    };
+
+    const cases: Array<{ name: string; content: string }> = [
+      {
+        name: "plain-obj",
+        content: JSON.stringify({ token: tokenObj }),
+      },
+      {
+        name: "plain-str",
+        content: JSON.stringify({ token: JSON.stringify(tokenObj) }),
+      },
+      {
+        name: "b64-obj",
+        content: Buffer.from(JSON.stringify({ token: tokenObj }), "utf8").toString("base64"),
+      },
+      {
+        name: "b64-str",
+        content: Buffer.from(JSON.stringify({ token: JSON.stringify(tokenObj) }), "utf8").toString("base64"),
+      },
+    ];
+
+    for (const c of cases) {
+      const isoHome = fs.mkdtempSync(path.join(TEST_DIR, `oauth-${c.name}-`));
+      const cliDir = path.join(isoHome, ".gemini", "antigravity-cli");
+      fs.mkdirSync(cliDir, { recursive: true });
+      fs.writeFileSync(path.join(cliDir, "antigravity-oauth-token"), c.content, "utf8");
+
+      const account: AccountDescriptor = {
+        slotKey: `slot-${c.name}`,
+        accountRef: VALID_UUID,
+        mode: "isolated",
+        label: c.name,
+        isolatedHomeDir: isoHome,
+      };
+
+      expect(readStoredAgyOAuthCredentials(account)).toEqual({
+        accessToken: "ya29.test-access",
+        refreshToken: "1//04test-refresh",
+        expiresAtMs: expectedMs,
+      });
+    }
+  });
+
+  test("sweepStaleAccountStorage prunes stale unprotected artifacts and preserves protected and fresh ones", () => {
+    const tempDataDir = fs.mkdtempSync(path.join(TEST_DIR, "sweep-data-"));
+    const cliDir = path.join(
+      tempDataDir,
+      "accounts",
+      VALID_UUID,
+      ".gemini",
+      "antigravity-cli",
+    );
+    const convDir = path.join(cliDir, "conversations");
+    const brainDir = path.join(cliDir, "brain");
+    const logDir = path.join(cliDir, "log");
+    fs.mkdirSync(convDir, { recursive: true });
+    fs.mkdirSync(brainDir, { recursive: true });
+    fs.mkdirSync(logDir, { recursive: true });
+
+    const nowMs = Date.now();
+    const oldTime = new Date(nowMs - 49 * 60 * 60 * 1000);
+    const freshTime = new Date(nowMs - 30 * 60 * 1000);
+
+    // Old unprotected artifacts -> should be removed
+    const oldDb = path.join(convDir, "old-sess.db");
+    const oldWal = path.join(convDir, "old-sess.db-wal");
+    const oldBrainDir = path.join(brainDir, "old-sess");
+    const oldBrainFile = path.join(oldBrainDir, "out.txt");
+    const oldLog = path.join(logDir, "cli-old.log");
+    fs.writeFileSync(oldDb, "db");
+    fs.writeFileSync(oldWal, "wal");
+    fs.mkdirSync(oldBrainDir, { recursive: true });
+    fs.writeFileSync(oldBrainFile, "old output");
+    fs.writeFileSync(oldLog, "old log");
+    fs.utimesSync(oldDb, oldTime, oldTime);
+    fs.utimesSync(oldWal, oldTime, oldTime);
+    fs.utimesSync(oldBrainFile, oldTime, oldTime);
+    fs.utimesSync(oldBrainDir, oldTime, oldTime);
+    fs.utimesSync(oldLog, oldTime, oldTime);
+
+    // Old protected artifacts -> should be preserved
+    const keepDb = path.join(convDir, "keep-sess.db");
+    const keepBrainDir = path.join(brainDir, "keep-sess");
+    const keepBrainFile = path.join(keepBrainDir, "out.txt");
+    fs.writeFileSync(keepDb, "db");
+    fs.mkdirSync(keepBrainDir, { recursive: true });
+    fs.writeFileSync(keepBrainFile, "keep output");
+    fs.utimesSync(keepDb, oldTime, oldTime);
+    fs.utimesSync(keepBrainFile, oldTime, oldTime);
+    fs.utimesSync(keepBrainDir, oldTime, oldTime);
+
+    // Fresh artifacts -> should be preserved (including old brain dir with fresh nested file)
+    const freshDb = path.join(convDir, "fresh-sess.db");
+    const freshLog = path.join(logDir, "cli-fresh.log");
+    const nestedBrainDir = path.join(brainDir, "resumed-sess");
+    const nestedSubDir = path.join(nestedBrainDir, ".system_generated", "logs");
+    const nestedFreshFile = path.join(nestedSubDir, "transcript.jsonl");
+    fs.writeFileSync(freshDb, "db");
+    fs.writeFileSync(freshLog, "fresh log");
+    fs.mkdirSync(nestedSubDir, { recursive: true });
+    fs.writeFileSync(nestedFreshFile, "fresh step");
+    fs.utimesSync(freshDb, freshTime, freshTime);
+    fs.utimesSync(freshLog, freshTime, freshTime);
+    fs.utimesSync(nestedFreshFile, freshTime, freshTime);
+    fs.utimesSync(nestedSubDir, oldTime, oldTime);
+    fs.utimesSync(path.join(nestedBrainDir, ".system_generated"), oldTime, oldTime);
+    fs.utimesSync(nestedBrainDir, oldTime, oldTime);
+
+    const prevAgyAcpDataDir = process.env.AGY_ACP_DATA_DIR;
+    process.env.AGY_ACP_DATA_DIR = tempDataDir;
+    try {
+      const removed = sweepStaleAccountStorage({
+        now: nowMs,
+        protectedSessionIds: new Set(["keep-sess"]),
+      });
+      expect(removed).toBe(3);
+
+      expect(fs.existsSync(oldDb)).toBe(false);
+      expect(fs.existsSync(oldWal)).toBe(false);
+      expect(fs.existsSync(oldBrainDir)).toBe(false);
+      expect(fs.existsSync(oldLog)).toBe(false);
+
+      expect(fs.existsSync(keepDb)).toBe(true);
+      expect(fs.existsSync(keepBrainFile)).toBe(true);
+      expect(fs.existsSync(freshDb)).toBe(true);
+      expect(fs.existsSync(freshLog)).toBe(true);
+      expect(fs.existsSync(nestedFreshFile)).toBe(true);
+    } finally {
+      if (prevAgyAcpDataDir !== undefined) {
+        process.env.AGY_ACP_DATA_DIR = prevAgyAcpDataDir;
+      } else {
+        delete process.env.AGY_ACP_DATA_DIR;
+      }
+    }
   });
 });
 
@@ -1119,6 +1265,30 @@ describe("src/usage/catalog.ts", () => {
 });
 
 describe("src/usage/quota.ts", () => {
+  test("formatCodeAssistPlan formats tier names and preserves non-duplicated multipliers", () => {
+    expect(
+      formatCodeAssistPlan({ paidTier: { id: "g1-ultra-tier", name: "Google AI Ultra" } }),
+    ).toBe("Google AI Ultra");
+    expect(
+      formatCodeAssistPlan({ paidTier: { id: "g1-pro-tier", name: "Google AI Pro" } }),
+    ).toBe("Google AI Pro");
+    expect(
+      formatCodeAssistPlan({ currentTier: { id: "free-tier", name: "Antigravity" } }),
+    ).toBe("Free");
+    expect(
+      formatCodeAssistPlan({ currentTier: { id: "standard-tier", name: "Antigravity" } }),
+    ).toBe("Standard");
+    expect(
+      formatCodeAssistPlan({ paidTier: { id: "max_5x", name: "Max" } }),
+    ).toBe("Max 5x");
+    expect(
+      formatCodeAssistPlan({ paidTier: { id: "g1-ultra-20x", name: "Google AI Ultra" } }),
+    ).toBe("Google AI Ultra 20x");
+    expect(
+      formatCodeAssistPlan({ paidTier: { id: "max_20x", name: "Max 20x" } }),
+    ).toBe("Max 20x");
+  });
+
   test("cadence and reset time parse correctly", () => {
     expect(cadence({ window: "5h" }, "5h", "").span).toBe(18000);
     expect(cadence({ window: "weekly" }, "weekly", "").span).toBe(604800);

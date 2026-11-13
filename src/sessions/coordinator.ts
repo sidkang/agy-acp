@@ -22,7 +22,10 @@ import {
 } from "../runtime/worker";
 import type { GlobalScheduler } from "../runtime/scheduler";
 import type { LoopbackMcpServer } from "../mcp/http-server";
-import type { SpawnAgyOptions } from "../accounts/env";
+import {
+  sweepStaleAccountStorage,
+  type SpawnAgyOptions,
+} from "../accounts/env";
 import type { ToolResultDelivery } from "../mcp/broker";
 
 export interface TurnExecutionOptions {
@@ -391,11 +394,17 @@ function utf8Suffix(text: string, bytes: number): string {
 
 const HISTORY_BLOCK_CLIP_BYTES = 12 * 1024;
 const HISTORY_BLOCK_KEEP_BYTES = 4 * 1024;
+const SEED_BLOCK_CLIP_BYTES = 64 * 1024;
+const SEED_BLOCK_KEEP_BYTES = 24 * 1024;
 
-function clipHistoryText(text: string): string {
-  if (utf8Bytes(text) <= HISTORY_BLOCK_CLIP_BYTES) return text;
-  const head = utf8Prefix(text, HISTORY_BLOCK_KEEP_BYTES);
-  const tail = utf8Suffix(text, HISTORY_BLOCK_KEEP_BYTES);
+function clipHistoryText(
+  text: string,
+  clipBytes = HISTORY_BLOCK_CLIP_BYTES,
+  keepBytes = HISTORY_BLOCK_KEEP_BYTES,
+): string {
+  if (utf8Bytes(text) <= clipBytes) return text;
+  const head = utf8Prefix(text, keepBytes);
+  const tail = utf8Suffix(text, keepBytes);
   return `${head}\n...[truncated]...\n${tail}`;
 }
 
@@ -403,55 +412,77 @@ const MAX_PROMPT_BYTES =
   Number(process.env.AGY_BRIDGE_MAX_PROMPT_BYTES) || 112 * 1024;
 const HISTORY_RECORD_NOTE =
   "Note: <conversation_history> is a read-only record of earlier turns. Do not re-execute completed tool calls or mimic [Tool Use] text syntax; invoke real MCP tools when needed.\n";
+const PRIOR_HISTORY_RECORD_NOTE =
+  "Note: <prior_conversation_history> is a read-only record of earlier turns in this conversation. Do not re-execute completed tool calls or mimic [Tool Use] text syntax; invoke real MCP tools when needed.\n";
+const SEEDED_ABOVE_NOTE =
+  "[Earlier turns are preserved in <prior_conversation_history> above.]\n";
 const CONTINUATION_NOTE =
   "(system note: continue your unfinished assistant reply below from the exact character where it stops, without repeating the prefix.)";
 
-function renderHistoryEntry(msg: NormalizedMessage): string {
+function renderHistoryEntry(
+  msg: NormalizedMessage,
+  clipBytes = HISTORY_BLOCK_CLIP_BYTES,
+  keepBytes = HISTORY_BLOCK_KEEP_BYTES,
+): string {
   const role = msg.role === "user" ? "User" : "Assistant";
   let entryText = `[${role}]:\n`;
   for (const part of msg.content) {
     if (part.type === "text") {
-      entryText += `${clipHistoryText(part.text)}\n`;
+      entryText += `${clipHistoryText(part.text, clipBytes, keepBytes)}\n`;
     } else if (part.type === "tool_use") {
-      const inputStr = clipHistoryText(JSON.stringify(part.input, null, 2));
+      const inputStr = clipHistoryText(
+        JSON.stringify(part.input, null, 2),
+        clipBytes,
+        keepBytes,
+      );
       entryText += `[Tool Use: ${part.name} (id: ${part.id})]:\n${inputStr}\n`;
     } else if (part.type === "tool_result") {
       const txt = part.content
         .filter((c) => c.type === "text")
         .map((c) => (c as any).text)
         .join("\n");
-      entryText += `[Tool Result: id: ${part.toolUseId}]:\n${clipHistoryText(txt)}\n[end of tool result]\n`;
+      entryText += `[Tool Result: id: ${part.toolUseId}]:\n${clipHistoryText(txt, clipBytes, keepBytes)}\n[end of tool result]\n`;
     }
   }
   entryText += "\n";
   return entryText;
 }
 
-function renderMessagesToPrompt(
-  priorMessages: NormalizedMessage[],
-  currentMessages: NormalizedMessage[],
-): Array<
-  | { type: "text"; text: string }
-  | { type: "image"; data: string; mimeType: string }
-> {
-  const parts: Array<
-    | { type: "text"; text: string }
-    | { type: "image"; data: string; mimeType: string }
-  > = [];
+function splitPriorAndCurrent(messages: NormalizedMessage[]): {
+  priorMessages: NormalizedMessage[];
+  currentMessages: NormalizedMessage[];
+} {
+  const hasPrefill =
+    messages.length > 0 && messages[messages.length - 1]!.role === "assistant";
+  if (hasPrefill) {
+    return {
+      priorMessages: messages.slice(0, -2),
+      currentMessages: messages.slice(-2),
+    };
+  }
+  return {
+    priorMessages: messages.slice(0, -1),
+    currentMessages: messages.slice(-1),
+  };
+}
 
+function renderCurrentTurnParts(
+  currentMessages: NormalizedMessage[],
+  isSingleWarmMessage: boolean,
+): {
+  userMessages: NormalizedMessage[];
+  turnText: string;
+  prefillText: string;
+} {
   const hasPrefill =
     currentMessages.length > 0 &&
     currentMessages[currentMessages.length - 1]!.role === "assistant";
-
   const userMessages = hasPrefill
     ? currentMessages.slice(0, -1)
     : currentMessages;
   const prefillMessage = hasPrefill
     ? currentMessages[currentMessages.length - 1]
     : undefined;
-
-  const isSingleWarmMessage =
-    priorMessages.length === 0 && !hasPrefill && userMessages.length === 1;
 
   let turnText = "";
   if (isSingleWarmMessage) {
@@ -496,6 +527,137 @@ function renderMessagesToPrompt(
     prefillText = `\n<assistant_prefill>\n${prefillContent}\n${CONTINUATION_NOTE}\n</assistant_prefill>\n`;
   }
 
+  return { userMessages, turnText, prefillText };
+}
+
+function planColdHistoryRender(
+  priorMessages: NormalizedMessage[],
+  currentMessages: NormalizedMessage[],
+  modelId: string,
+): {
+  systemHistorySeed?: string;
+  tailPriorMessages: NormalizedMessage[];
+} {
+  if (priorMessages.length === 0) {
+    return { systemHistorySeed: undefined, tailPriorMessages: [] };
+  }
+
+  const { turnText, prefillText } = renderCurrentTurnParts(
+    currentMessages,
+    false,
+  );
+  const currentBytes = utf8Bytes(turnText + prefillText);
+  const historyHeader = "<conversation_history>\n";
+  const historyFooter = HISTORY_RECORD_NOTE + "</conversation_history>\n\n";
+  const frameBytes = utf8Bytes(historyHeader + historyFooter);
+  const availableForPromptHistory = Math.max(
+    0,
+    MAX_PROMPT_BYTES - currentBytes - frameBytes,
+  );
+
+  const promptEntries = priorMessages.map((m) => renderHistoryEntry(m));
+  const promptEntryBytes = promptEntries.map((e) => utf8Bytes(e));
+  const totalPromptHistBytes = promptEntryBytes.reduce((a, b) => a + b, 0);
+
+  if (totalPromptHistBytes <= availableForPromptHistory) {
+    return { systemHistorySeed: undefined, tailPriorMessages: priorMessages };
+  }
+
+  const seededNoteBytes = utf8Bytes(SEEDED_ABOVE_NOTE);
+  let suffixBytes = 0;
+  let splitIdx = priorMessages.length;
+  for (let i = priorMessages.length - 1; i >= 1; i--) {
+    const nextBytes = suffixBytes + promptEntryBytes[i]!;
+    if (nextBytes + seededNoteBytes <= availableForPromptHistory) {
+      suffixBytes = nextBytes;
+      splitIdx = i;
+    } else {
+      break;
+    }
+  }
+
+  const overflowMessages = priorMessages.slice(0, splitIdx);
+  const tailPriorMessages = priorMessages.slice(splitIdx);
+
+  const seedHeader = "<prior_conversation_history>\n";
+  const seedFooter =
+    PRIOR_HISTORY_RECORD_NOTE + "</prior_conversation_history>";
+  const maxSeedBytes = /gpt-oss/i.test(modelId)
+    ? 256 * 1024
+    : Number(process.env.AGY_BRIDGE_MAX_SYSTEM_HISTORY_BYTES) ||
+      2 * 1024 * 1024;
+  const availableForSeed = Math.max(
+    0,
+    maxSeedBytes - utf8Bytes(seedHeader + seedFooter),
+  );
+
+  const seedEntries = overflowMessages.map((m) =>
+    renderHistoryEntry(m, SEED_BLOCK_CLIP_BYTES, SEED_BLOCK_KEEP_BYTES),
+  );
+  const seedEntryBytes = seedEntries.map((e) => utf8Bytes(e));
+  const totalSeedBytes = seedEntryBytes.reduce((a, b) => a + b, 0);
+
+  let seedBody = "";
+  if (totalSeedBytes <= availableForSeed) {
+    seedBody = seedEntries.join("");
+  } else {
+    let remainingBytes = totalSeedBytes;
+    let startIndex = 0;
+    while (startIndex < seedEntries.length) {
+      remainingBytes -= seedEntryBytes[startIndex]!;
+      startIndex++;
+      const omitNote = `[... omitted ${startIndex} earlier messages ...]\n`;
+      if (remainingBytes + utf8Bytes(omitNote) <= availableForSeed) {
+        seedBody = omitNote + seedEntries.slice(startIndex).join("");
+        break;
+      }
+    }
+    if (!seedBody) {
+      seedBody = `[... omitted ${overflowMessages.length} earlier messages ...]\n`;
+    }
+  }
+
+  return {
+    systemHistorySeed: `${seedHeader}${seedBody}${seedFooter}`,
+    tailPriorMessages,
+  };
+}
+
+interface RenderPromptOptions {
+  priorSeededInSystem?: boolean;
+  imageSourceMessages?: NormalizedMessage[];
+}
+
+function renderMessagesToPrompt(
+  priorMessages: NormalizedMessage[],
+  currentMessages: NormalizedMessage[],
+  opts?: RenderPromptOptions,
+): Array<
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string }
+> {
+  const parts: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; data: string; mimeType: string }
+  > = [];
+
+  const hasPrefill =
+    currentMessages.length > 0 &&
+    currentMessages[currentMessages.length - 1]!.role === "assistant";
+  const userMessagesCount = hasPrefill
+    ? currentMessages.length - 1
+    : currentMessages.length;
+  const isSingleWarmMessage =
+    priorMessages.length === 0 &&
+    !opts?.priorSeededInSystem &&
+    !hasPrefill &&
+    userMessagesCount === 1;
+
+  let { userMessages, turnText, prefillText } = renderCurrentTurnParts(
+    currentMessages,
+    isSingleWarmMessage,
+  );
+
   const currentBytes = utf8Bytes(turnText + prefillText);
   let historyText = "";
 
@@ -531,7 +693,7 @@ function renderMessagesToPrompt(
       const tail = utf8Suffix(turnText, half);
       turnText = `${head}${truncateMarker}${tail}`;
     }
-  } else if (priorMessages.length > 0) {
+  } else if (priorMessages.length > 0 || opts?.priorSeededInSystem) {
     const historyHeader = "<conversation_history>\n";
     const historyFooter = HISTORY_RECORD_NOTE + "</conversation_history>\n\n";
     const frameBytes = utf8Bytes(historyHeader + historyFooter);
@@ -540,16 +702,17 @@ function renderMessagesToPrompt(
       MAX_PROMPT_BYTES - currentBytes - frameBytes,
     );
 
+    const leadNote = opts?.priorSeededInSystem ? SEEDED_ABOVE_NOTE : "";
+    const leadBytes = utf8Bytes(leadNote);
     const historyEntries = priorMessages.map((m) => renderHistoryEntry(m));
-    const totalHistBytes = historyEntries.reduce(
-      (sum, e) => sum + utf8Bytes(e),
-      0,
-    );
+    const totalHistBytes =
+      leadBytes +
+      historyEntries.reduce((sum, e) => sum + utf8Bytes(e), 0);
 
     if (totalHistBytes <= availableForHistory) {
       historyText =
-        historyHeader + historyEntries.join("") + historyFooter;
-    } else {
+        historyHeader + leadNote + historyEntries.join("") + historyFooter;
+    } else if (historyEntries.length > 0) {
       let omittedCount = 0;
       let startIndex = 0;
       while (startIndex < historyEntries.length) {
@@ -558,11 +721,12 @@ function renderMessagesToPrompt(
         const remainingBytes = historyEntries
           .slice(startIndex + 1)
           .reduce((sum, e) => sum + utf8Bytes(e), 0);
-        if (remainingBytes + omitBytes <= availableForHistory) {
+        if (leadBytes + remainingBytes + omitBytes <= availableForHistory) {
           startIndex++;
           omittedCount++;
           historyText =
             historyHeader +
+            leadNote +
             omitNote +
             historyEntries.slice(startIndex).join("") +
             historyFooter;
@@ -574,6 +738,7 @@ function renderMessagesToPrompt(
       if (!historyText && omittedCount > 0) {
         historyText =
           historyHeader +
+          leadNote +
           `[... omitted ${priorMessages.length} earlier messages ...]\n` +
           historyFooter;
       }
@@ -585,7 +750,10 @@ function renderMessagesToPrompt(
     parts.push({ type: "text", text: combinedText });
   }
 
-  const allMessages = [...priorMessages, ...userMessages];
+  const allMessages = [
+    ...(opts?.imageSourceMessages ?? priorMessages),
+    ...userMessages,
+  ];
   for (const msg of allMessages) {
     for (const part of msg.content) {
       if (part.type === "image") {
@@ -620,6 +788,7 @@ interface ParkedSession {
   nativeSessionId: string;
   committedMessages: NormalizedMessage[];
   systemPrompt?: string;
+  systemHistorySeed?: string;
   minimalAgent: boolean;
   registeredTools: Array<{
     name: string;
@@ -635,9 +804,12 @@ interface ParkedSession {
 function estimateParkedBytes(
   messages: NormalizedMessage[],
   systemPrompt: string | undefined,
+  systemHistorySeed: string | undefined,
   tools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }>,
 ): number {
-  let bytes = systemPrompt ? utf8Bytes(systemPrompt) : 0;
+  let bytes =
+    (systemPrompt ? utf8Bytes(systemPrompt) : 0) +
+    (systemHistorySeed ? utf8Bytes(systemHistorySeed) : 0);
   try {
     bytes += utf8Bytes(JSON.stringify(tools));
     bytes += utf8Bytes(JSON.stringify(messages));
@@ -646,6 +818,8 @@ function estimateParkedBytes(
   }
   return bytes;
 }
+
+const STORAGE_GC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
 export class SessionCoordinator {
   readonly scheduler: GlobalScheduler;
@@ -661,6 +835,7 @@ export class SessionCoordinator {
   private readonly sessionLocks = new Map<string, Promise<void>>();
   private readonly activeWorkers = new Map<string, AgySessionWorker>();
   private readonly parkedSessions = new Map<string, ParkedSession>();
+  private lastStorageGcAt = 0;
 
   constructor(options: SessionCoordinatorOptions) {
     this.options = options;
@@ -683,7 +858,33 @@ export class SessionCoordinator {
         prevReapTick?.(now);
       } catch {}
       this.pruneParkedSessions(now);
+      if (now - this.lastStorageGcAt >= STORAGE_GC_INTERVAL_MS) {
+        this.lastStorageGcAt = now;
+        this.sweepAccountStorage(now);
+      }
     };
+  }
+
+  sweepAccountStorage(now = Date.now()): void {
+    const protectedSessionIds = new Set<string>();
+    for (const worker of this.activeWorkers.values()) {
+      if (worker.nativeSessionId) protectedSessionIds.add(worker.nativeSessionId);
+      if (worker.sessionId) protectedSessionIds.add(worker.sessionId);
+    }
+    for (const entry of this.parkedSessions.values()) {
+      if (entry.nativeSessionId) protectedSessionIds.add(entry.nativeSessionId);
+    }
+    try {
+      sweepStaleAccountStorage({ now, protectedSessionIds });
+    } catch {}
+  }
+
+  private removeActiveWorker(worker: AgySessionWorker): void {
+    for (const [key, w] of this.activeWorkers) {
+      if (w === worker) {
+        this.activeWorkers.delete(key);
+      }
+    }
   }
 
   pruneParkedSessions(now = Date.now()): void {
@@ -726,6 +927,7 @@ export class SessionCoordinator {
       const estimatedBytes = estimateParkedBytes(
         worker.committedMessages,
         worker.systemPrompt,
+        worker.appliedSystemHistorySeed,
         worker.registeredTools,
       );
       if (estimatedBytes > MAX_SINGLE_PARKED_BYTES) {
@@ -737,6 +939,7 @@ export class SessionCoordinator {
         nativeSessionId: worker.nativeSessionId,
         committedMessages: [...worker.committedMessages],
         systemPrompt: worker.systemPrompt,
+        systemHistorySeed: worker.appliedSystemHistorySeed,
         minimalAgent: worker.minimalAgent,
         registeredTools: [...worker.registeredTools],
         workDir: worker.workDir,
@@ -854,6 +1057,12 @@ export class SessionCoordinator {
       return;
     }
 
+    const requestedMinimalAgent = Boolean(
+      options?.providerOptions?.minimalAgent ??
+        this.providerOptions?.minimalAgent ??
+        false,
+    );
+
     const baseSessionKey = `${account.slotKey}::${account.accountRef}::${req.sessionId}`;
     let existingWorker = this.activeWorkers.get(sessionKey);
     if (!existingWorker && !req.subagentId) {
@@ -868,6 +1077,14 @@ export class SessionCoordinator {
           break;
         }
       }
+    }
+    if (!existingWorker) {
+      existingWorker = this.adoptAwaitingToolWorker(
+        account,
+        req,
+        sessionKey,
+        requestedMinimalAgent,
+      );
     }
 
     const baseWorker =
@@ -927,27 +1144,14 @@ export class SessionCoordinator {
       existingWorker &&
       existingWorker.account.accountRef !== account.accountRef
     ) {
-      for (const [k, w] of this.activeWorkers) {
-        if (w === existingWorker) {
-          this.activeWorkers.delete(k);
-        }
-      }
+      this.removeActiveWorker(existingWorker);
       this.scheduler.unregisterWorker(existingWorker);
       await existingWorker.close("account_mismatch");
       existingWorker = undefined;
     }
 
-    const requestedMinimalAgent = Boolean(
-      options?.providerOptions?.minimalAgent ??
-        this.providerOptions?.minimalAgent ??
-        false,
-    );
     if (existingWorker && existingWorker.minimalAgent !== requestedMinimalAgent) {
-      for (const [k, w] of this.activeWorkers) {
-        if (w === existingWorker) {
-          this.activeWorkers.delete(k);
-        }
-      }
+      this.removeActiveWorker(existingWorker);
       this.scheduler.unregisterWorker(existingWorker);
       await existingWorker.close("system_prompt_mode_changed");
       existingWorker = undefined;
@@ -1012,7 +1216,7 @@ export class SessionCoordinator {
 
     // Case 4: Warm IDLE session where history diverged/compacted or tools changed
     if (existingWorker && existingWorker.state === "IDLE") {
-      this.activeWorkers.delete(sessionKey);
+      this.removeActiveWorker(existingWorker);
       this.scheduler.unregisterWorker(existingWorker);
       await existingWorker.close("history_diverged_or_tools_changed");
     }
@@ -1026,6 +1230,72 @@ export class SessionCoordinator {
       sessionKey,
       signal,
     );
+  }
+
+  private adoptAwaitingToolWorker(
+    account: AccountDescriptor,
+    req: NormalizedAnthropicRequest,
+    sessionKey: string,
+    requestedMinimalAgent: boolean,
+  ): AgySessionWorker | undefined {
+    const lastMsg = req.messages[req.messages.length - 1];
+    if (!lastMsg || lastMsg.role !== "user") return undefined;
+
+    const incomingToolUseIds = new Set<string>();
+    for (const part of lastMsg.content) {
+      if (part.type === "tool_result") {
+        incomingToolUseIds.add(part.toolUseId);
+      }
+    }
+    if (incomingToolUseIds.size === 0) return undefined;
+
+    for (const candidate of this.activeWorkers.values()) {
+      if (candidate.pinned) continue;
+      if (candidate.state !== "AWAITING_TOOL_RESULTS") continue;
+      if (
+        candidate.account.slotKey !== account.slotKey ||
+        candidate.account.accountRef !== account.accountRef
+      ) {
+        continue;
+      }
+      if (candidate.minimalAgent !== requestedMinimalAgent) continue;
+
+      const pendingIds = candidate.broker.getExposedPendingIds();
+      if (!pendingIds.some((id) => incomingToolUseIds.has(id))) continue;
+
+      if (!req.subagentId) {
+        const diffSystem =
+          stripVolatileSystem(req.system) !==
+          stripVolatileSystem(candidate.systemPrompt);
+        const diffOpening =
+          getOpeningUserText(req.messages) !==
+          getOpeningUserText(candidate.committedMessages);
+        if (diffSystem && diffOpening) continue;
+      }
+
+      const prefixLen = candidate.committedMessages.length;
+      const matchesPrefix =
+        req.messages.length >= prefixLen &&
+        isPrefixMatch(
+          candidate.committedMessages,
+          req.messages.slice(0, prefixLen),
+        );
+      if (
+        !matchesPrefix &&
+        !isCompactedRequest(req.messages, candidate.committedMessages, candidate)
+      ) {
+        continue;
+      }
+
+      this.removeActiveWorker(candidate);
+      if (req.sessionId) {
+        candidate.sessionId = req.sessionId;
+      }
+      this.activeWorkers.set(sessionKey, candidate);
+      return candidate;
+    }
+
+    return undefined;
   }
 
   private async *executeFreshSessionTurn(
@@ -1059,6 +1329,15 @@ export class SessionCoordinator {
       resumeSessionId = parked.nativeSessionId;
     }
 
+    const { priorMessages, currentMessages } = splitPriorAndCurrent(
+      req.messages,
+    );
+    const coldPlan = planColdHistoryRender(
+      priorMessages,
+      currentMessages,
+      modelSelection.rawModelId,
+    );
+
     const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
     const workerOptions: WorkerOptions = {
       spawnFn,
@@ -1073,7 +1352,11 @@ export class SessionCoordinator {
         true,
       workDir: req.workDir,
       resumeSessionId,
+      resumeSystemHistorySeed: resumeSessionId
+        ? parked?.systemHistorySeed
+        : undefined,
       systemPrompt: req.system,
+      systemHistorySeed: coldPlan.systemHistorySeed,
       tools: req.tools,
       toolChoice: req.toolChoice,
       steerCancelTimeoutMs:
@@ -1081,7 +1364,7 @@ export class SessionCoordinator {
         this.options?.steerCancelTimeoutMs,
       onStateChange: (_worker, _oldState, newState) => {
         if (newState === "CLOSED") {
-          this.activeWorkers.delete(sessionKey);
+          this.removeActiveWorker(_worker);
           this.scheduler.unregisterWorker(_worker);
         }
       },
@@ -1107,7 +1390,7 @@ export class SessionCoordinator {
       try {
         await worker.start(signal);
       } catch (err) {
-        this.activeWorkers.delete(sessionKey);
+        this.removeActiveWorker(worker);
         this.scheduler.unregisterWorker(worker);
         await worker.close("admission_or_start_failed");
         throw err;
@@ -1136,23 +1419,12 @@ export class SessionCoordinator {
 
       await worker.applyModelSelection(modelSelection, signal);
 
-      // Determine prior messages vs current turn
-      let priorMessages: NormalizedMessage[] = [];
-      let currentMessages: NormalizedMessage[] = [];
-
-      const hasPrefill =
-        req.messages.length > 0 &&
-        req.messages[req.messages.length - 1]!.role === "assistant";
-
-      if (hasPrefill) {
-        priorMessages = req.messages.slice(0, -2);
-        currentMessages = req.messages.slice(-2);
-      } else {
-        priorMessages = req.messages.slice(0, -1);
-        currentMessages = req.messages.slice(-1);
-      }
-
-      const promptParts = renderMessagesToPrompt(priorMessages, currentMessages);
+      const promptParts = worker.systemHistorySeedApplied
+        ? renderMessagesToPrompt(coldPlan.tailPriorMessages, currentMessages, {
+            priorSeededInSystem: true,
+            imageSourceMessages: priorMessages,
+          })
+        : renderMessagesToPrompt(priorMessages, currentMessages);
       const tcReminder = getToolChoiceReminder(req.toolChoice);
       if (tcReminder) {
         if (
@@ -1200,7 +1472,7 @@ export class SessionCoordinator {
       }
 
       if (sawError) {
-        this.activeWorkers.delete(sessionKey);
+        this.removeActiveWorker(worker);
         this.scheduler.unregisterWorker(worker);
         await worker.close("turn_error");
       }
@@ -1297,7 +1569,7 @@ export class SessionCoordinator {
         !isPrefixMatch(worker.committedMessages, req.messages.slice(0, prefixLen))
       ) {
         if (isCompactedRequest(req.messages, worker.committedMessages, worker)) {
-          this.activeWorkers.delete(sessionKey);
+          this.removeActiveWorker(worker);
           this.scheduler.unregisterWorker(worker);
           await worker.close("compacted_during_tool_turn");
           yield* this.executeFreshSessionTurn(
@@ -1446,7 +1718,7 @@ export class SessionCoordinator {
         }
       } catch (err) {
         if (err instanceof SteerReplayNeededError && !yieldedAny) {
-          this.activeWorkers.delete(sessionKey);
+          this.removeActiveWorker(worker);
           this.scheduler.unregisterWorker(worker);
           await worker.close("steer_replay_needed");
           yield* this.executeFreshSessionTurn(
@@ -1463,7 +1735,7 @@ export class SessionCoordinator {
       }
 
       if (sawError) {
-        this.activeWorkers.delete(sessionKey);
+        this.removeActiveWorker(worker);
         this.scheduler.unregisterWorker(worker);
         await worker.close("turn_error");
       }
@@ -1481,6 +1753,14 @@ export class SessionCoordinator {
   ): AsyncGenerator<TurnStreamEvent> {
     const ephemeralSessionId = `ephemeral-${crypto.randomUUID()}`;
     const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
+    const { priorMessages, currentMessages } = splitPriorAndCurrent(
+      req.messages,
+    );
+    const coldPlan = planColdHistoryRender(
+      priorMessages,
+      currentMessages,
+      modelSelection.rawModelId,
+    );
     const worker = new AgySessionWorker(
       account,
       ephemeralSessionId,
@@ -1498,6 +1778,7 @@ export class SessionCoordinator {
           true,
         workDir: req.workDir,
         systemPrompt: req.system,
+        systemHistorySeed: coldPlan.systemHistorySeed,
         tools: req.tools,
         toolChoice: req.toolChoice,
       },
@@ -1530,25 +1811,12 @@ export class SessionCoordinator {
 
       await worker.applyModelSelection(modelSelection, signal);
 
-      let priorMessages: NormalizedMessage[] = [];
-      let currentMessages: NormalizedMessage[] = [];
-
-      const hasPrefill =
-        req.messages.length > 0 &&
-        req.messages[req.messages.length - 1]!.role === "assistant";
-
-      if (hasPrefill) {
-        priorMessages = req.messages.slice(0, -2);
-        currentMessages = req.messages.slice(-2);
-      } else {
-        priorMessages = req.messages.slice(0, -1);
-        currentMessages = req.messages.slice(-1);
-      }
-
-      const promptParts = renderMessagesToPrompt(
-        priorMessages,
-        currentMessages,
-      );
+      const promptParts = worker.systemHistorySeedApplied
+        ? renderMessagesToPrompt(coldPlan.tailPriorMessages, currentMessages, {
+            priorSeededInSystem: true,
+            imageSourceMessages: priorMessages,
+          })
+        : renderMessagesToPrompt(priorMessages, currentMessages);
       if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
         const sysPrompt = `<external_system_instructions>\n${worker.effectiveSystemPrompt}\n</external_system_instructions>\n\n`;
         if (promptParts.length > 0 && promptParts[0]!.type === "text") {

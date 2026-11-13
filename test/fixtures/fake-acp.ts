@@ -5,6 +5,7 @@ let mcpUrl: string | null = null;
 let currentSessionId: string | null = null;
 let currentModel = "default";
 let currentThoughtLevel = "default";
+let appendedSystemPrompt = "";
 let cancelled = false;
 
 const rl = readline.createInterface({
@@ -138,6 +139,7 @@ rl.on("line", async (line) => {
 
   if (method === "session/new") {
     mcpUrl = params?.mcpServers?.[0]?.url ?? null;
+    appendedSystemPrompt = params?._meta?.antigravity?.systemPrompt?.append ?? "";
     const sessionId = `fake-session-${Math.random().toString(36).slice(2, 10)}`;
     currentSessionId = sessionId;
     send({
@@ -431,10 +433,13 @@ rl.on("line", async (line) => {
     }
 
     // Default response: stream message chunks then complete
+    const sysProbe = promptText.includes("INSPECT_SYSTEM_APPEND")
+      ? ` [sysAppendBytes=${Buffer.byteLength(appendedSystemPrompt, "utf-8")}, hasPriorTag=${appendedSystemPrompt.includes("<prior_conversation_history>")}, hasFirst=${appendedSystemPrompt.includes("SEED_HEAD_MARKER_0")}]`
+      : "";
     notify("session/update", {
       sessionUpdate: "agent_message_chunk",
       content: {
-        text: `Answer: ${promptText} [model=${currentModel}, effort=${currentThoughtLevel}]`,
+        text: `Answer: ${promptText} [model=${currentModel}, effort=${currentThoughtLevel}]${sysProbe}`,
       },
     });
 

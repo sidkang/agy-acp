@@ -44,10 +44,10 @@
   "magpie": {
     "name": "Antigravity ACP",
     "icon": "https://raw.githubusercontent.com/sidkang/agy-acp/main/assets/icon.svg",
-    "maxConcurrency": 16,
+    "maxConcurrency": 36,
     "options": {
-      "maxGlobalWorkers": 16,
-      "maxPerAccountWorkers": 6,
+      "maxGlobalWorkers": 36,
+      "maxPerAccountWorkers": 18,
       "idleTimeoutMs": 3600000,
       "awaitingToolTimeoutMs": 600000
     },

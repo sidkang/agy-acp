@@ -562,3 +562,204 @@ export function redactSecrets(text: string): string {
   out = out.replace(/\bya29\.[A-Za-z0-9._-]{8,}\b/g, "[REDACTED]");
   return out;
 }
+
+export interface StoredAgyOAuthCredentials {
+  accessToken?: string;
+  refreshToken?: string;
+  expiresAtMs?: number;
+}
+
+/**
+ * Reads file-backed OAuth credentials (`antigravity-oauth-token`) for an
+ * isolated account (or a file-backed host account on Linux/SSH) if available.
+ * Never throws; returns `null` when unavailable or stored in OS Keychain.
+ */
+export function readStoredAgyOAuthCredentials(
+  account: AccountDescriptor,
+): StoredAgyOAuthCredentials | null {
+  try {
+    const homeDir =
+      account.mode === "isolated"
+        ? (account.isolatedHomeDir ?? resolveIsolatedHomeDir(account.accountRef))
+        : (HOST_HOME || os.homedir());
+    if (!homeDir) return null;
+
+    const tokenPath = path.join(
+      homeDir,
+      ".gemini",
+      "antigravity-cli",
+      "antigravity-oauth-token",
+    );
+    if (!fs.existsSync(tokenPath)) return null;
+
+    const raw = fs.readFileSync(tokenPath, "utf8").trim();
+    if (!raw) return null;
+
+    let outer: any;
+    try {
+      outer = JSON.parse(raw);
+    } catch {
+      outer = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+    }
+    if (!outer || typeof outer !== "object") return null;
+
+    let tok = outer.token ?? outer;
+    if (typeof tok === "string") {
+      tok = JSON.parse(tok);
+    }
+    if (!tok || typeof tok !== "object") return null;
+
+    const accessToken =
+      typeof tok.access_token === "string" && tok.access_token.trim()
+        ? tok.access_token.trim()
+        : undefined;
+    const refreshToken =
+      typeof tok.refresh_token === "string" && tok.refresh_token.trim()
+        ? tok.refresh_token.trim()
+        : undefined;
+    let expiresAtMs: number | undefined;
+    if (typeof tok.expiry === "string" && tok.expiry.trim()) {
+      const parsed = Date.parse(tok.expiry);
+      if (Number.isFinite(parsed) && parsed > 0) expiresAtMs = parsed;
+    }
+
+    if (!accessToken && !refreshToken) return null;
+    return { accessToken, refreshToken, expiresAtMs };
+  } catch {
+    return null;
+  }
+}
+
+export interface AccountStorageGcOptions {
+  now?: number;
+  /** Default: 48 hours. */
+  maxAgeMs?: number;
+  /** Active or parked native ACP session IDs that must never be pruned. */
+  protectedSessionIds?: ReadonlySet<string>;
+}
+
+const DEFAULT_STORAGE_GC_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * Prunes expired `conversations/*.db*`, `brain/<sessionId>`, and `log/cli-*.log`
+ * artifacts inside isolated account directories (`$AGY_ACP_DATA_DIR/accounts/*`)
+ * so long-running gateways do not accumulate unbounded SQLite / tool-output files.
+ */
+export function sweepStaleAccountStorage(
+  options: AccountStorageGcOptions = {},
+): number {
+  const now = options.now ?? Date.now();
+  const maxAgeMs = options.maxAgeMs ?? DEFAULT_STORAGE_GC_MAX_AGE_MS;
+  const protectedIds = options.protectedSessionIds ?? new Set<string>();
+  let removed = 0;
+
+  let accountsRoot: string;
+  try {
+    accountsRoot = path.join(getPluginDataRoot(), "accounts");
+    if (!fs.existsSync(accountsRoot)) return 0;
+  } catch {
+    return 0;
+  }
+
+  let accountDirs: fs.Dirent[];
+  try {
+    accountDirs = fs.readdirSync(accountsRoot, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+
+  for (const acctEnt of accountDirs) {
+    if (!acctEnt.isDirectory() || !UUID_REGEX.test(acctEnt.name)) continue;
+    const cliDir = path.join(
+      accountsRoot,
+      acctEnt.name,
+      ".gemini",
+      "antigravity-cli",
+    );
+
+    // 1. Prune conversations/<sessionId>.db (+ -wal / -shm sidecars)
+    const convDir = path.join(cliDir, "conversations");
+    try {
+      if (fs.existsSync(convDir)) {
+        const entries = fs.readdirSync(convDir, { withFileTypes: true });
+        for (const ent of entries) {
+          if (!ent.isFile() || !ent.name.endsWith(".db")) continue;
+          const sessionId = ent.name.slice(0, -3);
+          if (!sessionId || protectedIds.has(sessionId)) continue;
+          const dbFile = path.join(convDir, ent.name);
+          const walFile = `${dbFile}-wal`;
+          const shmFile = `${dbFile}-shm`;
+          let newestMtime = fs.statSync(dbFile).mtimeMs;
+          try {
+            if (fs.existsSync(walFile)) {
+              newestMtime = Math.max(newestMtime, fs.statSync(walFile).mtimeMs);
+            }
+          } catch {}
+          if (now - newestMtime > maxAgeMs) {
+            for (const f of [walFile, shmFile, dbFile]) {
+              try {
+                if (fs.existsSync(f)) fs.rmSync(f, { force: true });
+              } catch {}
+            }
+            removed++;
+          }
+        }
+      }
+    } catch {}
+
+    // 2. Prune brain/<sessionId> directories (offloaded tool outputs / scratch)
+    const newestTreeMtimeMs = (dir: string, depth = 0): number => {
+      let newest = fs.lstatSync(dir).mtimeMs;
+      if (depth >= 6) return newest;
+      const children = fs.readdirSync(dir, { withFileTypes: true });
+      for (const child of children) {
+        const childPath = path.join(dir, child.name);
+        const childStat = fs.lstatSync(childPath);
+        if (childStat.mtimeMs > newest) newest = childStat.mtimeMs;
+        if (child.isDirectory() && !child.isSymbolicLink()) {
+          const subNewest = newestTreeMtimeMs(childPath, depth + 1);
+          if (subNewest > newest) newest = subNewest;
+        }
+      }
+      return newest;
+    };
+
+    const brainDir = path.join(cliDir, "brain");
+    try {
+      if (fs.existsSync(brainDir)) {
+        const entries = fs.readdirSync(brainDir, { withFileTypes: true });
+        for (const ent of entries) {
+          if (!ent.isDirectory() || protectedIds.has(ent.name)) continue;
+          const target = path.join(brainDir, ent.name);
+          try {
+            const newestMtime = newestTreeMtimeMs(target);
+            if (now - newestMtime > maxAgeMs) {
+              fs.rmSync(target, { recursive: true, force: true });
+              removed++;
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+
+    // 3. Prune log/cli-*.log files
+    const logDir = path.join(cliDir, "log");
+    try {
+      if (fs.existsSync(logDir)) {
+        const entries = fs.readdirSync(logDir, { withFileTypes: true });
+        for (const ent of entries) {
+          if (!ent.isFile() || !ent.name.endsWith(".log")) continue;
+          const target = path.join(logDir, ent.name);
+          const st = fs.statSync(target);
+          if (now - st.mtimeMs > maxAgeMs) {
+            fs.rmSync(target, { force: true });
+            removed++;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return removed;
+}
+

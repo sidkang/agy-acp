@@ -2504,4 +2504,174 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     await sideSched.closeAll("test_done");
     sideSched.destroy();
   });
+
+  test("33. Turn-1 -> Turn-2 synthetic sessionId change re-keys AWAITING_TOOL_RESULTS worker without leaking slots", async () => {
+    const tightSched = new GlobalScheduler({
+      maxGlobalWorkers: 1,
+      maxPerAccountWorkers: 1,
+      idleTimeoutMs: 60_000,
+    });
+    const tightCoord = new SessionCoordinator({
+      scheduler: tightSched,
+      mcpServer,
+      spawnFn: spawnFakeAcp,
+    });
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Get weather",
+        inputSchema: { type: "object", properties: { city: { type: "string" } } },
+      },
+    ];
+
+    const turn1SessionId = `magpie-turn1-${Date.now()}`;
+    const turn2SessionId = `magpie-turn2-${Date.now()}`;
+
+    const turn1Req: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Tool re-key test",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "TRIGGER_TOOL_CALL please" }],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId: turn1SessionId,
+    };
+
+    let emittedToolCall: any = null;
+    for await (const ev of tightCoord.executeTurn(testAccount, turn1Req, sel)) {
+      if (ev.type === "tool_use") emittedToolCall = ev;
+    }
+    expect(emittedToolCall).toBeDefined();
+    expect(tightSched.getActiveCount()).toBe(1);
+
+    const turn1Worker = tightCoord.getActiveWorker(
+      `${testAccount.slotKey}::${turn1SessionId}`,
+    );
+    expect(turn1Worker).toBeDefined();
+    expect(turn1Worker!.state).toBe("AWAITING_TOOL_RESULTS");
+
+    // Turn 2 arrives with stabilized session ID (different from Turn 1) and maxPerAccountWorkers=1.
+    // Without re-keying, this would hit 503 worker exhaustion!
+    const turn2Req: NormalizedAnthropicRequest = {
+      ...turn1Req,
+      sessionId: turn2SessionId,
+      messages: [
+        ...turn1Req.messages,
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: emittedToolCall.id,
+              name: emittedToolCall.name,
+              input: emittedToolCall.input,
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: emittedToolCall.id,
+              isError: false,
+              content: [{ type: "text", text: "68F sunny" }],
+            },
+          ],
+        },
+      ],
+    };
+
+    let turn2Text = "";
+    for await (const ev of tightCoord.executeTurn(testAccount, turn2Req, sel)) {
+      if (ev.type === "text_delta") turn2Text += ev.text;
+    }
+    expect(turn2Text).toContain("68F sunny");
+    expect(tightSched.getActiveCount()).toBe(1);
+    expect(
+      tightCoord.getActiveWorker(`${testAccount.slotKey}::${turn1SessionId}`),
+    ).toBeUndefined();
+    const rekeyedWorker = tightCoord.getActiveWorker(
+      `${testAccount.slotKey}::${turn2SessionId}`,
+    );
+    expect(rekeyedWorker).toBe(turn1Worker);
+    expect(rekeyedWorker!.sessionId).toBe(turn2SessionId);
+    expect(rekeyedWorker!.state).toBe("IDLE");
+
+    await tightSched.closeAll("test_done");
+    tightSched.destroy();
+  });
+
+  test("34. Cold >112 KiB history spills earlier messages into _meta.antigravity.systemPrompt.append without omitting head turns", async () => {
+    const sessionId = `test-sys-spill-${Date.now()}`;
+    const chunk = "Y".repeat(10 * 1024); // 10 KiB (< 12 KiB clip limit)
+    const priorMessages: NormalizedAnthropicRequest["messages"] = [];
+    for (let i = 0; i < 16; i++) {
+      priorMessages.push(
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `${i === 0 ? "SEED_HEAD_MARKER_0 " : ""}User turn ${i}: ${chunk}`,
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: `Assistant turn ${i}: ${chunk}` }],
+        },
+      );
+    }
+
+    const req: NormalizedAnthropicRequest = {
+      model: "gemini-4-hydrogen",
+      system: "Large history spillover test",
+      messages: [
+        ...priorMessages,
+        {
+          role: "user",
+          content: [{ type: "text", text: "INSPECT_SYSTEM_APPEND final question" }],
+        },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    const sel: ModelSelection = {
+      rawModelId: "gemini-4-hydrogen",
+      configModelValue: "gemini-4-hydrogen",
+    };
+
+    let reply = "";
+    for await (const ev of coordinator.executeTurn(testAccount, req, sel)) {
+      if (ev.type === "text_delta") reply += ev.text;
+    }
+
+    expect(reply).toContain("hasPriorTag=true");
+    expect(reply).toContain("hasFirst=true");
+    expect(reply).toContain(
+      "[Earlier turns are preserved in <prior_conversation_history> above.]",
+    );
+    expect(reply).not.toContain("[... omitted ");
+
+    const worker = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker.systemHistorySeedApplied).toBe(true);
+    expect(Buffer.byteLength(reply, "utf-8")).toBeLessThan(120 * 1024);
+    await worker.close("test_done");
+  });
 });

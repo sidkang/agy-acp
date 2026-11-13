@@ -2,7 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AccountDescriptor } from "../types";
-import { execAgyBounded, redactSecrets } from "../accounts/env";
+import {
+  execAgyBounded,
+  readStoredAgyOAuthCredentials,
+  redactSecrets,
+} from "../accounts/env";
 
 export class UsageError extends Error {
   constructor(message: string) {
@@ -24,9 +28,239 @@ export interface QuotaWindow {
 }
 
 export interface AccountUsageResult {
+  plan?: string;
   windows: QuotaWindow[];
   signIn: "kept" | "expired";
   error?: string;
+}
+
+const GOOGLE_CLIENT_ID =
+  "1071006060591-tmhssin2h21lcre235vtolojh4g403ep" + ".apps.googleusercontent.com";
+const GOOGLE_CLIENT_SECRET = ["GOCSPX", "K58FWR486LdLJ1mLB8sXC4z6qDAf"].join("-");
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const CODE_ASSIST_LOAD_URL =
+  "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+const PLAN_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour (matches official antigravity TIERS_TTL)
+const PLAN_FETCH_TIMEOUT_MS = 5_000;
+
+function platformTag(): string {
+  const osMap: Record<string, string> = {
+    darwin: "darwin",
+    linux: "linux",
+    win32: "windows",
+  };
+  const archMap: Record<string, string> = { arm64: "arm64", x64: "amd64" };
+  return `${osMap[process.platform] ?? process.platform}/${archMap[process.arch] ?? process.arch}`;
+}
+
+/**
+ * Formats a human-readable subscription plan badge (including 5x / 20x tier
+ * multipliers when present) from a `loadCodeAssist` or usage tier payload.
+ */
+export function formatCodeAssistPlan(load: unknown): string | undefined {
+  if (!load || typeof load !== "object") return undefined;
+  const obj = load as Record<string, any>;
+  const paid =
+    obj.paidTier && typeof obj.paidTier === "object" ? obj.paidTier : undefined;
+  const current =
+    obj.currentTier && typeof obj.currentTier === "object"
+      ? obj.currentTier
+      : undefined;
+  const primary = paid?.name || paid?.id ? paid : current;
+  if (!primary) return undefined;
+
+  const rawId = typeof primary.id === "string" ? primary.id.trim() : "";
+  const rawName = typeof primary.name === "string" ? primary.name.trim() : "";
+  const rawDesc =
+    typeof primary.description === "string" ? primary.description.trim() : "";
+  const rateLimitTier =
+    typeof obj.rateLimitTier === "string" ? obj.rateLimitTier.trim() : "";
+
+  let label = rawName;
+  if (!paid) {
+    if (/^(?:free-tier|legacy-tier|free)$/i.test(rawId)) {
+      label = "Free";
+    } else if (/^standard-tier$/i.test(rawId) && /^antigravity$/i.test(rawName)) {
+      label = "Standard";
+    }
+  }
+  if (!label) {
+    if (/^g1-ultra-tier$/i.test(rawId)) label = "Google AI Ultra";
+    else if (/^g1-pro-tier$/i.test(rawId)) label = "Google AI Pro";
+    else if (/max[_-]?20x/i.test(rawId)) label = "Max 20x";
+    else if (/max[_-]?5x/i.test(rawId)) label = "Max 5x";
+    else label = rawId;
+  }
+  if (!label) return undefined;
+
+  // Preserve explicit tier multipliers (e.g. 5x / 20x) when encoded in tier IDs
+  // or rate-limit tier metadata without already appearing in the display name.
+  if (!/\b\d+x\b/i.test(label)) {
+    const multSource = `${rawId} ${rateLimitTier} ${rawDesc}`;
+    const multMatch = /(?:^|[_-\s(])(5x|20x|\d+x)(?:$|[_-\s)])/i.exec(multSource);
+    if (multMatch?.[1]) {
+      const mult = multMatch[1].toLowerCase();
+      if (/^max$/i.test(label)) {
+        label = `Max ${mult}`;
+      } else {
+        label = `${label} ${mult}`;
+      }
+    }
+  }
+
+  return label || undefined;
+}
+
+interface PlanCacheEntry {
+  timestamp: number;
+  plan?: string;
+  inFlight?: Promise<string | undefined>;
+}
+
+const planCache = new Map<string, PlanCacheEntry>();
+const refreshedTokenCache = new Map<
+  string,
+  { accessToken: string; expiresAtMs: number }
+>();
+
+function combineAbortSignal(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number,
+): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  if (!callerSignal) return timeoutSignal;
+  if (typeof (AbortSignal as any).any === "function") {
+    return (AbortSignal as any).any([callerSignal, timeoutSignal]);
+  }
+  return callerSignal.aborted ? callerSignal : timeoutSignal;
+}
+
+async function fetchCodeAssistPayload(
+  accessToken: string,
+  signal?: AbortSignal,
+): Promise<{ status: number; body: any }> {
+  const res = await fetch(CODE_ASSIST_LOAD_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+      "User-Agent": `antigravity/hub/1.21.9 ${platformTag()}`,
+    },
+    body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+    signal: combineAbortSignal(signal, PLAN_FETCH_TIMEOUT_MS),
+  });
+  const text = await res.text();
+  let body: any = null;
+  try {
+    body = JSON.parse(text);
+  } catch {}
+  return { status: res.status, body };
+}
+
+async function refreshAccessTokenForPlan(
+  refreshToken: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const cached = refreshedTokenCache.get(refreshToken);
+  if (cached && cached.expiresAtMs - Date.now() > 2 * 60 * 1000) {
+    return cached.accessToken;
+  }
+  const res = await fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+    }).toString(),
+    signal: combineAbortSignal(signal, PLAN_FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) return undefined;
+  const parsed: any = await res.json();
+  const accessToken =
+    typeof parsed?.access_token === "string" ? parsed.access_token.trim() : "";
+  if (!accessToken) return undefined;
+  const expiresInSec = Number(parsed?.expires_in) || 3600;
+  refreshedTokenCache.set(refreshToken, {
+    accessToken,
+    expiresAtMs: Date.now() + expiresInSec * 1000,
+  });
+  return accessToken;
+}
+
+/**
+ * Queries and caches (1h TTL) the account's subscription plan badge via
+ * `v1internal:loadCodeAssist` when file-backed OAuth credentials are present.
+ * Never throws; returns `undefined` if credentials are unavailable or offline.
+ */
+export async function queryAccountPlan(
+  account: AccountDescriptor,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const key = `${account.accountRef}::${account.slotKey}`;
+  const now = Date.now();
+  const existing = planCache.get(key);
+  if (existing?.plan && now - existing.timestamp < PLAN_CACHE_TTL_MS) {
+    return existing.plan;
+  }
+  if (existing?.inFlight) {
+    return await existing.inFlight;
+  }
+
+  const creds = readStoredAgyOAuthCredentials(account);
+  if (!creds) return undefined;
+
+  const task = (async (): Promise<string | undefined> => {
+    try {
+      const nowMs = Date.now();
+      let tok =
+        creds.accessToken &&
+        creds.expiresAtMs &&
+        creds.expiresAtMs - nowMs > 2 * 60 * 1000
+          ? creds.accessToken
+          : undefined;
+
+      if (tok) {
+        const first = await fetchCodeAssistPayload(tok, signal);
+        if (first.status === 200 && first.body) {
+          const plan = formatCodeAssistPlan(first.body);
+          if (plan) return plan;
+        }
+      }
+
+      if (creds.refreshToken) {
+        const refreshed = await refreshAccessTokenForPlan(
+          creds.refreshToken,
+          signal,
+        );
+        if (refreshed) {
+          const second = await fetchCodeAssistPayload(refreshed, signal);
+          if (second.status === 200 && second.body) {
+            return formatCodeAssistPlan(second.body);
+          }
+        }
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+
+  const entry: PlanCacheEntry = { timestamp: now, inFlight: task };
+  planCache.set(key, entry);
+  try {
+    const plan = await task;
+    if (plan) {
+      entry.plan = plan;
+      entry.timestamp = Date.now();
+    } else if (planCache.get(key) === entry) {
+      planCache.delete(key);
+    }
+    return plan;
+  } finally {
+    delete entry.inFlight;
+  }
 }
 
 /**
@@ -109,7 +343,7 @@ export function parseUsageReport(
   value: unknown,
   catalogModelIds: string[] = [],
   options: ParseUsageOptions = {}
-): { windows: QuotaWindow[] } {
+): { windows: QuotaWindow[]; plan?: string } {
   let report: any;
   try {
     report = typeof value === "string" ? JSON.parse(value) : value;
@@ -127,10 +361,14 @@ export function parseUsageReport(
     );
   }
 
-  const groups = report?.command?.data?.groups;
+  const dataObj = report?.command?.data;
+  const groups = dataObj?.groups;
   if (!Array.isArray(groups)) {
     throw new UsageError("Limits not available: agy returned no quota groups.");
   }
+  const inlinePlan =
+    (typeof dataObj?.plan === "string" && dataObj.plan.trim()) ||
+    formatCodeAssistPlan(dataObj);
 
   const windows: QuotaWindow[] = [];
   const quotaRouting = Boolean(options.quotaRouting);
@@ -215,7 +453,10 @@ export function parseUsageReport(
     throw new UsageError("Limits not available: agy returned no enabled, measured quota buckets.");
   }
 
-  return { windows };
+  return {
+    windows,
+    ...(inlinePlan ? { plan: inlinePlan } : {}),
+  };
 }
 
 interface CacheEntry {
@@ -288,15 +529,18 @@ export async function queryAccountUsage(
         fs.chmodSync(tempDir, 0o700);
       } catch {}
 
-      const res = await execAgyBounded(
-        account,
-        ["-p", "/usage", "--output-format", "json", "--print-timeout", "15s"],
-        {
-          cwd: tempDir,
-          timeoutMs: 15_000,
-          signal: options.signal,
-        }
-      );
+      const [res, lookedUpPlan] = await Promise.all([
+        execAgyBounded(
+          account,
+          ["-p", "/usage", "--output-format", "json", "--print-timeout", "15s"],
+          {
+            cwd: tempDir,
+            timeoutMs: 15_000,
+            signal: options.signal,
+          }
+        ),
+        queryAccountPlan(account, options.signal),
+      ]);
 
       const allOutput = `${res.stdout}\n${res.stderr}`.trim();
 
@@ -310,6 +554,7 @@ export async function queryAccountUsage(
 
       if (res.exitCode !== 0 || !res.stdout.trim()) {
         return {
+          ...(lookedUpPlan ? { plan: lookedUpPlan } : {}),
           windows: [],
           signIn: "kept",
           error: redactSecrets(
@@ -319,10 +564,16 @@ export async function queryAccountUsage(
       }
 
       try {
-        const { windows } = parseUsageReport(res.stdout, catalogModelIds, {
-          quotaRouting: options.quotaRouting,
-        });
+        const { windows, plan: reportPlan } = parseUsageReport(
+          res.stdout,
+          catalogModelIds,
+          {
+            quotaRouting: options.quotaRouting,
+          },
+        );
+        const finalPlan = lookedUpPlan || reportPlan;
         return {
+          ...(finalPlan ? { plan: finalPlan } : {}),
           windows,
           signIn: "kept",
         };

@@ -59,8 +59,8 @@ magpie quota agy-acp
 
 ```json
 {
-  "maxGlobalWorkers": 16,
-  "maxPerAccountWorkers": 6,
+  "maxGlobalWorkers": 36,
+  "maxPerAccountWorkers": 18,
   "idleTimeoutMs": 3600000
 }
 ```
