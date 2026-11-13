@@ -53,18 +53,9 @@ export class StepUsageTracker {
     return this.lastReportedStepIdx;
   }
 
-  /** How many model steps the prompt in flight has run. */
-  get promptStepCount(): number {
-    return this.stepCountInPrompt;
-  }
-
   /** A tool batch ended a step: the next prompt's usage covers one more. */
   incrementPromptStepCount(): void {
     this.stepCountInPrompt += 1;
-  }
-
-  resetPromptStepCount(): void {
-    this.stepCountInPrompt = 1;
   }
 
   /**
@@ -75,12 +66,10 @@ export class StepUsageTracker {
     account: AccountDescriptor,
     nativeSessionId: string,
   ): void {
-    try {
-      const steps = readConversationStepUsages(account, nativeSessionId);
-      if (steps.length > 0) {
-        this.lastReportedStepIdx = steps[steps.length - 1]!.idx;
-      }
-    } catch {}
+    const steps = readConversationStepUsages(account, nativeSessionId);
+    if (steps.length > 0) {
+      this.lastReportedStepIdx = steps[steps.length - 1]!.idx;
+    }
   }
 
   readUnseenStepsSync(
@@ -88,12 +77,7 @@ export class StepUsageTracker {
     nativeSessionId: string,
   ): StepTokenUsage[] {
     if (!nativeSessionId) return [];
-    let steps: StepTokenUsage[];
-    try {
-      steps = readConversationStepUsages(account, nativeSessionId);
-    } catch {
-      return [];
-    }
+    const steps = readConversationStepUsages(account, nativeSessionId);
     const unseen = steps.filter((s) => s.idx > this.lastReportedStepIdx);
     if (unseen.length > 0) {
       this.lastReportedStepIdx = unseen[unseen.length - 1]!.idx;
@@ -114,14 +98,9 @@ export class StepUsageTracker {
     options?: ReadUnseenStepsOptions,
   ): Promise<StepTokenUsage[]> {
     let unseen = this.readUnseenStepsSync(account, nativeSessionId);
-    if (unseen.length > 0 || !nativeSessionId) return unseen;
+    if (unseen.length > 0) return unseen;
 
-    let dbPath: string | null = null;
-    try {
-      dbPath = resolveConversationDbPath(account, nativeSessionId);
-    } catch {
-      dbPath = null;
-    }
+    const dbPath = resolveConversationDbPath(account, nativeSessionId);
     if (!dbPath || !fs.existsSync(dbPath)) return unseen;
 
     for (let attempt = 0; attempt < retries; attempt++) {

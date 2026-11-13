@@ -1,7 +1,7 @@
 // Ported from MIT-licensed `packages/agy-cli/cloak.mjs` & volatile-system
 // helpers in `packages/agy-cli/index.mjs` (magpie-community/plugins).
 
-export const TURNED_AWAY: readonly string[] = [
+const TURNED_AWAY: readonly string[] = [
   "x-anthropic-billing-header:",
   "built on anthropic's claude agent sdk",
   "you are codex, an agent based on gpt-5",
@@ -12,7 +12,7 @@ export const TURNED_AWAY: readonly string[] = [
 
 const ZW = "\u200B";
 
-export function asciiLower(s: string): string {
+function asciiLower(s: string): string {
   return String(s ?? "").replace(/[A-Z]/g, (ch) =>
     String.fromCharCode(ch.charCodeAt(0) + 32),
   );
@@ -30,14 +30,14 @@ const breakUp = (line: string): string =>
  * Paragraphs that Antigravity accepts without 429 but answers poorly unless reworded
  * with equivalent meaning (e.g. DeepSeek Harness @-path rule, #1028).
  */
-export const REWORDED: ReadonlyArray<readonly [string, string]> = [
+const REWORDED: ReadonlyArray<readonly [string, string]> = [
   [
     'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.',
     'When the user writes @ followed by a path, they are pointing at that file or folder. Relative paths start at the workspace root; absolute paths are host paths. A path ending in a slash is a folder, so list it if its contents matter; otherwise it is a file, so open it with the read tool before relying on it. Paths with spaces appear as @"...".',
   ],
 ];
 
-export function rewordSystemPrompt(system: string): string {
+function rewordSystemPrompt(system: string): string {
   let out = String(system ?? "");
   for (const [from, to] of REWORDED) {
     if (out.includes(from)) {
@@ -50,7 +50,7 @@ export function rewordSystemPrompt(system: string): string {
 /**
  * Strips Claude Code's rotating billing header line before forwarding or comparing.
  */
-export function stripBillingHeader(text: string | undefined | null): string {
+function stripBillingHeader(text: string | undefined | null): string {
   let s = String(text ?? "");
   s = s.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*\n?/gim, "");
   s = s.replace(/^[ \t]*cch=[0-9a-fA-F]+;?[ \t]*\n?/gim, "");
@@ -65,11 +65,11 @@ const AGENT_CLOCK_LINE_RE = new RegExp(
   "i",
 );
 
-export function isAgentClockLine(line: string): boolean {
+function isAgentClockLine(line: string): boolean {
   return AGENT_CLOCK_LINE_RE.test(String(line ?? "").trim());
 }
 
-export function stripAgentClockLines(text: string | undefined | null): string {
+function stripAgentClockLines(text: string | undefined | null): string {
   const s = String(text ?? "");
   if (!s) return s;
   return s

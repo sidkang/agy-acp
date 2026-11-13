@@ -10,26 +10,17 @@ import {
   type TurnStreamEvent,
 } from "../src/types";
 import { getPluginDataRoot } from "../src/accounts/env";
+import { AgySessionWorker, type ModelSelection } from "../src/runtime/worker";
 import {
-  AgySessionWorker,
   AsyncEventQueue,
   DEFAULT_MAX_TURN_QUEUE_BYTES,
-  type ModelSelection,
-} from "../src/runtime/worker";
+} from "../src/runtime/turn-context";
 import { measureProcessTreeRssBytes } from "../src/runtime/rss";
 import { encodeAnthropicSseResponse } from "../src/protocol/anthropic";
 import { GlobalScheduler } from "../src/runtime/scheduler";
 import { SessionCoordinator } from "../src/sessions/coordinator";
 import { getSharedMcpServer } from "../src/mcp/http-server";
-
-const fakeAcpPath = path.resolve(__dirname, "fixtures/fake-acp.ts");
-
-function spawnFakeAcp(account: AccountDescriptor, args: string[], opts?: any) {
-  return spawn("bun", ["run", fakeAcpPath], {
-    cwd: opts?.cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-}
+import { spawnFakeAcp, withEnv } from "./fixtures/helpers";
 
 const accountA: AccountDescriptor = {
   slotKey: "agy#phase2-a",
@@ -96,6 +87,28 @@ function makeMockWorker(
 }
 
 describe("Phase 2 GlobalScheduler wait-for-room", () => {
+  test("AGY_BRIDGE_MAX_PROCS only accepts a positive integer, otherwise the 16 default stands", async () => {
+    for (const invalid of ["abc", "0", "-3"]) {
+      await withEnv({ AGY_BRIDGE_MAX_PROCS: invalid }, () => {
+        const scheduler = new GlobalScheduler();
+        try {
+          expect(scheduler.maxGlobalWorkers).toBe(16);
+        } finally {
+          scheduler.destroy();
+        }
+      });
+    }
+
+    await withEnv({ AGY_BRIDGE_MAX_PROCS: "5" }, () => {
+      const scheduler = new GlobalScheduler();
+      try {
+        expect(scheduler.maxGlobalWorkers).toBe(5);
+      } finally {
+        scheduler.destroy();
+      }
+    });
+  });
+
   test("parks the request and admits it as soon as a slot frees", async () => {
     const scheduler = new GlobalScheduler({
       maxGlobalWorkers: 1,
@@ -537,7 +550,7 @@ describe("Phase 2 GlobalScheduler wait-for-room", () => {
       expect(eventsB.some((e) => e.type === "finish")).toBe(true);
 
       // Session A must NOT be shelved in memory or on disk.
-      expect((coordinator as any).parkedSessions.has(sessionKeyA)).toBe(false);
+      expect(coordinator.shelf.memorySessions.has(sessionKeyA)).toBe(false);
       if (fs.existsSync(parkedFile)) {
         const persisted = JSON.parse(fs.readFileSync(parkedFile, "utf8"));
         expect(persisted?.sessions?.[sessionKeyA]).toBeUndefined();

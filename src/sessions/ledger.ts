@@ -122,9 +122,13 @@ export function getToolChoiceReminder(
   return null;
 }
 
-export function validateNoOrphanToolResults(
+/**
+ * The first `tool_result` whose `tool_use_id` has no earlier `tool_use`, or
+ * `null` when the transcript is consistent.
+ */
+function firstOrphanToolResultId(
   messages: NormalizedMessage[],
-): void {
+): string | null {
   const toolUseIds = new Set<string>();
   for (const msg of messages) {
     if (msg.role === "assistant") {
@@ -134,49 +138,31 @@ export function validateNoOrphanToolResults(
     } else if (msg.role === "user") {
       for (const part of msg.content) {
         if (part.type === "tool_result" && !toolUseIds.has(part.toolUseId)) {
-          throw new BridgeHttpError(
-            400,
-            "invalid_request_error",
-            `Orphan tool_result with tool_use_id '${part.toolUseId}' has no matching prior tool_use`,
-          );
+          return part.toolUseId;
         }
       }
     }
+  }
+  return null;
+}
+
+export function validateNoOrphanToolResults(
+  messages: NormalizedMessage[],
+): void {
+  const orphanId = firstOrphanToolResultId(messages);
+  if (orphanId !== null) {
+    throw new BridgeHttpError(
+      400,
+      "invalid_request_error",
+      `Orphan tool_result with tool_use_id '${orphanId}' has no matching prior tool_use`,
+    );
   }
 }
 
 export function hasNoOrphanToolResults(
   messages: NormalizedMessage[],
 ): boolean {
-  const toolUseIds = new Set<string>();
-  for (const msg of messages) {
-    if (msg.role === "assistant") {
-      for (const part of msg.content) {
-        if (part.type === "tool_use") toolUseIds.add(part.id);
-      }
-    } else if (msg.role === "user") {
-      for (const part of msg.content) {
-        if (part.type === "tool_result" && !toolUseIds.has(part.toolUseId)) {
-          return false;
-        }
-      }
-    }
-  }
-  return true;
-}
-
-export function requestHasImages(messages: NormalizedMessage[]): boolean {
-  for (const msg of messages) {
-    for (const part of msg.content) {
-      if (part.type === "image") return true;
-      if (part.type === "tool_result") {
-        for (const item of part.content) {
-          if (item.type === "image") return true;
-        }
-      }
-    }
-  }
-  return false;
+  return firstOrphanToolResultId(messages) === null;
 }
 
 /** True when the transcript ends with `assistant(tool_use)` + matching results. */
@@ -950,31 +936,6 @@ export function matchPersistedPrefix(
     incomingPrefixLength: lm.incomingPrefixLength,
     viaLostMedia: true,
   };
-}
-
-/**
- * Content hash of everything that decides whether a native session may serve a
- * request: account, mode, workspace, stable system prompt, and the tool set.
- * Two requests with the same hash are in the same compatibility scope, which is
- * what a secondary (header-less) session lookup filters on before it compares
- * ledgers.
- */
-export function computeSessionContextHash(params: {
-  accountRef: string;
-  minimalAgent: boolean;
-  workDir?: string;
-  systemPrompt?: string;
-  toolsDigests: PersistedToolDigest[];
-}): string {
-  return sha256Hex(
-    stableJson({
-      accountRef: params.accountRef,
-      minimalAgent: params.minimalAgent,
-      workDir: normalizeWorkDir(params.workDir) ?? "",
-      systemPrompt: stripVolatileSystem(params.systemPrompt ?? ""),
-      tools: params.toolsDigests.map((t) => [t.name, t.schemaDigest]),
-    }),
-  );
 }
 
 // ---------------------------------------------------------------------------

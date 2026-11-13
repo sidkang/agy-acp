@@ -30,7 +30,6 @@ export interface AccountCatalog {
   readonly routes: Map<string, CatalogFamilyRoute>;
   readonly rawIds: Set<string>;
   readonly variants: Map<string, OfferedModelVariant>;
-  readonly fetchedAt: number;
   readonly isFallback: boolean;
 }
 
@@ -143,8 +142,6 @@ export function closestEffort(requested: EffortLevel, available: EffortLevel[]):
 }
 
 export interface BuildCatalogOptions {
-  availableModels?: Array<{ id: string; name?: string }>;
-  configOptions?: any[];
   isFallback?: boolean;
 }
 
@@ -279,25 +276,11 @@ export function buildCatalog(
     }
   }
 
-  // Enrich with ACP availableModels or configOptions if provided
-  if (options?.availableModels && options.availableModels.length > 0) {
-    const offeredIds = new Set(options.availableModels.map((m) => m.id));
-    for (const offered of options.availableModels) {
-      if (!models.some((m) => m.id === offered.id) && !routes.has(offered.id)) {
-        models.push({
-          id: offered.id,
-          name: offered.name || offered.id,
-        });
-      }
-    }
-  }
-
   return {
     models,
     routes,
     rawIds,
     variants: variantsMap,
-    fetchedAt: Date.now(),
     isFallback: Boolean(options?.isFallback),
   };
 }
@@ -612,7 +595,7 @@ export class CatalogService {
     this.pruneStaleCache(now);
     const cached = this.cache.get(cacheScopeKey);
 
-    if (!options?.forceRefresh && cached && !cached.catalog.isFallback && now - cached.fetchedAt < CATALOG_TTL_MS) {
+    if (!options?.forceRefresh && cached && now - cached.fetchedAt < CATALOG_TTL_MS) {
       return { catalog: cached.catalog, fellBack: false };
     }
 
@@ -620,7 +603,7 @@ export class CatalogService {
     if (!refresh) {
       refresh = this.fetchAccountCatalog(account, options?.signal)
         .then((lookup) => {
-          if (!lookup.fellBack && !lookup.catalog.isFallback) {
+          if (!lookup.fellBack) {
             this.cache.set(cacheScopeKey, { catalog: lookup.catalog, fetchedAt: Date.now() });
           }
           return lookup;

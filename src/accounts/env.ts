@@ -7,7 +7,6 @@ import type { AccountDescriptor } from "../types";
 // Capture host startup environment ONCE at module load
 export const HOST_HOME = process.env.HOME;
 export const HOST_XDG_DATA_HOME = process.env.XDG_DATA_HOME;
-export const HOST_XDG_STATE_HOME = process.env.XDG_STATE_HOME;
 export const HOST_PATH = process.env.PATH ?? "";
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -321,6 +320,20 @@ export function spawnAgy(
     windowsHide: true,
     detached: false,
   });
+}
+
+/**
+ * True when `pid` refers to a running OS process (`pid > 1`). `EPERM` means
+ * the process exists under a different user and is treated as alive.
+ */
+export function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code === "EPERM";
+  }
 }
 
 function collectUnixDescendantsBottomUp(rootPid: number): number[] {

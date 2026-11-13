@@ -31,7 +31,7 @@ import {
   normalizeWorkDir,
   subagentIdFromSessionKey,
   systemPromptsMatch,
-  type PersistedParkedSession,
+  type GeneratedToolCall,
   utf8Bytes,
   validateNoOrphanToolResults,
 } from "./ledger";
@@ -44,7 +44,6 @@ import {
 import {
   ShelfStore,
   type ClaimedShelfResume,
-  type ParkedSession,
   type WorkerParkSnapshot,
 } from "./shelf-store";
 
@@ -117,9 +116,7 @@ export class SessionCoordinator {
   private readonly maxWorkerRssBytes: number;
 
   /** Warm shelf + zero-plaintext resume index, behind one module (ARCH-1). */
-  private readonly shelf = new ShelfStore();
-  /** The shelf's memory map, named as callers and tests know it. */
-  private readonly parkedSessions: Map<string, ParkedSession>;
+  readonly shelf = new ShelfStore();
 
   private readonly sessionLocks = new Map<string, Promise<void>>();
   private readonly activeWorkers = new Map<string, AgySessionWorker>();
@@ -132,7 +129,6 @@ export class SessionCoordinator {
     this.defaultSpawnFn = options.spawnFn;
     this.providerOptions = options.providerOptions;
     this.maxWorkerRssBytes = resolveMaxWorkerRssBytes(options.maxWorkerRssBytes);
-    this.parkedSessions = this.shelf.memorySessions;
 
     // Typed lifecycle hooks instead of overwriting the scheduler's properties:
     // a second coordinator (or a test) can register its own without clobbering
@@ -147,19 +143,6 @@ export class SessionCoordinator {
         this.sweepAccountStorage(now);
       }
     });
-  }
-
-  private get persistedSessions(): Map<string, PersistedParkedSession> {
-    return this.shelf.persistedSessionsMap;
-  }
-
-  /** The index file the shelf resolved, as the plugin-host restart path expects. */
-  private get persistedSessionsFile(): string | null {
-    return this.shelf.loadedFile;
-  }
-
-  private ensurePersistedSessionsLoaded(now = Date.now()): void {
-    this.shelf.ensureLoaded(now);
   }
 
   pruneParkedSessions(now = Date.now()): void {
@@ -212,14 +195,6 @@ export class SessionCoordinator {
     };
   }
 
-  /** Would parking this worker leave behind a resume source of any kind? */
-  private canRetainResumeCheckpoint(worker: AgySessionWorker): boolean {
-    if (!worker.nativeSessionId) return false;
-    return this.shelf.canRetainCheckpoint(
-      this.snapshotForWorker(worker, this.sessionKeyForWorker(worker)),
-    );
-  }
-
   /**
    * True when a cleanly finished worker should be swapped out for memory rather
    * than reused. Only IDLE (never AWAITING_TOOL_RESULTS) sessions qualify, and
@@ -232,10 +207,9 @@ export class SessionCoordinator {
     if (worker.state !== "IDLE") return false;
     if (!worker.resumeSupported) return false;
     if (!worker.nativeSessionId) return false;
-    // Recycling is only worth it if a resume checkpoint can actually be kept:
-    // retiring a worker whose session is too large for the memory shelf *and*
-    // seeded (so no digest index) would destroy the warm conversation outright.
-    if (!this.canRetainResumeCheckpoint(worker)) return false;
+    // Parking is best-effort: the caller only retires when `parkSession` reports
+    // a retained resume source, so a ledger too large for the memory shelf and
+    // too seeded for the digest index keeps its warm worker instead.
     return worker.getRssBytes() > this.maxWorkerRssBytes;
   }
 
@@ -255,16 +229,9 @@ export class SessionCoordinator {
     );
   }
 
+  /** The live worker registered under `sessionKey`, if any. */
   getActiveWorker(sessionKey: string): AgySessionWorker | undefined {
-    const direct = this.activeWorkers.get(sessionKey);
-    if (direct) return direct;
-    for (const [key, worker] of this.activeWorkers) {
-      const parts = key.split("::");
-      if (parts.length === 3 && `${parts[0]}::${parts[2]}` === sessionKey) {
-        return worker;
-      }
-    }
-    return undefined;
+    return this.activeWorkers.get(sessionKey);
   }
 
   // ---------------------------------------------------------------------------
@@ -524,8 +491,8 @@ export class SessionCoordinator {
         existingWorker,
         req,
         sessionKey,
-        signal,
         modelSelection,
+        signal,
         options,
       );
       return;
@@ -718,6 +685,90 @@ export class SessionCoordinator {
     return best.worker;
   }
 
+  /**
+   * Fails a request that carries images for a worker whose `agy` build cannot
+   * take them.
+   *
+   * `retire` is for a worker created for this very request: it can never serve
+   * it, so it is closed instead of being left parked for reuse. A pre-existing
+   * worker keeps its session — the caller may still use it without images.
+   */
+  private async assertImagesSupported(
+    worker: AgySessionWorker,
+    req: NormalizedAnthropicRequest,
+    retire = false,
+  ): Promise<void> {
+    if (worker.imageSupported) return;
+    if (!requestHasImages(req.messages)) return;
+    if (retire) await this.retireWorker(worker, "image_not_supported");
+    throw new BridgeHttpError(
+      400,
+      "invalid_request_error",
+      "Images are not supported by the underlying agent",
+    );
+  }
+
+  /**
+   * Folds one turn event into the accumulator: the committed ledger needs the
+   * whole answer and every tool call, and the same event decides the outcome.
+   */
+  private foldTurnEvent(
+    fold: TurnFold,
+    worker: AgySessionWorker,
+    req: NormalizedAnthropicRequest,
+    sessionKey: string,
+    event: TurnStreamEvent,
+  ): void {
+    if (event.type === "tool_use") {
+      fold.generatedToolCalls.push(event);
+    } else if (event.type === "text_delta") {
+      fold.fullAnswerText += event.text;
+    } else if (event.type === "error") {
+      fold.sawError = true;
+    } else if (event.type === "finish") {
+      fold.turnFinishedCleanly = true;
+      commitAssistantTurn(
+        worker,
+        req,
+        fold.fullAnswerText,
+        fold.generatedToolCalls,
+      );
+      if (fold.generatedToolCalls.length === 0) {
+        this.shelf.recordPersisted(
+          sessionKey,
+          this.snapshotForWorker(worker, sessionKey),
+        );
+      }
+    }
+  }
+
+  /**
+   * What every stateful turn does once its event loop is done: retire a worker
+   * whose turn did not end cleanly, or park and close one whose tree outgrew the
+   * RSS ceiling. Runs while the worker is still pinned, because an unpinned IDLE
+   * worker becomes evictable immediately and a waiting admission would park the
+   * very session this is about to discard.
+   */
+  private async settleStatefulTurn(
+    worker: AgySessionWorker,
+    fold: Pick<TurnFold, "sawError" | "turnFinishedCleanly">,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const why = fold.sawError
+      ? "turn_error"
+      : this.shouldRetireUnfinishedTurn(worker, fold.turnFinishedCleanly, signal);
+    if (why) {
+      await this.retireWorker(worker, why);
+      return;
+    }
+    if (!fold.turnFinishedCleanly || !this.shouldRecycleForRss(worker)) return;
+    // Park first, while the session key is still registered, so the next turn
+    // resumes this exact conversation in a fresh process.
+    if (this.parkSession(worker)) {
+      await this.retireWorker(worker, "rss_limit_exceeded");
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Retirement
   // ---------------------------------------------------------------------------
@@ -791,31 +842,6 @@ export class SessionCoordinator {
         false,
     );
     const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
-    const now = Date.now();
-
-    // Exactly one resume source, memory first then the digest index. A stale
-    // in-memory entry is dropped inside the shelf so it can never donate its
-    // ledger or system-history seed to a session resumed from disk (HIGH-3).
-    //
-    // `claimResume` reserves the native session id *before* the first `await`,
-    // so two forks racing on the same conversation cannot both be handed the
-    // same `agy` session; the claim is released when this turn ends.
-    const resumeSource: ClaimedShelfResume | null = this.shelf.claimResume({
-      account,
-      req,
-      sessionKey,
-      requestedMinimalAgent,
-      now,
-      hasCustomSpawnFn: Boolean(spawnFn),
-      isKeyBusy: (key) =>
-        this.sessionLocks.has(key) || this.activeWorkers.has(key),
-    });
-
-    const resumeSessionId = resumeSource?.entry.nativeSessionId;
-    const resumeSystemHistorySeed =
-      resumeSource?.kind === "memory"
-        ? resumeSource.entry.systemHistorySeed
-        : undefined;
 
     const { priorMessages, currentMessages } = splitPriorAndCurrent(
       req.messages,
@@ -841,8 +867,6 @@ export class SessionCoordinator {
       exposeThinking: req.thinkingEnabled,
       cloakPrompts,
       workDir: req.workDir,
-      resumeSessionId,
-      resumeSystemHistorySeed,
       systemPrompt: req.system,
       systemHistorySeed: coldPlan.systemHistorySeed,
       tools: req.tools,
@@ -873,10 +897,10 @@ export class SessionCoordinator {
     // or a consumer that unwound the generator mid-turn, e.g. the SSE/JSON
     // encoders calling `iterator.return()` on `{ type: "error" }`).
     const releasePin = worker.pin();
+    const fold = newTurnFold();
+    let resumeSource: ClaimedShelfResume | null = null;
     let started = false;
     let handedOff = false;
-    let sawError = false;
-    let turnFinishedCleanly = false;
 
     try {
       try {
@@ -888,6 +912,38 @@ export class SessionCoordinator {
       this.activeWorkers.set(sessionKey, worker);
 
       try {
+        if (signal?.aborted) {
+          throw new BridgeHttpError(
+            499,
+            "invalid_request_error",
+            "Request aborted before the worker could start",
+          );
+        }
+        // Exactly one resume source, memory first then the digest index. A stale
+        // in-memory entry is dropped inside the shelf so it can never donate its
+        // ledger or system-history seed to a session resumed from disk (HIGH-3).
+        //
+        // The claim runs synchronously and only once this turn owns the session
+        // (registered above, still pinned): it reserves the native session id
+        // before the first `await` inside it, so two forks racing on the same
+        // conversation cannot both be handed the same `agy` session, and the
+        // session it claims is already this turn's own warm entry.
+        resumeSource = this.shelf.claimResume({
+          account,
+          req,
+          sessionKey,
+          requestedMinimalAgent,
+          now: Date.now(),
+          hasCustomSpawnFn: Boolean(spawnFn),
+          isKeyBusy: (key) =>
+            key !== sessionKey &&
+            (this.sessionLocks.has(key) || this.activeWorkers.has(key)),
+        });
+        workerOptions.resumeSessionId = resumeSource?.entry.nativeSessionId;
+        workerOptions.resumeSystemHistorySeed =
+          resumeSource?.kind === "memory"
+            ? resumeSource.entry.systemHistorySeed
+            : undefined;
         await worker.start(signal);
         started = true;
       } catch (err) {
@@ -897,53 +953,20 @@ export class SessionCoordinator {
         throw err;
       }
 
-      if (worker.resumedFromShelf && resumeSource?.kind === "memory") {
-        // Bind only THIS entry's ledger, never a competing persisted one.
-        worker.committedMessages = [...resumeSource.entry.committedMessages];
-        worker.registeredTools = [...resumeSource.entry.registeredTools];
-        this.shelf.consumeMemory(
-          resumeSource.matchedKey,
-          worker.nativeSessionId,
-        );
-        handedOff = true;
-        yield* this.executeWarmIdleTurn(
-          worker,
-          req,
-          modelSelection,
-          sessionKey,
-          signal,
-          resumeSource.matchedPrefixLength,
-          options,
-          recoveringFromInvalidation,
-        );
-        return;
-      }
-      if (!worker.resumedFromShelf && resumeSource?.kind === "memory") {
-        // The agent refused `session/resume` (or its .db vanished): drop the
-        // shelf entry and cold-start instead of trusting a stale ledger.
-        this.shelf.consumeMemory(
-          resumeSource.matchedKey,
-          resumeSource.entry.nativeSessionId,
-        );
-      }
-
-      if (worker.resumedFromShelf && resumeSource?.kind === "persisted") {
-        // Rebuild the ledger from the matched prefix only; the digests prove this
-        // slice of the incoming transcript is the pre-restart conversation.
-        worker.committedMessages = req.messages.slice(
-          0,
-          resumeSource.matchedPrefixLength,
-        );
-        worker.registeredTools = [...req.tools];
-        if (resumeSource.viaSecondaryHash) {
-          this.shelf.consumeMemory(
-            resumeSource.matchedKey,
-            worker.nativeSessionId,
+      if (worker.resumedFromShelf && resumeSource) {
+        if (resumeSource.kind === "memory") {
+          // Bind only THIS entry's ledger, never a competing persisted one.
+          worker.committedMessages = [...resumeSource.entry.committedMessages];
+          worker.registeredTools = [...resumeSource.entry.registeredTools];
+        } else {
+          // Rebuild the ledger from the matched prefix only; the digests prove
+          // this slice of the incoming transcript is the pre-restart
+          // conversation.
+          worker.committedMessages = req.messages.slice(
+            0,
+            resumeSource.matchedPrefixLength,
           );
-          this.shelf.invalidate(
-            resumeSource.matchedKey,
-            worker.nativeSessionId,
-          );
+          worker.registeredTools = [...req.tools];
         }
         handedOff = true;
         yield* this.executeWarmIdleTurn(
@@ -959,23 +982,7 @@ export class SessionCoordinator {
         return;
       }
 
-      if (!worker.resumedFromShelf && resumeSource?.kind === "persisted") {
-        // Resume was rejected by the agent (or its .db vanished): drop the stale
-        // index entry and continue with a normal cold start.
-        this.shelf.invalidate(
-          resumeSource.matchedKey,
-          resumeSource.entry.nativeSessionId,
-        );
-      }
-
-      if (requestHasImages(req.messages) && !worker.imageSupported) {
-        await this.retireWorker(worker, "image_not_supported");
-        throw new BridgeHttpError(
-          400,
-          "invalid_request_error",
-          "Images are not supported by the underlying agent",
-        );
-      }
+      await this.assertImagesSupported(worker, req, true);
 
       await worker.applyModelSelection(modelSelection, signal);
 
@@ -990,14 +997,6 @@ export class SessionCoordinator {
       if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
         unshiftSystemInstructions(promptParts, worker.effectiveSystemPrompt);
       }
-
-      const generatedToolCalls: Array<{
-        type: "tool_use";
-        id: string;
-        name: string;
-        input: Record<string, unknown>;
-      }> = [];
-      let fullAnswerText = "";
 
       // Advancing a native session past its checkpoint must be unconditional:
       // an un-removable older checkpoint would later be resumed as if it still
@@ -1025,22 +1024,7 @@ export class SessionCoordinator {
         return;
       }
       for await (const event of worker.startPromptTurn(promptParts, signal)) {
-        if (event.type === "tool_use") {
-          generatedToolCalls.push(event);
-        } else if (event.type === "text_delta") {
-          fullAnswerText += event.text;
-        } else if (event.type === "error") {
-          sawError = true;
-        } else if (event.type === "finish") {
-          turnFinishedCleanly = true;
-          commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
-          if (generatedToolCalls.length === 0) {
-            this.shelf.recordPersisted(
-              sessionKey,
-              this.snapshotForWorker(worker, sessionKey),
-            );
-          }
-        }
+        this.foldTurnEvent(fold, worker, req, sessionKey, event);
         yield event;
       }
     } finally {
@@ -1052,18 +1036,7 @@ export class SessionCoordinator {
         if (started && !handedOff) {
           // A fresh worker has no previously committed turns to preserve: any
           // uncommitted exit must retire it from coordinator and scheduler alike.
-          const why = sawError
-            ? "turn_error"
-            : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-          if (why) {
-            await this.retireWorker(worker, why);
-          } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
-            // Park first, while the session key is still registered, so the next
-            // turn resumes this exact conversation in a fresh process.
-            if (this.parkSession(worker)) {
-              await this.retireWorker(worker, "rss_limit_exceeded");
-            }
-          }
+          await this.settleStatefulTurn(worker, fold, signal);
         }
       } finally {
         releasePin();
@@ -1087,18 +1060,11 @@ export class SessionCoordinator {
     recoveringFromInvalidation = false,
   ): AsyncGenerator<TurnStreamEvent> {
     const releasePin = worker.pin();
+    const fold = newTurnFold();
     let handedOff = false;
     let promptStarted = false;
-    let sawError = false;
-    let turnFinishedCleanly = false;
     try {
-      if (requestHasImages(req.messages) && !worker.imageSupported) {
-        throw new BridgeHttpError(
-          400,
-          "invalid_request_error",
-          "Images are not supported by the underlying agent",
-        );
-      }
+      await this.assertImagesSupported(worker, req);
 
       worker.setExposeThinking(req.thinkingEnabled);
       await worker.applyModelSelection(modelSelection, signal);
@@ -1112,14 +1078,6 @@ export class SessionCoordinator {
       const deltaMessages = req.messages.slice(prefixLen);
       const promptParts = renderMessagesToPrompt([], deltaMessages);
       appendToolChoiceReminder(promptParts, req);
-
-      const generatedToolCalls: Array<{
-        type: "tool_use";
-        id: string;
-        name: string;
-        input: Record<string, unknown>;
-      }> = [];
-      let fullAnswerText = "";
 
       // Same rule as the cold path: never advance a warm native session while an
       // older checkpoint for it is still resumable from the index.
@@ -1146,37 +1104,13 @@ export class SessionCoordinator {
       }
       promptStarted = true;
       for await (const event of worker.startPromptTurn(promptParts, signal)) {
-        if (event.type === "tool_use") {
-          generatedToolCalls.push(event);
-        } else if (event.type === "text_delta") {
-          fullAnswerText += event.text;
-        } else if (event.type === "error") {
-          sawError = true;
-        } else if (event.type === "finish") {
-          turnFinishedCleanly = true;
-          commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
-          if (generatedToolCalls.length === 0) {
-            this.shelf.recordPersisted(
-              sessionKey,
-              this.snapshotForWorker(worker, sessionKey),
-            );
-          }
-        }
+        this.foldTurnEvent(fold, worker, req, sessionKey, event);
         yield event;
       }
     } finally {
       try {
         if (promptStarted && !handedOff) {
-          const why = sawError
-            ? "turn_error"
-            : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-          if (why) {
-            await this.retireWorker(worker, why);
-          } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
-            if (this.parkSession(worker)) {
-              await this.retireWorker(worker, "rss_limit_exceeded");
-            }
-          }
+          await this.settleStatefulTurn(worker, fold, signal);
         }
       } finally {
         releasePin();
@@ -1192,11 +1126,12 @@ export class SessionCoordinator {
     worker: AgySessionWorker,
     req: NormalizedAnthropicRequest,
     sessionKey: string,
+    modelSelection: ModelSelection,
     signal?: AbortSignal,
-    modelSelection?: ModelSelection,
     options?: TurnExecutionOptions,
   ): AsyncGenerator<TurnStreamEvent> {
     const releasePin = worker.pin();
+    const fold = newTurnFold();
     if (options?.steerCancelTimeoutMs !== undefined) {
       worker.steerCancelTimeoutMs = options.steerCancelTimeoutMs;
     }
@@ -1204,8 +1139,6 @@ export class SessionCoordinator {
       worker.steerToolCommitTimeoutMs = options.steerToolCommitTimeoutMs;
     }
     let handedOff = false;
-    let sawError = false;
-    let turnFinishedCleanly = false;
     let continuationStarted = false;
     try {
       // Verify the incoming transcript still carries this ledger (exactly, or
@@ -1226,7 +1159,7 @@ export class SessionCoordinator {
           yield* this.executeFreshSessionTurn(
             worker.account,
             req,
-            modelSelection ?? { rawModelId: req.model, configModelValue: req.model },
+            modelSelection,
             options,
             sessionKey,
             signal,
@@ -1285,14 +1218,6 @@ export class SessionCoordinator {
       worker.setExposeThinking(req.thinkingEnabled);
       worker.broker.setToolChoice(req.toolChoice);
 
-      const generatedToolCalls: Array<{
-        type: "tool_use";
-        id: string;
-        name: string;
-        input: Record<string, unknown>;
-      }> = [];
-      let fullAnswerText = "";
-
       let yieldedAny = false;
       // The tool results are about to move the native session forward, so the
       // older checkpoint has to be gone first; if it cannot be removed, hand the
@@ -1303,7 +1228,7 @@ export class SessionCoordinator {
         yield* this.executeFreshSessionTurn(
           worker.account,
           req,
-          modelSelection ?? { rawModelId: req.model, configModelValue: req.model },
+          modelSelection,
           options,
           sessionKey,
           signal,
@@ -1320,22 +1245,7 @@ export class SessionCoordinator {
           modelSelection,
         )) {
           yieldedAny = true;
-          if (event.type === "tool_use") {
-            generatedToolCalls.push(event);
-          } else if (event.type === "text_delta") {
-            fullAnswerText += event.text;
-          } else if (event.type === "error") {
-            sawError = true;
-          } else if (event.type === "finish") {
-            turnFinishedCleanly = true;
-            commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
-            if (generatedToolCalls.length === 0) {
-              this.shelf.recordPersisted(
-                sessionKey,
-                this.snapshotForWorker(worker, sessionKey),
-              );
-            }
-          }
+          this.foldTurnEvent(fold, worker, req, sessionKey, event);
           yield event;
         }
       } catch (err) {
@@ -1347,7 +1257,7 @@ export class SessionCoordinator {
           yield* this.executeFreshSessionTurn(
             worker.account,
             req,
-            modelSelection ?? { rawModelId: req.model, configModelValue: req.model },
+            modelSelection,
             options,
             sessionKey,
             signal,
@@ -1359,16 +1269,7 @@ export class SessionCoordinator {
     } finally {
       try {
         if (!handedOff && continuationStarted) {
-          const why = sawError
-            ? "turn_error"
-            : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-          if (why) {
-            await this.retireWorker(worker, why);
-          } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
-            if (this.parkSession(worker)) {
-              await this.retireWorker(worker, "rss_limit_exceeded");
-            }
-          }
+          await this.settleStatefulTurn(worker, fold, signal);
         }
       } finally {
         releasePin();
@@ -1442,13 +1343,7 @@ export class SessionCoordinator {
         throw err;
       }
 
-      if (requestHasImages(req.messages) && !worker.imageSupported) {
-        throw new BridgeHttpError(
-          400,
-          "invalid_request_error",
-          "Images are not supported by the underlying agent",
-        );
-      }
+      await this.assertImagesSupported(worker, req);
 
       await worker.applyModelSelection(modelSelection, signal);
 
@@ -1458,6 +1353,7 @@ export class SessionCoordinator {
             imageSourceMessages: priorMessages,
           })
         : renderMessagesToPrompt(priorMessages, currentMessages);
+      appendToolChoiceReminder(promptParts, req);
       if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
         unshiftSystemInstructions(promptParts, worker.effectiveSystemPrompt);
       }
@@ -1476,17 +1372,33 @@ export class SessionCoordinator {
 // Turn helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * The accumulator a stateful turn folds its event stream into. The ledger the
+ * turn commits needs the whole answer and every tool call, and the same events
+ * decide whether the worker may be reused afterwards.
+ */
+interface TurnFold {
+  generatedToolCalls: GeneratedToolCall[];
+  fullAnswerText: string;
+  sawError: boolean;
+  turnFinishedCleanly: boolean;
+}
+
+function newTurnFold(): TurnFold {
+  return {
+    generatedToolCalls: [],
+    fullAnswerText: "",
+    sawError: false,
+    turnFinishedCleanly: false,
+  };
+}
+
 /** The ledger a finished turn leaves behind (prefill is merged, not appended). */
 function commitAssistantTurn(
   worker: AgySessionWorker,
   req: NormalizedAnthropicRequest,
   fullAnswerText: string,
-  generatedToolCalls: Array<{
-    type: "tool_use";
-    id: string;
-    name: string;
-    input: Record<string, unknown>;
-  }>,
+  generatedToolCalls: GeneratedToolCall[],
 ): void {
   worker.committedMessages = buildCommittedMessages(
     req.messages,

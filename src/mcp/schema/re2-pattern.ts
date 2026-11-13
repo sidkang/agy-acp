@@ -23,8 +23,9 @@ type SchemaNode = Record<string, unknown>
 
 const HINT_PREFIX = "pattern: "
 
-export function appendHint(node: unknown, hint: string | null | undefined): void {
-  if (!hint || !isSchemaNode(node)) return
+export function appendHint(schema: unknown, hint: string): void {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema) || !hint) return
+  const node = schema as SchemaNode
   if (typeof node.description === "string" && node.description.trim()) {
     if (!node.description.includes(hint)) node.description = `${node.description} (${hint})`
   } else {
@@ -585,7 +586,7 @@ export function isRE2Safe(source: string): boolean {
   return depth === 0 && groupStack.length === 1
 }
 
-export interface PatternSanitizationResult {
+interface PatternSanitizationResult {
   ok: boolean
   pattern: string | undefined
   original: unknown

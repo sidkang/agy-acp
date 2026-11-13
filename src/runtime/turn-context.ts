@@ -161,11 +161,6 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
   }
 }
 
-export interface BeginTurnQueueOptions {
-  maxBufferedBytes?: number;
-  onOverflow: () => void;
-}
-
 /**
  * One worker's per-turn state: the epoch that tells a stale `session/prompt`
  * callback from the live one, the active event queue, and the text the model
@@ -179,11 +174,6 @@ export class TurnContext {
   private thinking = "";
   private held = "";
   private prompt: Promise<any> | null = null;
-
-  /** The epoch of the prompt whose events belong to the current turn. */
-  get promptEpoch(): number {
-    return this.activePromptSeq;
-  }
 
   /**
    * While true, `session/update` text is dropped and prompt callbacks only bank
@@ -220,10 +210,6 @@ export class TurnContext {
     return this.thinking;
   }
 
-  set thinkingText(value: string) {
-    this.thinking = value;
-  }
-
   get pendingPrompt(): Promise<any> | null {
     return this.prompt;
   }
@@ -241,7 +227,9 @@ export class TurnContext {
    * Starts a turn: the held text and the accumulated thought belong to the
    * previous one, so they are dropped with it.
    */
-  beginTurnQueue(options: BeginTurnQueueOptions): AsyncEventQueue<TurnStreamEvent> {
+  beginTurnQueue(
+    options: Omit<AsyncEventQueueOptions<TurnStreamEvent>, "estimateBytes">,
+  ): AsyncEventQueue<TurnStreamEvent> {
     this.thinking = "";
     this.held = "";
     const queue = new AsyncEventQueue<TurnStreamEvent>({

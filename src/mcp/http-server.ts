@@ -54,19 +54,15 @@ export class LoopbackMcpServer {
   private readonly sessions = new Map<string, SessionToolBroker>()
 
   constructor() {
-    this.ensureStarted()
+    this.start()
   }
 
   get port(): number {
     return this.server?.port ?? 0
   }
 
-  get url(): string {
-    return `http://127.0.0.1:${this.port}`
-  }
-
   registerSession(broker: SessionToolBroker): RegisteredSession {
-    this.ensureStarted()
+    this.start()
     const token = randomBytes(TOKEN_BYTES).toString("hex")
     this.sessions.set(token, broker)
     return {
@@ -87,10 +83,6 @@ export class LoopbackMcpServer {
 
   /** (Re)starts a stopped server; a no-op while one is already listening. */
   start(): void {
-    this.ensureStarted()
-  }
-
-  private ensureStarted(): void {
     if (this.server) return
     this.server = Bun.serve({
       hostname: "127.0.0.1",
@@ -106,7 +98,7 @@ export class LoopbackMcpServer {
             (server as any).timeout(request, 0)
           }
         }
-        return this.handleRequest(request, server.port ?? this.server?.port ?? 0, server)
+        return this.handleRequest(request, server.port ?? this.server?.port ?? 0)
       },
     })
   }
@@ -125,7 +117,7 @@ export class LoopbackMcpServer {
     return found
   }
 
-  private async handleRequest(request: Request, port: number, server?: any): Promise<Response> {
+  private async handleRequest(request: Request, port: number): Promise<Response> {
     const url = new URL(request.url)
     const match = TOKEN_PATH_RE.exec(url.pathname)
     if (!match) return new Response("Not Found", { status: 404 })
@@ -147,10 +139,6 @@ export class LoopbackMcpServer {
 
     const broker = this.findSession(token)
     if (!broker) return new Response("Unauthorized", { status: 401 })
-
-    if (server && typeof server.timeout === "function") {
-      server.timeout(request, 0)
-    }
 
     const declaredLength = request.headers.get("content-length")
     if (declaredLength !== null && Number(declaredLength) > MAX_BODY_BYTES) {

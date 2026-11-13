@@ -1,13 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import crypto from "node:crypto";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   BridgeHttpError,
   type AccountDescriptor,
   type EffortLevel,
-  type NormalizedAnthropicRequest,
   type NormalizedContentPart,
   type NormalizedMessage,
   type TokenUsageSummary,
@@ -31,9 +29,10 @@ import {
   cloakSystemPrompt,
 } from "../protocol/cloak";
 import { settleStepUsage } from "../usage/step-usage";
-import { StepUsageTracker } from "../usage/tracker";
+import { StepUsageTracker, emptyUsage } from "../usage/tracker";
 import {
   spawnAgy,
+  isPidAlive,
   killProcessTree,
   redactSecrets,
   type SpawnAgyOptions,
@@ -44,13 +43,8 @@ import {
   type ToolResultDelivery,
 } from "../mcp/broker";
 import { type LoopbackMcpServer } from "../mcp/http-server";
+import { createSyntheticThinkingSignature } from "../protocol/anthropic";
 import { AsyncEventQueue, TurnContext } from "./turn-context";
-
-export {
-  AsyncEventQueue,
-  DEFAULT_MAX_TURN_QUEUE_BYTES,
-  type AsyncEventQueueOptions,
-} from "./turn-context";
 
 export type WorkerState =
   | "STARTING"
@@ -104,7 +98,6 @@ export interface WorkerOptions {
     oldState: WorkerState,
     newState: WorkerState,
   ) => void;
-  onEvict?: () => void;
 }
 
 const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n";
@@ -125,17 +118,6 @@ function flattenOptions(opts: any[]): any[] {
   return result;
 }
 
-export function createSyntheticThinkingSignature(
-  sessionId: string,
-  thinkingText: string,
-): string {
-  const hmac = crypto
-    .createHmac("sha256", sessionId)
-    .update(thinkingText)
-    .digest("hex");
-  return `agy1.${hmac}`;
-}
-
 const liveWorkersForExitCleanup = new Set<AgySessionWorker>();
 let exitHookRegistered = false;
 let staleWorkspacesSwept = false;
@@ -150,16 +132,6 @@ function ensureWorkerExitHookRegistered(): void {
       } catch {}
     }
   });
-}
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: any) {
-    return err?.code === "EPERM";
-  }
 }
 
 export function sweepStaleWorkspaces(now = Date.now()): number {
@@ -178,7 +150,7 @@ export function sweepStaleWorkspaces(now = Date.now()): number {
     try {
       if (fs.existsSync(pidFile)) {
         const ownerPid = Number(fs.readFileSync(pidFile, "utf-8").trim());
-        if (!isProcessAlive(ownerPid)) {
+        if (!isPidAlive(ownerPid)) {
           fs.rmSync(fullPath, { recursive: true, force: true });
           removed++;
         }
@@ -233,7 +205,6 @@ export class AgySessionWorker {
   readonly workDir?: string;
   readonly minimalAgent: boolean;
   effectiveSystemPrompt: string = "";
-  readonly onEvict?: () => void;
   private readonly mcpServer: LoopbackMcpServer;
   private readonly options: WorkerOptions;
 
@@ -244,7 +215,6 @@ export class AgySessionWorker {
   private child!: ChildProcessWithoutNullStreams;
   private conn!: AcpConnection;
   private mcpUrl!: string;
-  private mcpToken?: string;
 
   nativeSessionId!: string;
   imageSupported: boolean = false;
@@ -269,30 +239,17 @@ export class AgySessionWorker {
   steerToolCommitTimeoutMs?: number;
 
   private pinLeases: number = 0;
-  private manualPinned: boolean = false;
   private capacityListener?: () => void;
   private lastRssSampleAt: number = 0;
   private lastRssBytes: number = 0;
 
   /**
-   * A worker is held by every owner that currently needs it: the coordinator's
-   * turn (a `pin()` lease) and the admission and side-request paths that set
-   * `pinned` directly. It is evictable only when none of them holds it.
+   * A worker is held by every in-flight owner (the coordinator's turn and the
+   * admission / side-request paths all take a `pin()` lease). It is evictable
+   * only while no lease is outstanding.
    */
   get pinned(): boolean {
-    return this.pinLeases > 0 || this.manualPinned;
-  }
-
-  /**
-   * Unpinning makes this worker evictable, so it is a capacity event: waiters
-   * parked in the scheduler must be woken instead of polling.
-   */
-  set pinned(value: boolean) {
-    const wasPinned = this.pinned;
-    this.manualPinned = Boolean(value);
-    if (wasPinned && !this.pinned) {
-      this.notifyCapacityChange();
-    }
+    return this.pinLeases > 0;
   }
 
   /**
@@ -367,7 +324,6 @@ export class AgySessionWorker {
     this.options = options ?? {};
     this.workDir = this.options.workDir;
     this.minimalAgent = Boolean(this.options.minimalAgent);
-    this.onEvict = this.options.onEvict;
     this.steerCancelTimeoutMs = this.options.steerCancelTimeoutMs;
     this.steerToolCommitTimeoutMs = this.options.steerToolCommitTimeoutMs;
 
@@ -457,14 +413,47 @@ export class AgySessionWorker {
     return bytes;
   }
 
+  /**
+   * Retires the worker (when `closeReason` is given) and throws the bridge's
+   * standard 499 abort error. Never returns, so call sites do not need a
+   * trailing `throw` of their own.
+   */
+  private async throwAborted(
+    closeReason?: string,
+    message = "Request aborted during startup",
+  ): Promise<never> {
+    if (closeReason) {
+      await this.close(closeReason);
+    }
+    throw new BridgeHttpError(499, "invalid_request_error", message);
+  }
+
+  /**
+   * Turns a sign-in failure surfaced by a startup RPC into the bridge's 401 and
+   * retires the worker; anything else is rethrown unchanged.
+   */
+  private async failIfAuthExpired(err: unknown): Promise<never> {
+    const stderr = this.conn.getStderrTail();
+    const combined = `${(err as any)?.message || ""}\n${stderr}`;
+    if (
+      /please sign in|not (?:logged|signed) in|authentication expired|login required|unauthenticated/i.test(
+        combined,
+      )
+    ) {
+      await this.close("auth_expired");
+      throw new BridgeHttpError(
+        401,
+        "authentication_error",
+        "Antigravity CLI authentication expired. Please sign in again.",
+        { signInExpired: true },
+      );
+    }
+    throw err;
+  }
+
   async start(signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) {
-      await this.close("aborted_startup");
-      throw new BridgeHttpError(
-        499,
-        "invalid_request_error",
-        "Request aborted during startup",
-      );
+      await this.throwAborted("aborted_startup");
     }
 
     let abortHandler: (() => void) | null = null;
@@ -487,7 +476,7 @@ export class AgySessionWorker {
       );
       fs.mkdirSync(agentDir, { recursive: true });
 
-      const minimalAgent = Boolean(this.options.minimalAgent);
+      const minimalAgent = this.minimalAgent;
       const agentContent = [
         "---",
         "name: magpie-bridge",
@@ -535,9 +524,6 @@ export class AgySessionWorker {
       const reg = this.mcpServer.registerSession(this.broker);
       this.unregisterMcp = reg.unregister;
       this.mcpUrl = reg.url;
-      if ((reg as any).token) {
-        this.mcpToken = (reg as any).token;
-      }
 
       // 4. Spawn agy ACP
       const logFile = path.join(this.workspaceDir, "agy-acp.log");
@@ -593,12 +579,7 @@ export class AgySessionWorker {
       this.setupAcpListeners();
 
       if (signal?.aborted) {
-        await this.close("aborted_startup");
-        throw new BridgeHttpError(
-          499,
-          "invalid_request_error",
-          "Request aborted during startup",
-        );
+        await this.throwAborted("aborted_startup");
       }
 
       // 5. ACP initialize
@@ -619,31 +600,11 @@ export class AgySessionWorker {
           },
         });
       } catch (err: any) {
-        const stderr = this.conn.getStderrTail();
-        const combined = `${err?.message || ""}\n${stderr}`;
-        if (
-          /please sign in|not (?:logged|signed) in|authentication expired|login required|unauthenticated/i.test(
-            combined,
-          )
-        ) {
-          await this.close("auth_expired");
-          throw new BridgeHttpError(
-            401,
-            "authentication_error",
-            "Antigravity CLI authentication expired. Please sign in again.",
-            { signInExpired: true },
-          );
-        }
-        throw err;
+        await this.failIfAuthExpired(err);
       }
 
       if (signal?.aborted) {
-        await this.close("aborted_startup");
-        throw new BridgeHttpError(
-          499,
-          "invalid_request_error",
-          "Request aborted during startup",
-        );
+        await this.throwAborted("aborted_startup");
       }
 
       this.imageSupported = Boolean(
@@ -741,22 +702,7 @@ export class AgySessionWorker {
           this.nativeSessionId =
             (sessionRes as any)?.sessionId || this.sessionId;
         } catch (err: any) {
-          const stderr = this.conn.getStderrTail();
-          const combined = `${err?.message || ""}\n${stderr}`;
-          if (
-            /please sign in|not (?:logged|signed) in|authentication expired|login required|unauthenticated/i.test(
-              combined,
-            )
-          ) {
-            await this.close("auth_expired");
-            throw new BridgeHttpError(
-              401,
-              "authentication_error",
-              "Antigravity CLI authentication expired. Please sign in again.",
-              { signInExpired: true },
-            );
-          }
-          throw err;
+          await this.failIfAuthExpired(err);
         }
       }
 
@@ -765,12 +711,7 @@ export class AgySessionWorker {
       }
 
       if (signal?.aborted) {
-        await this.close("aborted_startup");
-        throw new BridgeHttpError(
-          499,
-          "invalid_request_error",
-          "Request aborted during startup",
-        );
+        await this.throwAborted("aborted_startup");
       }
 
       this.setState("IDLE");
@@ -929,7 +870,9 @@ export class AgySessionWorker {
     }
   }
 
-  private diagnoseTerminationError(rawErr?: unknown): TurnStreamEvent {
+  private diagnoseTerminationError(
+    rawErr?: unknown,
+  ): Extract<TurnStreamEvent, { type: "error" }> {
     const rawErrMsg =
       rawErr instanceof Error
         ? rawErr.message
@@ -1059,12 +1002,7 @@ export class AgySessionWorker {
   private async settleAndCloseBatchTurn(
     q: AsyncEventQueue<TurnStreamEvent>,
   ): Promise<void> {
-    let toolStepUsage: TokenUsageSummary = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadInputTokens: 0,
-      cacheCreationInputTokens: 0,
-    };
+    let toolStepUsage: TokenUsageSummary = emptyUsage();
     try {
       const dbSteps = await this.usage.readUnseenStepsWithRetry(
         this.account,
@@ -1096,11 +1034,7 @@ export class AgySessionWorker {
     signal?: AbortSignal,
   ): Promise<void> {
     if (signal?.aborted) {
-      throw new BridgeHttpError(
-        499,
-        "invalid_request_error",
-        "Request aborted during startup",
-      );
+      await this.throwAborted(undefined, "Request aborted");
     }
 
     const modelOpt = this.configOptions.find(
@@ -1228,20 +1162,6 @@ export class AgySessionWorker {
     this.markTurnDiagnosticsStart();
     const queue = this.createTurnQueue();
 
-    let abortHandler: (() => void) | null = null;
-    if (signal) {
-      abortHandler = () => {
-        if (this._state === "GENERATING") {
-          void this.handleClientAbort();
-        }
-      };
-      if (signal.aborted) {
-        abortHandler();
-      } else {
-        signal.addEventListener("abort", abortHandler, { once: true });
-      }
-    }
-
     const seq = this.turn.nextPromptEpoch();
 
     const promptPromise = this.conn.request(
@@ -1262,22 +1182,7 @@ export class AgySessionWorker {
         this.handlePromptError(err, seq);
       });
 
-    let completedTurn = false;
-    try {
-      for await (const event of queue) {
-        if (event.type === "finish" || event.type === "error") {
-          completedTurn = true;
-        }
-        yield event;
-      }
-    } finally {
-      if (signal && abortHandler) {
-        signal.removeEventListener("abort", abortHandler);
-      }
-      if (!completedTurn && this.state === "GENERATING") {
-        await this.handleClientAbort();
-      }
-    }
+    yield* this.drainTurnQueue(queue, signal);
   }
 
   private handlePromptSuccess(result: any, seq?: number): void {
@@ -1308,10 +1213,7 @@ export class AgySessionWorker {
 
     if (result?.stopReason === "refusal") {
       const diag = this.diagnoseTerminationError();
-      if (
-        diag.type === "error" &&
-        (diag.status === 400 || diag.status === 401 || diag.status === 429)
-      ) {
+      if (diag.status === 400 || diag.status === 401 || diag.status === 429) {
         this.turn.finishWith(diag);
         this.setState("IDLE");
         this.turn.pendingPrompt = null;
@@ -1375,18 +1277,7 @@ export class AgySessionWorker {
     }
     this.broker.markHttpTurnClosed();
     if (this._state === "GENERATING") {
-      const errorEvent = this.diagnoseTerminationError(err);
-      const eventToSend: TurnStreamEvent =
-        errorEvent.type === "error"
-          ? errorEvent
-          : {
-              type: "error",
-              status: 500,
-              errorType: "api_error",
-              message: redactSecrets(err?.message || "ACP prompt failed"),
-            };
-
-      this.turn.finishWith(eventToSend);
+      this.turn.finishWith(this.diagnoseTerminationError(err));
       this.setState("IDLE");
     }
     this.turn.pendingPrompt = null;
@@ -1404,25 +1295,7 @@ export class AgySessionWorker {
       this.broker.cancelAll("Client aborted request");
     } catch {}
 
-    let settled = false;
-    const promptPromise = this.turn.pendingPrompt;
-    if (promptPromise) {
-      try {
-        await Promise.race([
-          promptPromise.then(
-            () => {
-              settled = true;
-            },
-            () => {
-              settled = true;
-            },
-          ),
-          new Promise((r) => setTimeout(r, 1500)),
-        ]);
-      } catch {}
-    } else {
-      settled = true;
-    }
+    const settled = await this.settleOrTimeout(this.turn.pendingPrompt, 1500);
 
     this.turn.closeQueue();
 
@@ -1430,6 +1303,73 @@ export class AgySessionWorker {
       await this.close("cancel_timeout");
     } else if (this._state === "GENERATING") {
       this.setState("IDLE");
+    }
+  }
+
+  /**
+   * Waits for `promise` to settle — fulfilment and rejection both count — or
+   * for `timeoutMs` to elapse. Resolves `true` when it settled and `false` on
+   * timeout; a missing promise counts as already settled.
+   */
+  private async settleOrTimeout(
+    promise: Promise<unknown> | null | undefined,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    if (!promise) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise.then(
+          () => true,
+          () => true,
+        ),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Drains one turn's event queue, wiring the caller's abort signal to
+   * `handleClientAbort`, and cancelling an abandoned turn even when the
+   * consumer stops reading early (`for await ... break` / `return`).
+   */
+  private async *drainTurnQueue(
+    queue: AsyncEventQueue<TurnStreamEvent>,
+    signal?: AbortSignal,
+  ): AsyncGenerator<TurnStreamEvent> {
+    let abortHandler: (() => void) | null = null;
+    if (signal) {
+      abortHandler = () => {
+        if (this._state === "GENERATING") {
+          void this.handleClientAbort();
+        }
+      };
+      if (signal.aborted) {
+        abortHandler();
+      } else {
+        signal.addEventListener("abort", abortHandler, { once: true });
+      }
+    }
+
+    let completedTurn = false;
+    try {
+      for await (const event of queue) {
+        if (event.type === "finish" || event.type === "error") {
+          completedTurn = true;
+        }
+        yield event;
+      }
+    } finally {
+      if (signal && abortHandler) {
+        signal.removeEventListener("abort", abortHandler);
+      }
+      if (!completedTurn && this.state === "GENERATING") {
+        await this.handleClientAbort();
+      }
     }
   }
 
@@ -1473,7 +1413,7 @@ export class AgySessionWorker {
     if (!delivery.allPendingResolved) {
       if (delivery.newlyExposedCalls.length > 0) {
         if (steeringPromptParts.length > 0) {
-          this.broker.cancelUnexposed("Skipped due to user steering message");
+          this.broker.cancelAll("Skipped due to user steering message");
         } else {
           for (const call of delivery.newlyExposedCalls) {
             yield {
@@ -1486,12 +1426,7 @@ export class AgySessionWorker {
           yield {
             type: "finish",
             stopReason: "tool_use",
-            usage: {
-              inputTokens: 0,
-              outputTokens: 0,
-              cacheReadInputTokens: 0,
-              cacheCreationInputTokens: 0,
-            },
+            usage: emptyUsage(),
           };
           // Remain in AWAITING_TOOL_RESULTS
           return;
@@ -1508,7 +1443,7 @@ export class AgySessionWorker {
     }
 
     if (steeringPromptParts.length > 0 && this.broker.hasPendingWork()) {
-      this.broker.cancelUnexposed("Skipped due to user steering message");
+      this.broker.cancelAll("Skipped due to user steering message");
     }
 
     // 3. All pending resolved:
@@ -1551,37 +1486,7 @@ export class AgySessionWorker {
 
       this.setState("GENERATING");
       const queue = this.createTurnQueue();
-
-      let abortHandler: (() => void) | null = null;
-      if (signal) {
-        abortHandler = () => {
-          if (this._state === "GENERATING") {
-            void this.handleClientAbort();
-          }
-        };
-        if (signal.aborted) {
-          abortHandler();
-        } else {
-          signal.addEventListener("abort", abortHandler, { once: true });
-        }
-      }
-
-      let completedTurn = false;
-      try {
-        for await (const event of queue) {
-          if (event.type === "finish" || event.type === "error") {
-            completedTurn = true;
-          }
-          yield event;
-        }
-      } finally {
-        if (signal && abortHandler) {
-          signal.removeEventListener("abort", abortHandler);
-        }
-        if (!completedTurn && this.state === "GENERATING") {
-          await this.handleClientAbort();
-        }
-      }
+      yield* this.drainTurnQueue(queue, signal);
       return;
     }
 
@@ -1591,9 +1496,7 @@ export class AgySessionWorker {
 
     try {
       await this.waitForActiveToolCallsCommit(
-        this.steerToolCommitTimeoutMs ??
-          this.options.steerToolCommitTimeoutMs ??
-          5_000,
+        this.steerToolCommitTimeoutMs ?? 5_000,
       );
     } catch (err) {
       // The barrier already closed the worker; continuing would talk to a dead
@@ -1617,28 +1520,10 @@ export class AgySessionWorker {
       } catch {}
     }
 
-    let settled = false;
-    const cancelTimeoutMs =
-      this.steerCancelTimeoutMs ??
-      this.options.steerCancelTimeoutMs ??
-      5_000;
-    if (oldPromptPromise) {
-      try {
-        await Promise.race([
-          oldPromptPromise.then(
-            () => {
-              settled = true;
-            },
-            () => {
-              settled = true;
-            },
-          ),
-          new Promise((r) => setTimeout(r, cancelTimeoutMs)),
-        ]);
-      } catch {}
-    } else {
-      settled = true;
-    }
+    const settled = await this.settleOrTimeout(
+      oldPromptPromise,
+      this.steerCancelTimeoutMs ?? 5_000,
+    );
 
     if (!settled) {
       await this.close("steer_cancel_unsettled");

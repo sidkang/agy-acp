@@ -91,6 +91,34 @@ function utf8Suffix(text: string, bytes: number): string {
   return buf.subarray(buf.length - bytes).toString("utf-8");
 }
 
+/**
+ * The smallest number of leading entries to drop so the rest fits `budget`
+ * after `fixedBytes`, counting the omission note's own bytes.
+ *
+ * Suffix bytes only shrink as `dropped` grows, so the first fit is the longest
+ * suffix that fits; `entryBytes.length` means even the note alone does not fit.
+ */
+function smallestDrop(
+  entryBytes: number[],
+  budget: number,
+  fixedBytes: number,
+  note: (omitted: number) => string,
+): number {
+  let remaining = entryBytes.reduce((sum, bytes) => sum + bytes, 0);
+  for (let dropped = 1; dropped <= entryBytes.length; dropped++) {
+    remaining -= entryBytes[dropped - 1]!;
+    if (fixedBytes + remaining + utf8Bytes(note(dropped)) <= budget) {
+      return dropped;
+    }
+  }
+  return entryBytes.length;
+}
+
+/** `[... omitted N earlier messages ...]` as both history budgets write it. */
+function omittedNote(omitted: number): string {
+  return `[... omitted ${omitted} earlier messages ...]\n`;
+}
+
 function clipHistoryText(
   text: string,
   clipBytes = HISTORY_BLOCK_CLIP_BYTES,
@@ -278,17 +306,12 @@ export function planColdHistoryRender(
   }
 
   const seededNoteBytes = utf8Bytes(SEEDED_ABOVE_NOTE);
-  let suffixBytes = 0;
-  let splitIdx = priorMessages.length;
-  for (let i = priorMessages.length - 1; i >= 1; i--) {
-    const nextBytes = suffixBytes + promptEntryBytes[i]!;
-    if (nextBytes + seededNoteBytes <= availableForPromptHistory) {
-      suffixBytes = nextBytes;
-      splitIdx = i;
-    } else {
-      break;
-    }
-  }
+  const splitIdx = smallestDrop(
+    promptEntryBytes,
+    availableForPromptHistory,
+    seededNoteBytes,
+    () => SEEDED_ABOVE_NOTE,
+  );
 
   const overflowMessages = priorMessages.slice(0, splitIdx);
   const tailPriorMessages = priorMessages.slice(splitIdx);
@@ -314,24 +337,15 @@ export function planColdHistoryRender(
   const seedEntryBytes = seedEntries.map((e) => utf8Bytes(e));
   const totalSeedBytes = seedEntryBytes.reduce((a, b) => a + b, 0);
 
-  let seedBody = "";
-  if (totalSeedBytes <= availableForSeed) {
-    seedBody = seedEntries.join("");
-  } else {
-    let remainingBytes = totalSeedBytes;
-    let startIndex = 0;
-    while (startIndex < seedEntries.length) {
-      remainingBytes -= seedEntryBytes[startIndex]!;
-      startIndex++;
-      const omitNote = `[... omitted ${startIndex} earlier messages ...]\n`;
-      if (remainingBytes + utf8Bytes(omitNote) <= availableForSeed) {
-        seedBody = omitNote + seedEntries.slice(startIndex).join("");
-        break;
-      }
-    }
-    if (!seedBody) {
-      seedBody = `[... omitted ${overflowMessages.length} earlier messages ...]\n`;
-    }
+  let seedBody = seedEntries.join("");
+  if (totalSeedBytes > availableForSeed) {
+    const dropped = smallestDrop(
+      seedEntryBytes,
+      availableForSeed,
+      0,
+      omittedNote,
+    );
+    seedBody = omittedNote(dropped) + seedEntries.slice(dropped).join("");
   }
 
   return {
@@ -432,42 +446,26 @@ export function renderMessagesToPrompt(
     const leadNote = opts?.priorSeededInSystem ? SEEDED_ABOVE_NOTE : "";
     const leadBytes = utf8Bytes(leadNote);
     const historyEntries = priorMessages.map((m) => renderHistoryEntry(m));
+    const historyEntryBytes = historyEntries.map((e) => utf8Bytes(e));
     const totalHistBytes =
-      leadBytes + historyEntries.reduce((sum, e) => sum + utf8Bytes(e), 0);
+      leadBytes + historyEntryBytes.reduce((sum, bytes) => sum + bytes, 0);
 
     if (totalHistBytes <= availableForHistory) {
       historyText =
         historyHeader + leadNote + historyEntries.join("") + historyFooter;
     } else if (historyEntries.length > 0) {
-      let omittedCount = 0;
-      let startIndex = 0;
-      while (startIndex < historyEntries.length) {
-        const omitNote = `[... omitted ${omittedCount + 1} earlier messages ...]\n`;
-        const omitBytes = utf8Bytes(omitNote);
-        const remainingBytes = historyEntries
-          .slice(startIndex + 1)
-          .reduce((sum, e) => sum + utf8Bytes(e), 0);
-        if (leadBytes + remainingBytes + omitBytes <= availableForHistory) {
-          startIndex++;
-          omittedCount++;
-          historyText =
-            historyHeader +
-            leadNote +
-            omitNote +
-            historyEntries.slice(startIndex).join("") +
-            historyFooter;
-          break;
-        }
-        startIndex++;
-        omittedCount++;
-      }
-      if (!historyText && omittedCount > 0) {
-        historyText =
-          historyHeader +
-          leadNote +
-          `[... omitted ${priorMessages.length} earlier messages ...]\n` +
-          historyFooter;
-      }
+      const dropped = smallestDrop(
+        historyEntryBytes,
+        availableForHistory,
+        leadBytes,
+        omittedNote,
+      );
+      historyText =
+        historyHeader +
+        leadNote +
+        omittedNote(dropped) +
+        historyEntries.slice(dropped).join("") +
+        historyFooter;
     }
   }
 
@@ -496,6 +494,3 @@ export function renderMessagesToPrompt(
 
   return parts;
 }
-
-/** Exposed for tests that assert the prompt budget itself. */
-export const PROMPT_BUDGET_BYTES = MAX_PROMPT_BYTES;

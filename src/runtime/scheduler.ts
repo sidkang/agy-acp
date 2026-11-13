@@ -12,8 +12,6 @@ export interface GlobalSchedulerOptions {
   /** Cap on parked admission requests; beyond it the request fails fast. */
   maxWaiters?: number;
   installSignalHandlers?: boolean;
-  onBeforeEvictIdle?: (worker: AgySessionWorker) => void;
-  onReapTick?: (now: number) => void;
 }
 
 const BUSY_MESSAGE =
@@ -46,6 +44,18 @@ function envNonNegInt(name: string): number | undefined {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 0) return undefined;
   return Math.floor(parsed);
+}
+
+/**
+ * Reads a strictly positive integer override. Used for capacities, where `0` or
+ * a non-numeric value (which `parseInt` would turn into `NaN`) is not a usable
+ * limit and must fall back to the default.
+ */
+function envPositiveInt(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : undefined;
 }
 
 const globalActiveSchedulers = new Set<GlobalScheduler>();
@@ -86,13 +96,11 @@ export class GlobalScheduler {
   readonly awaitingToolTimeoutMs: number;
   readonly waitTimeoutMs: number;
   readonly maxWaiters: number;
-  readonly onBeforeEvictIdle?: (worker: AgySessionWorker) => void;
-  onReapTick?: (now: number) => void;
 
   /**
-   * Additional owners of the two lifecycle events, so a second listener does not
-   * have to capture and re-wrap the property (which is what the coordinator had
-   * to do with `(scheduler as any).onBeforeEvictIdle`).
+   * Owners of the two lifecycle events. A hook set keeps several listeners
+   * independent instead of forcing each new owner to capture and re-wrap a
+   * single callback property.
    */
   private readonly beforeEvictIdleHooks = new Set<
     (worker: AgySessionWorker) => void
@@ -107,9 +115,7 @@ export class GlobalScheduler {
   private reaperTimer?: ReturnType<typeof setInterval>;
 
   constructor(options?: GlobalSchedulerOptions) {
-    const envMax = process.env.AGY_BRIDGE_MAX_PROCS
-      ? parseInt(process.env.AGY_BRIDGE_MAX_PROCS, 10)
-      : undefined;
+    const envMax = envPositiveInt("AGY_BRIDGE_MAX_PROCS");
 
     this.maxGlobalWorkers = options?.maxGlobalWorkers ?? envMax ?? 16;
     this.maxPerAccountWorkers = options?.maxPerAccountWorkers ?? 6;
@@ -126,8 +132,6 @@ export class GlobalScheduler {
       60_000;
     this.maxWaiters = options?.maxWaiters ?? 128;
     this.reaperIntervalMs = options?.reaperIntervalMs ?? 60 * 1000; // 1 minute
-    this.onBeforeEvictIdle = options?.onBeforeEvictIdle;
-    this.onReapTick = options?.onReapTick;
 
     this.reaperTimer = setInterval(() => {
       void this.reapIdleWorkers();
@@ -236,7 +240,7 @@ export class GlobalScheduler {
     const now = Date.now();
     const accountKey = `${account.accountRef}::${account.slotKey}`;
     if (this.shuttingDown) return { admitted: false };
-    const active = Array.from(this.workers).filter((w) => w.state !== "CLOSED");
+    const active = this.getActiveWorkers();
     const accountWorkers = active.filter(
       (w) => `${w.account.accountRef}::${w.account.slotKey}` === accountKey,
     );
@@ -340,23 +344,16 @@ export class GlobalScheduler {
         },
       };
 
-      const removeWaiter = (): void => {
-        const index = this.waiters.indexOf(waiter);
-        if (index >= 0) this.waiters.splice(index, 1);
+      // Arrow bound to `this` so the abort listener keeps the scheduler
+      // instance when it fires from the signal's dispatch.
+      const onAbort = (): void => {
+        this.removeWaiter(waiter);
+        waiter.cleanup();
+        waiter.reject(this.abortedError());
       };
 
-      function onAbort(): void {
-        removeWaiter();
-        waiter.cleanup();
-        waiter.reject(new BridgeHttpError(
-          499,
-          "invalid_request_error",
-          "Request aborted while waiting for session capacity",
-        ));
-      }
-
       timer = setTimeout(() => {
-        removeWaiter();
+        this.removeWaiter(waiter);
         waiter.cleanup();
         waiter.reject(this.busyError());
       }, this.waitTimeoutMs);
@@ -449,12 +446,6 @@ export class GlobalScheduler {
 
   private notifyEvictIdle(worker: AgySessionWorker): void {
     if (worker.state === "IDLE") {
-      try {
-        worker.onEvict?.();
-      } catch {}
-      try {
-        this.onBeforeEvictIdle?.(worker);
-      } catch {}
       for (const hook of Array.from(this.beforeEvictIdleHooks)) {
         try {
           hook(worker);
@@ -464,30 +455,11 @@ export class GlobalScheduler {
   }
 
   private notifyReapTick(now: number): void {
-    try {
-      this.onReapTick?.(now);
-    } catch {}
     for (const hook of Array.from(this.reapTickHooks)) {
       try {
         hook(now);
       } catch {}
     }
-  }
-
-  async evictIdleLRU(): Promise<AgySessionWorker | null> {
-    const idleWorkers = Array.from(this.workers)
-      .filter((w) => !w.pinned && w.state === "IDLE")
-      .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
-
-    if (idleWorkers.length === 0) {
-      return null;
-    }
-
-    const victim = idleWorkers[0]!;
-    this.workers.delete(victim);
-    this.notifyEvictIdle(victim);
-    await victim.close("evicted_idle_lru");
-    return victim;
   }
 
   async reapIdleWorkers(): Promise<number> {
@@ -509,11 +481,7 @@ export class GlobalScheduler {
         this.notifyEvictIdle(worker);
         await worker.close("idle_timeout");
         count++;
-      } else if (
-        worker.state === "AWAITING_TOOL_RESULTS" &&
-        worker.lastActivityAt >= 1_000_000_000 &&
-        now - worker.lastActivityAt >= this.awaitingToolTimeoutMs
-      ) {
+      } else if (this.isAwaitingToolExpired(worker, now)) {
         this.workers.delete(worker);
         await worker.close("awaiting_tool_timeout");
         count++;

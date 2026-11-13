@@ -5,19 +5,12 @@
 //
 // Ported from the MIT-licensed agy-cli bridge (see LICENSE).
 
+import { appendHint } from "./re2-pattern"
+
 type SchemaNode = Record<string, unknown>
 
 function isSchemaNode(value: unknown): value is SchemaNode {
   return value !== null && typeof value === "object" && !Array.isArray(value)
-}
-
-function appendSchemaHint(node: SchemaNode, hint: string): void {
-  if (!hint) return
-  if (typeof node.description === "string" && node.description.trim()) {
-    if (!node.description.includes(hint)) node.description = `${node.description} (${hint})`
-  } else {
-    node.description = hint
-  }
 }
 
 function nodeDeclaresArray(node: unknown): node is SchemaNode {
@@ -118,11 +111,11 @@ function inferItemsFromExisting(existing: SchemaNode): SchemaNode | null {
   return null
 }
 
-export const PERMISSIVE_LEAF_TYPES = ["string", "number", "integer", "boolean", "object", "null"] as const
+const PERMISSIVE_LEAF_TYPES = ["string", "number", "integer", "boolean", "object", "null"] as const
 // Gemini Schema cannot express an unbounded nested array without $ref, which
 // the translator may not honor. Eight levels is enough for tool arguments and
 // is idempotent because the innermost array already has typed items.
-export const PERMISSIVE_ARRAY_DEPTH = 8
+const PERMISSIVE_ARRAY_DEPTH = 8
 const TUPLE_ITEMS_HINT = "tuple items were left as a list; positional tuples may not be honored"
 const UNTYPED_ITEMS_HINT = "array items were untyped; a permissive items schema was added"
 
@@ -151,12 +144,12 @@ function mergeItems(fromCombo: SchemaNode, existing: SchemaNode): SchemaNode {
 function fillGeminiArrayItems(node: SchemaNode): void {
   if (!nodeDeclaresArray(node)) return
   if (Array.isArray(node.items)) {
-    appendSchemaHint(node, TUPLE_ITEMS_HINT)
+    appendHint(node, TUPLE_ITEMS_HINT)
     return
   }
   const existing: SchemaNode = isSchemaNode(node.items) ? { ...node.items } : {}
   if (Array.isArray(node.prefixItems)) {
-    appendSchemaHint(node, TUPLE_ITEMS_HINT)
+    appendHint(node, TUPLE_ITEMS_HINT)
     if (!typelessItems(node.items)) return
     // prefixItems alone still leaves sibling items missing; fill a rest schema.
     const fromCombo = itemsFromCombinators(node)
@@ -164,7 +157,7 @@ function fillGeminiArrayItems(node: SchemaNode): void {
     else {
       const inferred = inferItemsFromExisting(existing)
       node.items = inferred ?? permissiveItemSchema(existing)
-      if (!inferred) appendSchemaHint(node, UNTYPED_ITEMS_HINT)
+      if (!inferred) appendHint(node, UNTYPED_ITEMS_HINT)
     }
     return
   }
@@ -180,7 +173,7 @@ function fillGeminiArrayItems(node: SchemaNode): void {
     return
   }
   node.items = permissiveItemSchema(existing)
-  appendSchemaHint(node, UNTYPED_ITEMS_HINT)
+  appendHint(node, UNTYPED_ITEMS_HINT)
 }
 
 const SCHEMA_CHILD_KEYS = [

@@ -323,39 +323,43 @@ function toolChoiceFromType(
   }
 }
 
-function extractSystemPrompt(system: unknown): string {
-  if (system === undefined || system === null) return "";
+interface SystemContentPolicy {
+  /** JSON path used in 400 messages, e.g. `system` or `messages[0].content`. */
+  path: string;
+  /** Translated tool blocks are ignored here; a top-level `system` rejects them. */
+  allowsToolBlocks: boolean;
+}
 
-  if (typeof system === "string") {
-    return system;
+/**
+ * Flattens a string-or-array system payload into the newline-joined prompt text.
+ *
+ * Top-level `body.system` and a leading `role: "system"` message differ in one
+ * place only: translators mix `tool_addition` / `tool_removal` blocks into
+ * messages, and those must be ignored rather than forwarded as prompt text,
+ * while a top-level `system` declaring a non-text block is a caller error.
+ */
+function flattenSystemContent(content: unknown, policy: SystemContentPolicy): string {
+  if (content === undefined || content === null) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) {
+    throw invalidRequest(`${policy.path} must be a string or an array of text blocks`);
   }
-
-  if (isPlainObject(system)) {
-    const text = system.text;
-    const type = system.type;
-    if (type !== undefined && type !== "text") {
-      throw invalidRequest(`Unsupported system block type "${String(type)}"`);
-    }
-    return typeof text === "string" ? text : "";
-  }
-
-  if (!Array.isArray(system)) {
-    throw invalidRequest("system must be a string or an array of text blocks");
-  }
-
   const segments: string[] = [];
-  for (const block of system) {
+  for (const block of content) {
     if (typeof block === "string") {
       if (block.trim() !== "") segments.push(block);
       continue;
     }
     if (!isPlainObject(block)) {
-      throw invalidRequest("system blocks must be objects or strings");
+      throw invalidRequest(`${policy.path} blocks must be objects or strings`);
     }
     const type = block.type;
+    if (policy.allowsToolBlocks && (type === "tool_addition" || type === "tool_removal")) {
+      continue;
+    }
     if (type !== undefined && type !== "text") {
       throw invalidRequest(
-        `Unsupported system block type "${String(type)}"; system prompts only support text`,
+        `Unsupported ${policy.path} block type "${String(type)}"; system prompts only support text`,
       );
     }
     if (typeof block.text === "string" && block.text.trim() !== "") {
@@ -365,36 +369,24 @@ function extractSystemPrompt(system: unknown): string {
   return segments.join("\n\n");
 }
 
+function extractSystemPrompt(system: unknown): string {
+  if (isPlainObject(system)) {
+    const text = system.text;
+    const type = system.type;
+    if (type !== undefined && type !== "text") {
+      throw invalidRequest(`Unsupported system block type "${String(type)}"`);
+    }
+    return typeof text === "string" ? text : "";
+  }
+  return flattenSystemContent(system, { path: "system", allowsToolBlocks: false });
+}
+
 /** System prompt carried as leading `role: "system"` messages by translated clients. */
 function extractSystemTextFromMessage(content: unknown, index: number): string {
-  if (content === undefined || content === null) return "";
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) {
-    throw invalidRequest(`messages[${index}].content must be a string or an array of text blocks`);
-  }
-  const segments: string[] = [];
-  for (const block of content) {
-    if (typeof block === "string") {
-      if (block.trim() !== "") segments.push(block);
-      continue;
-    }
-    if (!isPlainObject(block)) {
-      throw invalidRequest(`messages[${index}] system content blocks must be objects`);
-    }
-    const type = block.type;
-    if (type === "tool_addition" || type === "tool_removal") {
-      continue;
-    }
-    if (type !== undefined && type !== "text") {
-      throw invalidRequest(
-        `Unsupported system message content type "${String(type)}"; only text is supported`,
-      );
-    }
-    if (typeof block.text === "string" && block.text.trim() !== "") {
-      segments.push(block.text);
-    }
-  }
-  return segments.join("\n\n");
+  return flattenSystemContent(content, {
+    path: `messages[${index}].content`,
+    allowsToolBlocks: true,
+  });
 }
 
 /**
@@ -1017,6 +1009,11 @@ export function parseAnthropicRequest(
  */
 const PER_PROCESS_KEY = randomBytes(32);
 
+/**
+ * A stable per-process signature for one streamed thinking block, scoped to
+ * `(sessionId, thinkingText)`. Pass `""` for `sessionId` when encoding a
+ * standalone stream without session context.
+ */
 export function createSyntheticThinkingSignature(
   sessionId: string,
   thinkingText: string,
@@ -1100,72 +1097,13 @@ const PRE_STREAM_TERMINATOR_TYPES: ReadonlySet<TurnStreamEvent["type"]> = new Se
 class PeekedTurnSource {
   readonly iterator: AsyncIterator<TurnStreamEvent>;
   readonly peeked: TurnStreamEvent[] = [];
-  readonly ready: Promise<PeekOutcome>;
-  private claimed = false;
   private closed = false;
   private closedPromise: Promise<void> | null = null;
   private drainedAfterFinish = false;
   private drainTimedOut = false;
-  private detachPreClaimAbort: (() => void) | null = null;
-  /**
-   * `"sync"` while the caller holds the Response this class was wrapped in and
-   * has not awaited the call; `"async"` once it has, at which point the
-   * finalized Response owns the turn and the synchronous body is detached.
-   */
-  private mode: "sync" | "async" = "sync";
 
-  constructor(
-    events: AsyncIterable<TurnStreamEvent>,
-    signal?: AbortSignal,
-    onUnclaimedAbort?: () => void,
-  ) {
+  constructor(events: AsyncIterable<TurnStreamEvent>) {
     this.iterator = events[Symbol.asyncIterator]();
-    if (signal) {
-      const onAbort = (): void => {
-        this.clearPreClaimAbort();
-        if (this.claimed || this.closed) return;
-        try {
-          onUnclaimedAbort?.();
-        } catch {}
-        void this.close();
-      };
-      if (signal.aborted) {
-        queueMicrotask(onAbort);
-      } else {
-        signal.addEventListener("abort", onAbort, { once: true });
-        this.detachPreClaimAbort = () => {
-          signal.removeEventListener("abort", onAbort);
-        };
-      }
-    }
-    this.ready = this.peek(signal);
-  }
-
-  private clearPreClaimAbort(): void {
-    const detach = this.detachPreClaimAbort;
-    this.detachPreClaimAbort = null;
-    detach?.();
-  }
-
-  /** Exactly one response body may drive the iterator. */
-  claim(): boolean {
-    if (this.claimed) return false;
-    this.claimed = true;
-    this.clearPreClaimAbort();
-    return true;
-  }
-
-  get isAsync(): boolean {
-    return this.mode === "async";
-  }
-
-  get isClaimed(): boolean {
-    return this.claimed;
-  }
-
-  /** Irreversible: from here on only the finalized Response drives the turn. */
-  promoteToAsync(): void {
-    this.mode = "async";
   }
 
   /**
@@ -1196,12 +1134,11 @@ class PeekedTurnSource {
 
   /**
    * Releases the upstream turn exactly once. Single-flight: `iterator.return()`
-   * and the caller's `onBodyCancel` hook run for the first caller only, however
-   * many bodies, aborts and pumps race to tear the turn down.
+   * runs for the first caller only, however many aborts, cancels and pumps race
+   * to tear the turn down.
    */
   close(): Promise<void> {
     if (this.closedPromise !== null) return this.closedPromise;
-    this.clearPreClaimAbort();
     this.closed = true;
     this.closedPromise = (async (): Promise<void> => {
       try {
@@ -1220,10 +1157,11 @@ class PeekedTurnSource {
     return this.closedPromise;
   }
 
-  private async peek(signal?: AbortSignal): Promise<PeekOutcome> {
+  /** Buffers events until the turn is provably started (or has failed). */
+  async peekFirst(): Promise<PeekOutcome> {
     try {
       for (;;) {
-        if (signal?.aborted === true) return { kind: "events" };
+        if (this.closed) return { kind: "events" };
         const result = await this.iterator.next();
         if (result.done === true) return { kind: "events" };
         const event = result.value;
@@ -1243,7 +1181,6 @@ class PeekedTurnSource {
 interface SseChannel {
   readonly isClosed: boolean;
   bind(controller: ReadableStreamDefaultController<Uint8Array>): void;
-  bindAbort(signal: AbortSignal | undefined, onAbort: () => void): void;
   emit(event: string, data: unknown): Promise<void>;
   /** Grants one frame of downstream capacity and wakes a blocked `emit`. */
   wakeDrain(): void;
@@ -1251,12 +1188,11 @@ interface SseChannel {
   finish(): void;
 }
 
-function createSseChannel(): SseChannel {
+function createSseChannel(onFinish?: () => void): SseChannel {
   const encoder = new TextEncoder();
   let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
-  let detachAbort: (() => void) | null = null;
   /**
    * Downstream credits, one per `pull()`. With `highWaterMark: 0` a consumer
    * that keeps reading never lets `desiredSize` rise above 0, so a pull is the
@@ -1302,10 +1238,9 @@ function createSseChannel(): SseChannel {
     if (controller === null) return;
     closed = true;
     stopHeartbeat();
-    if (detachAbort !== null) {
-      detachAbort();
-      detachAbort = null;
-    }
+    // Teardown hooks (e.g. detaching the caller's abort listener) run with the
+    // close itself, so a finished body leaves nothing behind.
+    onFinish?.();
     // A pump parked on backpressure must never be left hanging on teardown.
     resolveDrainWaiter();
     try {
@@ -1321,26 +1256,6 @@ function createSseChannel(): SseChannel {
     },
     bind(next: ReadableStreamDefaultController<Uint8Array>): void {
       controller = next;
-    },
-    /**
-     * Wires abort handling lazily. Only a body that actually claimed the turn
-     * calls this, so an unconsumed placeholder Response registers no listener
-     * (and can never cancel the source owned by the live body).
-     */
-    bindAbort(signal: AbortSignal | undefined, onAbort: () => void): void {
-      if (signal === undefined || detachAbort !== null || closed) return;
-      if (signal.aborted) {
-        // Dead before pumping (the caller hung up while we peeked).
-        finish();
-        onAbort();
-        return;
-      }
-      const onAbortEvent = (): void => {
-        finish();
-        onAbort();
-      };
-      signal.addEventListener("abort", onAbortEvent, { once: true });
-      detachAbort = () => signal.removeEventListener("abort", onAbortEvent);
     },
     async emit(event: string, data: unknown): Promise<void> {
       // Bound the buffer: a reader that stops reading must stall the pump here
@@ -1595,12 +1510,8 @@ async function pumpTurnEvents(
     });
     channel.startHeartbeat(PING_INTERVAL_MS);
 
-    const outcome = await source.ready;
-    if (outcome.kind === "error") {
-      await emitStreamErrorFrame(channel, outcome.error);
-      return;
-    }
-
+    // The pre-stream peek already decided this is a live turn; buffered events
+    // are replayed before the pump continues on the live iterator.
     for (const event of source.peeked) {
       if (channel.isClosed) return;
       if (await encodeSseEvent(event, state, channel)) {
@@ -1649,37 +1560,37 @@ async function pumpTurnEvents(
   }
 }
 
-interface SseTwin {
-  response: Response;
-  /** Takes the turn for this body (and wires abort) unless it is detached. */
-  claim(): void;
-}
-
 /**
- * Builds one Response over the turn.
+ * Builds the one SSE Response that owns the turn.
  *
- * `owns` decides whether this body may claim (and therefore release) the turn.
- * A purely synchronous caller holds the body built for it; once the caller
- * awaits the call the source is promoted to async and that first body reports
- * `owns()` false for good, so it can neither drive nor cancel the turn the
- * finalized body now owns.
+ * Abort wiring happens here, before the body is handed out: a caller that hangs
+ * up — or a host that cancels an unconsumed body, as Magpie's gateway does —
+ * between `await` and the first `pull()` must still release the upstream turn.
  */
 function createSseResponse(
   model: string,
   source: PeekedTurnSource,
   signal: AbortSignal | undefined,
-  owns: () => boolean,
   onBodyCancel?: () => void,
-): SseTwin {
-  const channel = createSseChannel();
+): Response {
+  let detachAbort: (() => void) | null = null;
+
+  const detachAbortListener = (): void => {
+    const detach = detachAbort;
+    detachAbort = null;
+    detach?.();
+  };
+
+  // The channel is built first so finishing the body (naturally or by abort)
+  // detaches the caller's listener at the same instant it closes the stream.
+  const channel = createSseChannel(detachAbortListener);
   let pumping = false;
-  let ownsSource = false;
   let released = false;
 
-  // Only a body that claimed the turn may release it: a detached body must never
-  // cancel a source another body is driving.
+  /** Releases the turn exactly once, however many teardown paths race here. */
   const releaseSource = (): void => {
-    if (!ownsSource || released) return;
+    detachAbortListener();
+    if (released) return;
     released = true;
     try {
       onBodyCancel?.();
@@ -1688,23 +1599,18 @@ function createSseResponse(
     void source.close();
   };
 
-  /** Claims the turn for this body. False when it is detached or already taken. */
-  const claimSource = (): boolean => {
-    if (ownsSource) return true;
-    if (!owns()) return false;
-    if (!source.claim()) return false;
-    ownsSource = true;
-    // Abort wiring happens here, after the claim: a detached body therefore
-    // registers zero AbortSignal listeners and can never cancel the live one.
-    channel.bindAbort(signal, releaseSource);
-    return true;
-  };
-
-  /** Claims eagerly: a body may be cancelled or aborted before its first pull. */
-  const claim = (): void => {
-    if (!claimSource()) return;
-    if (channel.isClosed || signal?.aborted === true) releaseSource();
-  };
+  if (signal !== undefined) {
+    if (signal.aborted) {
+      releaseSource();
+    } else {
+      const onAbort = (): void => {
+        channel.finish();
+        releaseSource();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      detachAbort = () => signal.removeEventListener("abort", onAbort);
+    }
+  }
 
   const body = new ReadableStream<Uint8Array>(
     {
@@ -1716,12 +1622,9 @@ function createSseResponse(
         channel.wakeDrain();
         if (pumping) return;
         pumping = true;
-        if (!claimSource()) {
-          // Detached, or the other body already drives this turn.
-          channel.finish();
-          return;
-        }
         if (channel.isClosed || signal?.aborted === true) {
+          // Aborted or cancelled before the turn could start: emit no frames.
+          channel.finish();
           releaseSource();
           return;
         }
@@ -1729,12 +1632,8 @@ function createSseResponse(
       },
       cancel() {
         channel.finish();
-        // A body cancelled before its first `pull()` never claimed the turn, so
-        // an unread response would leak the upstream generator (and the session
-        // lock it holds). Claiming here releases it; a detached body returns
-        // without touching the turn the caller's awaited Response owns.
-        if (!owns()) return;
-        claim();
+        // A body cancelled before its first `pull()` never pumped, so an unread
+        // response would leak the upstream generator (and its session lock).
         releaseSource();
       },
     },
@@ -1743,106 +1642,73 @@ function createSseResponse(
     { highWaterMark: 0 },
   );
 
-  return { response: new Response(body, { status: 200, headers: { ...SSE_HEADERS } }), claim };
+  return new Response(body, { status: 200, headers: { ...SSE_HEADERS } });
 }
-
-type ResponseThen = (
-  onFulfilled?: ((value: Response) => unknown) | null,
-  onRejected?: ((reason: unknown) => unknown) | null,
-) => Promise<unknown>;
 
 /**
- * Makes an already-usable `Response` also awaitable.
+ * Awaits the first peek, waking early if the caller hangs up mid-peek.
  *
- * Both usage styles are supported:
- *   const res = await encodeAnthropicSseResponse(...); // exact status
- *   const res = encodeAnthropicSseResponse(...);       // 200 SSE immediately
- *
- * The finalized response — the only one that can report a pre-stream failure as
- * a real HTTP status — is built on the first `.then`, which is exactly what an
- * `await` does. A purely synchronous caller therefore never pays for a second
- * Response, and no unattended promise ever tears down the turn it is streaming.
+ * Waiting for upstream to yield its first event can take the whole turn
+ * timeout, so an abandoned request must release the turn immediately instead.
  */
-function asAwaitableResponse(
-  response: Response,
-  finalize: () => Promise<Response>,
-): Response {
+async function peekRacingAbort(
+  source: PeekedTurnSource,
+  signal: AbortSignal | undefined,
+): Promise<PeekOutcome | "aborted"> {
+  const peek = source.peekFirst();
+  if (signal === undefined) return peek;
+  let detach = (): void => {};
+  const aborted = new Promise<"aborted">((resolve) => {
+    const onAbort = (): void => resolve("aborted");
+    signal.addEventListener("abort", onAbort, { once: true });
+    detach = () => signal.removeEventListener("abort", onAbort);
+  });
   try {
-    Object.defineProperty(response, "then", {
-      configurable: true,
-      enumerable: false,
-      writable: true,
-      value: ((onFulfilled, onRejected) =>
-        finalize().then(onFulfilled, onRejected)) as ResponseThen,
-    });
-  } catch {
-    // A non-extensible Response still streams correctly, it just cannot be awaited.
+    return await Promise.race([peek, aborted]);
+  } finally {
+    detach();
   }
-  return response;
 }
 
-export function encodeAnthropicSseResponse(
+/**
+ * Turns the runtime's event stream into an Anthropic Messages response.
+ *
+ * The pre-stream peek runs first so a pool-exhausted or invalid turn answers
+ * with its real HTTP status; once content is provable the call resolves with a
+ * single SSE `Response` that streams the rest of the turn.
+ */
+export async function encodeAnthropicSseResponse(
   model: string,
   events: AsyncIterable<TurnStreamEvent>,
   signal?: AbortSignal,
   onBodyCancel?: () => void,
-): Response {
+): Promise<Response> {
   let source: PeekedTurnSource;
   try {
-    source = new PeekedTurnSource(events, signal, onBodyCancel);
+    source = new PeekedTurnSource(events);
   } catch (err) {
     return jsonErrorResponse(err);
   }
 
-  // The body a synchronous caller holds. It drives the turn unless the caller
-  // awaits the call, which promotes the source to async mode (see `finalize`).
-  const placeholder = createSseResponse(
-    model,
-    source,
-    signal,
-    () => !source.isAsync,
-    onBodyCancel,
-  );
-
-  let finalized: Promise<Response> | null = null;
-  const finalize = (): Promise<Response> => {
-    if (finalized !== null) return finalized;
-    if (source.isClaimed) {
-      // The caller has already started reading the synchronous body and only now
-      // awaits the call. That body owns the turn, so promoting the source would
-      // detach it mid-stream (`owns()` would turn false and a later `cancel()`
-      // would stop releasing the turn). Answer with the body the caller holds —
-      // after removing its own `then`: resolving a promise with a thenable whose
-      // `then` finalizes back into this same promise would unwrap forever.
-      delete (placeholder.response as { then?: unknown }).then;
-      finalized = Promise.resolve(placeholder.response);
-      return finalized;
-    }
-    // Irreversible: the synchronous body is detached from here on.
-    source.promoteToAsync();
-    finalized = source.ready
-      .then(async (outcome) => {
-        if (outcome.kind === "error") {
-          // Release the upstream turn before answering with a real HTTP error:
-          // a coordinator generator suspended at its `yield` would otherwise
-          // hold its session lock forever.
-          await source.close();
-          return jsonErrorResponse(outcome.error);
-        }
-        const twin = createSseResponse(model, source, signal, () => true, onBodyCancel);
-        // Claim (and arm abort) before `finalized` resolves, so a cancelled or
-        // aborted response still releases the turn before its first `pull()`.
-        twin.claim();
-        return twin.response;
-      })
-      .catch(async (err: unknown) => {
-        await source.close();
-        return jsonErrorResponse(err);
-      });
-    return finalized;
+  const aborted = (): Response => {
+    // Release the upstream turn before answering: a coordinator generator
+    // suspended at its `yield` would otherwise hold its session lock forever.
+    void source.close();
+    return jsonErrorResponse(
+      new BridgeHttpError(499, "invalid_request_error", "Client closed request"),
+    );
   };
 
-  return asAwaitableResponse(placeholder.response, finalize);
+  if (signal?.aborted === true) return aborted();
+
+  const outcome = await peekRacingAbort(source, signal);
+  if (outcome === "aborted") return aborted();
+  if (outcome.kind === "error") {
+    await source.close();
+    return jsonErrorResponse(outcome.error);
+  }
+
+  return createSseResponse(model, source, signal, onBodyCancel);
 }
 
 // ---------------------------------------------------------------------------

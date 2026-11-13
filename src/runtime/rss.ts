@@ -59,8 +59,16 @@ function readLinuxChildPids(pid: number): number[] {
   return children;
 }
 
-/** Walk `rootPid` and its descendants via `/proc` (no subprocess spawned). */
-function sumLinuxTreeRssBytes(rootPid: number): number {
+/**
+ * Depth-first RSS total for `rootPid` and its descendants. `childrenOf` and
+ * `rssBytesOf` supply the platform-specific lookups; a pid reported twice is
+ * still only counted once.
+ */
+function walkTreeRss(
+  rootPid: number,
+  childrenOf: (pid: number) => readonly number[],
+  rssBytesOf: (pid: number) => number,
+): number {
   const visited = new Set<number>();
   const stack: number[] = [rootPid];
   let total = 0;
@@ -68,12 +76,17 @@ function sumLinuxTreeRssBytes(rootPid: number): number {
     const pid = stack.pop()!;
     if (visited.has(pid)) continue;
     visited.add(pid);
-    total += readLinuxPidRssBytes(pid);
-    for (const child of readLinuxChildPids(pid)) {
+    total += rssBytesOf(pid);
+    for (const child of childrenOf(pid)) {
       if (!visited.has(child)) stack.push(child);
     }
   }
   return total;
+}
+
+/** Walk `rootPid` and its descendants via `/proc` (no subprocess spawned). */
+function sumLinuxTreeRssBytes(rootPid: number): number {
+  return walkTreeRss(rootPid, readLinuxChildPids, readLinuxPidRssBytes);
 }
 
 /** Walk `rootPid` and its descendants using a single `ps` snapshot. */
@@ -104,19 +117,11 @@ function sumPsTreeRssBytes(rootPid: number): number {
     siblings.push(pid);
   }
 
-  const visited = new Set<number>();
-  const stack: number[] = [rootPid];
-  let total = 0;
-  while (stack.length > 0) {
-    const pid = stack.pop()!;
-    if (visited.has(pid)) continue;
-    visited.add(pid);
-    total += (rssByPid.get(pid) ?? 0) * 1024;
-    for (const child of childrenByPpid.get(pid) ?? []) {
-      if (!visited.has(child)) stack.push(child);
-    }
-  }
-  return total;
+  return walkTreeRss(
+    rootPid,
+    (pid) => childrenByPpid.get(pid) ?? [],
+    (pid) => (rssByPid.get(pid) ?? 0) * 1024,
+  );
 }
 
 /**

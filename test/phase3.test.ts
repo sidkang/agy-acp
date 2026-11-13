@@ -7,26 +7,19 @@ import { spawn, spawnSync } from "node:child_process";
 import { Database } from "bun:sqlite";
 
 import {
-  BridgeHttpError,
   type AccountDescriptor,
   type NormalizedAnthropicRequest,
-  type NormalizedContentPart,
   type NormalizedMessage,
   type TurnStreamEvent,
 } from "../src/types";
 import {
-  buildCommittedMessages,
-  computeSessionContextHash,
   digestMessagesForPersistence,
-  digestToolsForPersistence,
   heardRuns,
   isCompactedRequest,
   isPrefixMatch,
   lostMedia,
   matchLedgerPrefix,
   matchPersistedPrefix,
-  sha256Hex,
-  type ToolDefLike,
 } from "../src/sessions/ledger";
 import {
   MAX_PARKED_SESSIONS,
@@ -65,13 +58,8 @@ import {
   combineSignals,
   createLoginSessionDisposer,
 } from "../src/accounts/auth";
-import type { SpawnAgyOptions } from "../src/accounts/env";
+import { spawnFakeAcp } from "./fixtures/helpers";
 
-const FAKE_ACP_PATH = path.resolve(
-  import.meta.dir,
-  "fixtures",
-  "fake-acp.ts",
-);
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
 
 const tempDirs: string[] = [];
@@ -94,17 +82,6 @@ function makeAccount(
     label: `test-${suffix}`,
     isolatedHomeDir,
   };
-}
-
-function spawnFakeAcp(
-  _account: AccountDescriptor,
-  args: string[],
-  opts?: SpawnAgyOptions,
-) {
-  return spawn("bun", ["run", FAKE_ACP_PATH, ...args], {
-    cwd: opts?.cwd ?? process.cwd(),
-    stdio: ["pipe", "pipe", "pipe"],
-  });
 }
 
 async function withDataDir<T>(
@@ -588,42 +565,6 @@ describe("Phase 3: MED-10 ShelfStore & secondary content-hash addressing", () =>
     };
   }
 
-  test("computeSessionContextHash ignores volatile headers and separates scope", () => {
-    const tools: ToolDefLike[] = [
-      {
-        name: "read",
-        description: "read file",
-        inputSchema: { type: "object", properties: { path: { type: "string" } } },
-      },
-    ];
-    const toolsDigests = digestToolsForPersistence(tools);
-    const h1 = computeSessionContextHash({
-      accountRef: "acct-1",
-      minimalAgent: false,
-      workDir: "/repo/a",
-      systemPrompt:
-        "x-anthropic-billing-header: cc_version=1.0; cch=aaa\nYou are helpful.",
-      toolsDigests,
-    });
-    const h2 = computeSessionContextHash({
-      accountRef: "acct-1",
-      minimalAgent: false,
-      workDir: "  /repo/a  ",
-      systemPrompt:
-        "x-anthropic-billing-header: cc_version=2.0; cch=bbb\nYou are helpful.",
-      toolsDigests,
-    });
-    const hDiffAccount = computeSessionContextHash({
-      accountRef: "acct-2",
-      minimalAgent: false,
-      workDir: "/repo/a",
-      systemPrompt: "You are helpful.",
-      toolsDigests,
-    });
-    expect(h1).toBe(h2);
-    expect(h1).not.toBe(hDiffAccount);
-  });
-
   test("ShelfStore secondary lookup picks longest strict prefix and enforces all negative guards", () => {
     const dataDir = makeTempDir("agy-shelf-sec-");
     return withDataDir(dataDir, () => {
@@ -1046,6 +987,55 @@ describe("Phase 3: inline image fitting & broker/prompt-render wiring", () => {
     expect(readImageDimensions(Buffer.from("AAAA", "base64"))).toBeNull();
   });
 
+  test("lossless/arithmetic JPEG (SOF3/SOF9) is probed but never decoded or re-encoded", () => {
+    // Only baseline (SOF0), extended sequential (SOF1) and progressive (SOF2)
+    // Huffman frames are decodable here. A lossless (SOF3) or arithmetic-coded
+    // (SOF9) frame must come back as `null` instead of being decoded to garbage
+    // and then re-encoded over the caller's real pixels.
+    const frameHeader = (
+      sofMarker: number,
+      width: number,
+      height: number,
+    ): Uint8Array =>
+      Uint8Array.from([
+        0xff, 0xd8, // SOI
+        0xff, sofMarker, 0x00, 0x0b, // frame header, length 11
+        0x08, // 8-bit precision
+        (height >> 8) & 0xff, height & 0xff,
+        (width >> 8) & 0xff, width & 0xff,
+        0x01, // one component
+        0x01, 0x11, 0x00, // id 1, 1x1 sampling, quant table 0
+        0xff, 0xd9, // EOI
+      ]);
+
+    for (const sofMarker of [0xc3, 0xc9]) {
+      const header = frameHeader(sofMarker, 32, 16);
+      const base64 = Buffer.from(header).toString("base64");
+      // Probing reads only the frame header, so the dimensions are still known.
+      expect(readImageDimensions(header)).toEqual({
+        width: 32,
+        height: 16,
+        format: "jpeg",
+      });
+      expect(decodeImageRgba(header)).toBeNull();
+      expect(fitInlineImage("image/jpeg", base64)).toEqual({
+        mediaType: "image/jpeg",
+        data: base64,
+      });
+
+      // Wider than `MAX_INLINE_IMAGE_SIDE`, so the fitter really does attempt a
+      // decode + downscale: the undecodable frame must still pass through the
+      // original bytes rather than becoming a grey re-encoded JPEG.
+      const wide = frameHeader(sofMarker, MAX_INLINE_IMAGE_SIDE + 400, 16);
+      const wideBase64 = Buffer.from(wide).toString("base64");
+      expect(decodeImageRgba(wide)).toBeNull();
+      expect(fitInlineImage("image/jpeg", wideBase64)).toEqual({
+        mediaType: "image/jpeg",
+        data: wideBase64,
+      });
+    }
+  });
+
   test("fast path, downscale (>2000px), LRU cache, WebP passthrough, and bomb guard", () => {
     // 1. Small/unreadable passthrough untouched
     expect(fitInlineImage("image/png", "AAAA")).toEqual({
@@ -1114,13 +1104,12 @@ describe("Phase 3: inline image fitting & broker/prompt-render wiring", () => {
     // 5. Noisy >5 MiB PNG (<=2000px, e.g. 1600x1200 raw noise) triggers JPEG fallback cascade
     const noisyPng = encodePngRgba(1600, 1200, makeNoisyRgba(1600, 1200));
     const noisyB64 = Buffer.from(noisyPng).toString("base64");
-    if (noisyB64.length > MAX_INLINE_IMAGE_BASE64_BYTES) {
-      const fittedNoisy = fitInlineImage("image/png", noisyB64);
-      expect(fittedNoisy.mediaType).toBe("image/jpeg");
-      expect(fittedNoisy.data.length).toBeLessThanOrEqual(
-        MAX_INLINE_IMAGE_BASE64_BYTES,
-      );
-    }
+    expect(noisyB64.length).toBeGreaterThan(MAX_INLINE_IMAGE_BASE64_BYTES);
+    const fittedNoisy = fitInlineImage("image/png", noisyB64);
+    expect(fittedNoisy.mediaType).toBe("image/jpeg");
+    expect(fittedNoisy.data.length).toBeLessThanOrEqual(
+      MAX_INLINE_IMAGE_BASE64_BYTES,
+    );
 
     // 6. Oversized WebP passes through safely
     const vp8x = new Uint8Array(30);
@@ -1183,13 +1172,16 @@ describe("Phase 3: inline image fitting & broker/prompt-render wiring", () => {
     }
 
     // 2. SessionToolBroker fits tool_result image and leaves "AAAA" untouched
-    const broker = new SessionToolBroker({ batchWindowMs: 1 });
-    broker.setTools([{ name: "snap", inputSchema: { type: "object" } }]);
     let resolveBatch!: (calls: any[]) => void;
     const exposedPromise = new Promise<any[]>((resolve) => {
       resolveBatch = resolve;
     });
-    broker.openTurnWindow((calls) => resolveBatch(calls));
+    const broker = new SessionToolBroker({
+      batchWindowMs: 1,
+      onBatchReady: (calls) => resolveBatch(calls),
+    });
+    broker.setTools([{ name: "snap", inputSchema: { type: "object" } }]);
+    broker.openTurnWindow();
 
     const rpcPromise = broker.handleJsonRpc({
       jsonrpc: "2.0",
@@ -1483,9 +1475,11 @@ describe("Phase 3: ARCH-3 encodeAnthropicSseResponse ownership", () => {
     };
   }
 
-  test("sync error stream stays open until read; unread sync stream attaches zero abort listeners", async () => {
+  test("pre-stream error resolves before the body exists; a live stream attaches one abort listener and releases it", async () => {
+    // 1. The first event is peeked before the response is handed back, so an
+    //    error arrives as its real HTTP status with the source closed once.
     const stats = { returned: 0, pulls: 0 };
-    const res = encodeAnthropicSseResponse(
+    const errRes = await encodeAnthropicSseResponse(
       "m",
       trackedEvents(
         [
@@ -1499,16 +1493,16 @@ describe("Phase 3: ARCH-3 encodeAnthropicSseResponse ownership", () => {
         stats,
       ),
     );
-    await new Promise((r) => setTimeout(r, 25));
-    expect(stats.returned).toBe(0);
-    const text = await res.text();
-    expect(text).toContain("event: error");
-    expect(text).toContain("pool exhausted");
+    expect(errRes.status).toBe(429);
+    expect(errRes.headers.get("content-type")).toContain("application/json");
     expect(stats.returned).toBe(1);
+    expect(((await errRes.json()) as any).error.message).toBe("pool exhausted");
 
+    // 2. A stream that starts with content is not closed by the peek: the body
+    //    owns the iterator and is the only thing that releases it.
     const stats2 = { returned: 0, pulls: 0 };
     const spy = spyController();
-    const syncRes = encodeAnthropicSseResponse(
+    const okRes = await encodeAnthropicSseResponse(
       "m",
       trackedEvents(
         [
@@ -1519,15 +1513,17 @@ describe("Phase 3: ARCH-3 encodeAnthropicSseResponse ownership", () => {
       ),
       spy.signal,
     );
-    await new Promise((r) => setTimeout(r, 15));
+    expect(okRes.status).toBe(200);
+    expect(stats2.pulls).toBe(1);
+    expect(stats2.returned).toBe(0);
     // Single PeekedTurnSource pre-claim listener only (no duplicate body listener)
     expect(spy.listenerCount()).toBe(1);
-    expect(await syncRes.text()).toContain("message_stop");
+    expect(await okRes.text()).toContain("message_stop");
     expect(stats2.returned).toBe(1);
     expect(spy.listenerCount()).toBe(0);
   });
 
-  test("awaited error maps to JSON error, simultaneous cancel+abort releases once, read-then-await avoids deadlock", async () => {
+  test("awaited error maps to JSON error and simultaneous cancel+abort releases once", async () => {
     // 1. Pre-stream error event -> HTTP JSON 429 + closed once
     const errStats = { returned: 0, pulls: 0 };
     const errRes = await encodeAnthropicSseResponse(
@@ -1591,23 +1587,6 @@ describe("Phase 3: ARCH-3 encodeAnthropicSseResponse ownership", () => {
     expect(raceStats.returned).toBe(1);
     expect(cancels).toBe(1);
     expect(spy.listenerCount()).toBe(0);
-
-    // 4. Read-then-await does not deadlock and returns the exact same Response
-    const rtaStats = { returned: 0, pulls: 0 };
-    const rtaRes = encodeAnthropicSseResponse(
-      "m",
-      trackedEvents(
-        [
-          { type: "text_delta", text: "hi" },
-          { type: "finish", stopReason: "end_turn", usage: USAGE_ZERO },
-        ],
-        rtaStats,
-      ),
-    );
-    expect(await rtaRes.text()).toContain("message_stop");
-    const awaitedSame = await rtaRes;
-    expect(awaitedSame).toBe(rtaRes);
-    expect(rtaStats.returned).toBe(1);
   });
 });
 

@@ -81,7 +81,6 @@ interface ParkedCall {
   input: Record<string, unknown>
   promise: Promise<unknown>
   resolve: (result: unknown) => void
-  reject: (error: unknown) => void
   deadlineTimer: ReturnType<typeof setTimeout> | null
 }
 
@@ -102,10 +101,8 @@ function errorResult(text: string): McpCallToolResult {
 
 function createParkedCall(name: string, mcpName: string, input: Record<string, unknown>): ParkedCall {
   let resolveFn: (result: unknown) => void = () => {}
-  let rejectFn: (error: unknown) => void = () => {}
-  const promise = new Promise<unknown>((resolve, reject) => {
+  const promise = new Promise<unknown>((resolve) => {
     resolveFn = resolve
-    rejectFn = reject
   })
   return {
     id: `${TOOL_USE_ID_PREFIX}${randomBytes(12).toString("hex")}`,
@@ -114,7 +111,6 @@ function createParkedCall(name: string, mcpName: string, input: Record<string, u
     input,
     promise,
     resolve: resolveFn,
-    reject: rejectFn,
     deadlineTimer: null,
   }
 }
@@ -149,7 +145,6 @@ export class SessionToolBroker {
 
   private normalizedTools: NormalizedToolDef[] = []
   private mcpToOriginal = new Map<string, string>()
-  private originalToMcp = new Map<string, string>()
   private toolChoice: ToolChoiceSpec = { type: "auto" }
   private rejectedNoneCount = 0
   private rejectedChoiceCount = 0
@@ -163,7 +158,6 @@ export class SessionToolBroker {
 
   private batchTimer: ReturnType<typeof setTimeout> | null = null
   private turnOutputOpen = true
-  private batchListener: ((calls: ExposedToolCall[]) => void) | null = null
 
   constructor(options: SessionToolBrokerOptions = {}) {
     this.batchWindowMs = options.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS
@@ -178,11 +172,6 @@ export class SessionToolBroker {
     const normalized = normalizeToolDefinitions(rawTools)
     this.normalizedTools = normalized.tools
     this.mcpToOriginal = normalized.mcpToOriginal
-    this.originalToMcp = normalized.originalToMcp
-    return this.normalizedTools
-  }
-
-  getTools(): NormalizedToolDef[] {
     return this.normalizedTools
   }
 
@@ -203,8 +192,7 @@ export class SessionToolBroker {
   }
 
   /** Start a new HTTP turn in which `tools/call`s may be exposed. */
-  openTurnWindow(onBatchReady?: (calls: ExposedToolCall[]) => void): void {
-    if (onBatchReady) this.batchListener = onBatchReady
+  openTurnWindow(): void {
     this.turnOutputOpen = true
   }
 
@@ -212,11 +200,6 @@ export class SessionToolBroker {
   markHttpTurnClosed(): void {
     this.turnOutputOpen = false
     this.flushBatch()
-  }
-
-  /** Called when the model finished text/end while calls were still batching. */
-  flushCurrentBatchNow(): void {
-    this.markHttpTurnClosed()
   }
 
   hasPendingWork(): boolean {
@@ -295,24 +278,6 @@ export class SessionToolBroker {
     this.clearBatchTimer()
     this.turnOutputOpen = false
     for (const call of parked) {
-      this.clearDeadline(call)
-      call.resolve(errorResult(text))
-    }
-  }
-
-  /**
-   * Cancel and resolve unexposed parked calls (e.g. late parallel siblings)
-   * so they do not block or intercept a user steering message.
-   */
-  cancelUnexposed(reason?: string): void {
-    const text = reason || "Skipped due to user steering message"
-    const unexposed = [...this.currentBatch, ...this.queuedUnexposed, ...this.exposedPending.values()]
-    this.currentBatch = []
-    this.queuedUnexposed = []
-    this.exposedPending.clear()
-    this.clearBatchTimer()
-    this.turnOutputOpen = false
-    for (const call of unexposed) {
       this.clearDeadline(call)
       call.resolve(errorResult(text))
     }
@@ -421,13 +386,9 @@ export class SessionToolBroker {
     }
 
     const call = this.parkCall(originalName, mcpName, ensureObject(params.arguments))
-    try {
-      const result = await call.promise
-      return { status: 200, body: { jsonrpc: "2.0", id, result } }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      return { status: 200, body: { jsonrpc: "2.0", id, error: { code: -32603, message } } }
-    }
+    // A parked call is only ever resolved (never rejected), so nothing to catch.
+    const result = await call.promise
+    return { status: 200, body: { jsonrpc: "2.0", id, result } }
   }
 
   private parkCall(name: string, mcpName: string, input: Record<string, unknown>): ParkedCall {
@@ -440,7 +401,7 @@ export class SessionToolBroker {
       // With parallel tool use disabled, the first call alone closes the turn:
       // siblings that arrive afterwards queue instead of joining this batch.
       if (this.currentBatch.length === 1 && this.disablesParallelToolUse()) {
-        this.flushCurrentBatchNow()
+        this.markHttpTurnClosed()
       }
     } else {
       this.queuedUnexposed.push(call)
@@ -479,9 +440,7 @@ export class SessionToolBroker {
   }
 
   private emitBatch(batch: ParkedCall[]): void {
-    const exposed = batch.map(toExposedCall)
-    const listener = this.batchListener ?? this.onBatchReady
-    listener?.(exposed)
+    this.onBatchReady?.(batch.map(toExposedCall))
   }
 
   private armDeadline(call: ParkedCall): void {

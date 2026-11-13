@@ -16,7 +16,7 @@ import { createHash } from "node:crypto"
 
 import type { NormalizedAnthropicRequest, NormalizedToolDef } from "../../types"
 import { ensureGeminiArrayItems } from "./array-items"
-import { sanitizePatternFields } from "./re2-pattern"
+import { appendHint, sanitizePatternFields } from "./re2-pattern"
 
 export type JsonSchema = Record<string, unknown>
 
@@ -59,15 +59,6 @@ const NO_VALUE_HINT = "No value is allowed by the original schema."
 const NULL_HINT = "Must be null."
 const RECURSIVE_HINT = "Recursive schema; follow the tool's original argument contract."
 const LIMIT_HINT = "Schema expansion limit reached; follow the tool's original argument contract."
-
-function appendHint(node: JsonSchema, hint: unknown): void {
-  if (typeof hint !== "string" || !hint) return
-  if (typeof node.description === "string" && node.description.trim()) {
-    if (!node.description.includes(hint)) node.description = `${node.description} (${hint})`
-  } else {
-    node.description = hint
-  }
-}
 
 function clip(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim()
@@ -259,7 +250,7 @@ function intersectSchemas(schemas: unknown[]): JsonSchema {
   const out: JsonSchema = { ...first }
   const conflicts: string[] = []
   for (const schema of meaningful.slice(1)) {
-    appendHint(out, schema.description)
+    if (typeof schema.description === "string") appendHint(out, schema.description)
     for (const [key, value] of Object.entries(schema)) {
       if (key === "description" || key === "properties" || key === "required" || key === "items" ||
           key === "enum" || key === "type" || NUMBER_BOUNDS.includes(key)) continue

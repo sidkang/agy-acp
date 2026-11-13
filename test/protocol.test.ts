@@ -128,7 +128,7 @@ function trackedStream(events: TurnStreamEvent[]): {
 
 /**
  * A drop-in `AbortSignal` that counts live "abort" listeners, so tests can
- * assert that an unconsumed placeholder Response registers none.
+ * prove every response path detaches its listener.
  */
 function trackingSignal(): {
   signal: AbortSignal;
@@ -1310,10 +1310,38 @@ describe("encodeAnthropicSseResponse: pre-stream failures keep their HTTP status
 // ---------------------------------------------------------------------------
 // encodeAnthropicSseResponse: upstream lifecycle
 // ---------------------------------------------------------------------------
+
+/**
+ * A coordinator-shaped turn: the session lock is taken before the first yield
+ * and only dropped in `finally`, so anything that walks away from the iterator
+ * without releasing it holds the lock forever. `state` is owned per test — a
+ * shared counter would hide a missed release behind a sibling's teardown.
+ */
+function lockedTurn(
+  state: { finalized: number },
+  text = "never read",
+): AsyncGenerator<TurnStreamEvent> {
+  return (async function* (): AsyncGenerator<TurnStreamEvent> {
+    try {
+      yield { type: "text_delta", text };
+      yield { type: "finish", stopReason: "end_turn", usage: USAGE };
+    } finally {
+      state.finalized += 1;
+    }
+  })();
+}
+
+/** Waits (bounded) for a released upstream to run its `finally` block. */
+async function settle(state: { finalized: number }): Promise<void> {
+  for (let tick = 0; tick < 50 && state.finalized === 0; tick += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
 describe("encodeAnthropicSseResponse: upstream teardown", () => {
   test("a pre-stream error event runs the upstream generator's finally block", async () => {
     const state = { finalized: false, lockReleased: false, ranPastError: false };
-    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
+    async function* lockedErrorTurn(): AsyncGenerator<TurnStreamEvent> {
       // Mirrors SessionCoordinator.executeTurn: a lock is taken before the first
       // yield and only dropped in `finally`.
       try {
@@ -1331,7 +1359,7 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
       }
     }
 
-    const response = await encodeAnthropicSseResponse(MODEL, lockedTurn());
+    const response = await encodeAnthropicSseResponse(MODEL, lockedErrorTurn());
     expect(response.status).toBe(429);
     expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
     expect(asRecord((await readJson(response)).error).message).toBe("pool exhausted");
@@ -1343,7 +1371,7 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
     expect(state.ranPastError).toBe(false);
   });
 
-  test("an awaited response leaves zero abort listeners and its unused twin cannot double-cancel", async () => {
+  test("an awaited response leaves zero abort listeners and a late abort cannot double-cancel", async () => {
     const tracker = trackingSignal();
     const events: TurnStreamEvent[] = [
       { type: "text_delta", text: "hi" },
@@ -1377,8 +1405,8 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
     const frames = parseSseFrames(await response.text());
     expect(frames[frames.length - 1]?.event).toBe("message_stop");
 
-    // The unclaimed placeholder Response registered no listener, and the claimed
-    // body detaches its listener when the stream finishes.
+    // The single claimed body registers exactly one listener and detaches it
+    // when the stream finishes.
     expect(tracker.listenerCount()).toBe(0);
     expect(state.returns).toBe(1);
 
@@ -1393,21 +1421,13 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
     const tracker = trackingSignal();
     const state = { finalized: 0 };
     let bodyCancels = 0;
-    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
-      try {
-        yield { type: "text_delta", text: "never read" };
-        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
-      } finally {
-        state.finalized += 1;
-      }
-    }
 
     // The host records the body of an unconsumed response and cancels it when
     // downstream disconnects, so an unread response must still release the turn
     // (an unreleased generator holds its session lock forever).
     const response = await encodeAnthropicSseResponse(
       MODEL,
-      lockedTurn(),
+      lockedTurn(state),
       tracker.signal,
       () => {
         bodyCancels += 1;
@@ -1415,9 +1435,7 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
     );
     await response.body?.cancel();
 
-    for (let tick = 0; tick < 50 && state.finalized === 0; tick += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
+    await settle(state);
     expect(state.finalized).toBe(1);
     expect(bodyCancels).toBe(1);
     expect(tracker.listenerCount()).toBe(0);
@@ -1426,62 +1444,34 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
   test("an awaited response aborted before its first read releases the upstream", async () => {
     const tracker = trackingSignal();
     const state = { finalized: 0 };
-    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
-      try {
-        yield { type: "text_delta", text: "never read" };
-        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
-      } finally {
-        state.finalized += 1;
-      }
-    }
 
-    const response = await encodeAnthropicSseResponse(MODEL, lockedTurn(), tracker.signal);
+    await encodeAnthropicSseResponse(MODEL, lockedTurn(state), tracker.signal);
     expect(tracker.listenerCount()).toBe(1);
     tracker.abort();
 
-    for (let tick = 0; tick < 50 && state.finalized === 0; tick += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
+    await settle(state);
     expect(state.finalized).toBe(1);
     expect(tracker.listenerCount()).toBe(0);
   });
 
-  test("a synchronously returned response cancelled before its first read releases the upstream", async () => {
+  test("an awaited response cancelled before its first pull still releases the turn", async () => {
     const state = { finalized: 0 };
-    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
-      try {
-        yield { type: "text_delta", text: "never read" };
-        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
-      } finally {
-        state.finalized += 1;
-      }
-    }
 
-    // Sync style means `.then` is never called, so the placeholder body owns the
-    // turn and must release it rather than wait for a `pull()` that never comes.
-    const response = encodeAnthropicSseResponse(MODEL, lockedTurn());
+    // The body is handed out by the await; a host that cancels it without ever
+    // reading has to release the turn rather than wait for a `pull()` that
+    // never comes.
+    const response = await encodeAnthropicSseResponse(MODEL, lockedTurn(state));
+    expect(response.status).toBe(200);
     await response.body?.cancel();
 
-    for (let tick = 0; tick < 50 && state.finalized === 0; tick += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
+    await settle(state);
     expect(state.finalized).toBe(1);
   });
 
-  test("a sync-style response read after a delay still streams the whole turn", async () => {
+  test("a response read after a delay still streams the whole turn", async () => {
     const state = { finalized: 0 };
-    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
-      try {
-        yield { type: "text_delta", text: "kept" };
-        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
-      } finally {
-        state.finalized += 1;
-      }
-    }
 
-    // The awaited twin settles long before a synchronous caller gets round to
-    // reading; it must not steal the turn from the body the caller holds.
-    const response = encodeAnthropicSseResponse(MODEL, lockedTurn());
+    const response = await encodeAnthropicSseResponse(MODEL, lockedTurn(state, "kept"));
     await new Promise((resolve) => setTimeout(resolve, 5));
     const frames = parseSseFrames(await response.text());
 
@@ -1510,7 +1500,7 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
       }
     }
 
-    const response = encodeAnthropicSseResponse(MODEL, gatedTurn(), tracker.signal);
+    const response = await encodeAnthropicSseResponse(MODEL, gatedTurn(), tracker.signal);
     const payload = response.text();
 
     for (let i = 0; i < 50 && !entered; i += 1) {
@@ -1577,13 +1567,20 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
     expect(finalized).toBe(true);
   });
 
-  test("aborting a synchronous unread response releases the upstream generator", async () => {
+  test("aborting while the turn is still peeking answers 499 JSON and releases the upstream", async () => {
     const tracker = trackingSignal();
-    const state = { peeked: false, finalized: 0, cancels: 0 };
+    const state = { entered: false, finalized: 0 };
+    let releasePeek!: () => void;
+    const peekGate = new Promise<void>((resolve) => {
+      releasePeek = resolve;
+    });
 
-    async function* unreadSyncTurn(): AsyncGenerator<TurnStreamEvent> {
+    // The first event only arrives after the gate: the caller hangs up while
+    // `peekFirst()` is still waiting on upstream, the slowest possible start.
+    async function* slowStart(): AsyncGenerator<TurnStreamEvent> {
       try {
-        state.peeked = true;
+        state.entered = true;
+        await peekGate;
         yield { type: "text_delta", text: "unread" };
         yield { type: "finish", stopReason: "end_turn", usage: USAGE };
       } finally {
@@ -1591,27 +1588,24 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
       }
     }
 
-    const _response = encodeAnthropicSseResponse(
-      MODEL,
-      unreadSyncTurn(),
-      tracker.signal,
-      () => {
-        state.cancels += 1;
-      },
-    );
-
-    for (let i = 0; i < 50 && !state.peeked; i += 1) {
+    const pending = encodeAnthropicSseResponse(MODEL, slowStart(), tracker.signal);
+    for (let i = 0; i < 50 && !state.entered; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
-    expect(state.peeked).toBe(true);
+    expect(state.entered).toBe(true);
 
     tracker.abort();
-    for (let i = 0; i < 50 && state.finalized === 0; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    expect(state.finalized).toBe(1);
-    expect(state.cancels).toBe(1);
+    const response = await pending;
+    expect(response.status).toBe(499);
+    expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(asRecord((await readJson(response)).error).type).toBe("invalid_request_error");
     expect(tracker.listenerCount()).toBe(0);
+
+    // The generator is parked mid-await; releasing it lets the queued
+    // `iterator.return()` run its finally block.
+    releasePeek();
+    await settle(state);
+    expect(state.finalized).toBe(1);
   });
 });
 
@@ -1696,7 +1690,7 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
   });
 
   test("a thinking block without an upstream signature gets a synthetic one", async () => {
-    const response = encodeAnthropicSseResponse(
+    const response = await encodeAnthropicSseResponse(
       MODEL,
       streamOf([
         { type: "thinking_delta", thinking: "internal monologue" },
@@ -1776,7 +1770,7 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
 
   test("an exception after content started is reported in-stream", async () => {
     const stats = await withIntervalTracking(async () => {
-      const response = encodeAnthropicSseResponse(
+      const response = await encodeAnthropicSseResponse(
         MODEL,
         streamThatFailsAfter(
           [{ type: "text_delta", text: "hi" }],
@@ -1796,7 +1790,7 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
 
   test("an upstream that ends without a finish event still closes the message", async () => {
     const tracked = trackedStream([{ type: "text_delta", text: "cut off" }]);
-    const response = encodeAnthropicSseResponse(MODEL, tracked.iterable);
+    const response = await encodeAnthropicSseResponse(MODEL, tracked.iterable);
     const frames = parseSseFrames(await response.text());
     const delta = requireFrame(frames, "message_delta");
     expect(asRecord(delta.data.delta).stop_reason).toBe("end_turn");
@@ -1805,31 +1799,36 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
     expect(tracked.state.returned).toBe(true);
   });
 
-  test("the response object is also awaitable and keeps the SSE body", async () => {
-    // Sync usage (status is already committed) and await usage must agree.
-    const syncResponse = encodeAnthropicSseResponse(
+  test("awaiting the call resolves to one standard Response carrying the SSE body", async () => {
+    const response = await encodeAnthropicSseResponse(
       MODEL,
-      streamOf([{ type: "text_delta", text: "x" }, { type: "finish", stopReason: "end_turn", usage: USAGE }]),
+      streamOf([
+        { type: "text_delta", text: "y" },
+        { type: "finish", stopReason: "end_turn", usage: USAGE },
+      ]),
     );
-    expect(syncResponse).toBeInstanceOf(Response);
-    expect(syncResponse.status).toBe(200);
-    expect(parseSseFrames(await syncResponse.text())[0]?.event).toBe("message_start");
-
-    const awaited = await encodeAnthropicSseResponse(
-      MODEL,
-      streamOf([{ type: "text_delta", text: "y" }, { type: "finish", stopReason: "end_turn", usage: USAGE }]),
-    );
-    expect(awaited).toBeInstanceOf(Response);
-    expect(awaited.status).toBe(200);
-    expect(parseSseFrames(await awaited.text())[0]?.event).toBe("message_start");
+    expect(response).toBeInstanceOf(Response);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/event-stream; charset=utf-8");
+    const frames = parseSseFrames(await response.text());
+    expect(frames[0]?.event).toBe("message_start");
+    expect(frames[frames.length - 1]?.event).toBe("message_stop");
   });
 
-  test("an aborted signal closes the response without frames and releases the upstream", async () => {
+  test("a pre-aborted signal answers 499 JSON without touching the upstream", async () => {
     const controller = new AbortController();
-    const tracked = trackedStream([{ type: "text_delta", text: "one" }]);
-    const response = encodeAnthropicSseResponse(MODEL, tracked.iterable, controller.signal);
     controller.abort();
-    expect(await response.text()).toBe("");
+    const tracked = trackedStream([{ type: "text_delta", text: "one" }]);
+
+    const response = await encodeAnthropicSseResponse(MODEL, tracked.iterable, controller.signal);
+    expect(response.status).toBe(499);
+    expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(await readJson(response)).toEqual({
+      type: "error",
+      error: { type: "invalid_request_error", message: "Client closed request" },
+    });
+    // No SSE frames at all, and the turn is torn down rather than left unread.
+    expect(tracked.state.pulled).toBe(0);
     expect(tracked.state.returned).toBe(true);
   });
 
@@ -1905,7 +1904,7 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
         yield { type: "finish", stopReason: "end_turn", usage: USAGE };
       }
 
-      const response = encodeAnthropicSseResponse(MODEL, gated());
+      const response = await encodeAnthropicSseResponse(MODEL, gated());
       const payload = response.text();
 
       // Let the pump reach the silent upstream, then fire the heartbeat.
@@ -2112,7 +2111,7 @@ describe("encodeAnthropicSseResponse: backpressure", () => {
       yield { type: "finish", stopReason: "end_turn", usage: USAGE };
     }
 
-    const response = encodeAnthropicSseResponse(MODEL, chatty());
+    const response = await encodeAnthropicSseResponse(MODEL, chatty());
     const reader = response.body?.getReader();
     if (reader === undefined) throw new Error("expected a streaming body");
 
@@ -2159,7 +2158,7 @@ describe("encodeAnthropicSseResponse: backpressure", () => {
       }
     }
 
-    const response = encodeAnthropicSseResponse(MODEL, endless());
+    const response = await encodeAnthropicSseResponse(MODEL, endless());
     const reader = response.body?.getReader();
     if (reader === undefined) throw new Error("expected a streaming body");
     await reader.read();

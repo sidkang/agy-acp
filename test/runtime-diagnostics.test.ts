@@ -36,6 +36,41 @@ interface FakeAcpScriptContext {
   sendResult: (id: number | string, result: unknown) => void;
   sendError: (id: number | string, code: number, message: string) => void;
   exitProcess: (code: number | null, signal?: NodeJS.Signals | null) => void;
+  /**
+   * Ends the current turn the way the real CLI does when the agent dies: the
+   * terminal error chunk plus a plain `end_turn` result. Optionally stages a
+   * numbered worker log line first, which is what the diagnosis reads.
+   */
+  terminateTurn: (log?: { name: string; text: string; append?: boolean }) => void;
+  /** Answers the in-flight `session/prompt` with a JSON-RPC error. */
+  failTurn: (message: string, code?: number) => void;
+}
+
+/** The chunk agy emits as the only content of a turn that failed internally. */
+const AGENT_ERROR_CHUNK = "\n⚠ Agent execution terminated due to error.\n";
+
+const NATIVE_SESSION_ID = "native-diag-sess-1";
+
+/**
+ * One worker→`encodeAnthropicSseResponse` case: every field is what a test would
+ * otherwise assert by hand, so the scaffolding below is written exactly once.
+ */
+interface DiagnosedTurnCase {
+  name: string;
+  workspacePrefix: string;
+  sessionId: string;
+  /** What the scripted CLI does once `session/prompt` arrives. */
+  script: (ctx: FakeAcpScriptContext) => void;
+  /** Startup chatter written before the prompt arrives (if any). */
+  startup?: (ctx: FakeAcpScriptContext) => void;
+  status: number;
+  signInHeader: string | null;
+  errorType: string;
+  message?: string;
+  /** Substrings that must never appear anywhere in the raw JSON body. */
+  forbidden?: string[];
+  /** Extra assertions over the raw (pre-parse) body. */
+  checkRaw?: (raw: string) => void;
 }
 
 function createScriptedFakeAcpChild(
@@ -55,6 +90,9 @@ function createScriptedFakeAcpChild(
   };
 
   let childRef: any;
+  // The id of the in-flight `session/prompt`, so a scripted turn can answer it
+  // without every test hard-coding the JSON-RPC sequence.
+  let promptRequestId: number | string = 3;
   const ctx: FakeAcpScriptContext = {
     workspaceDir,
     stderr,
@@ -70,6 +108,24 @@ function createScriptedFakeAcpChild(
     exitProcess: (code: number | null, signal: NodeJS.Signals | null = null) => {
       if (childRef) childRef.exitCode = code ?? 1;
       emitter.emit("exit", code, signal);
+    },
+    terminateTurn: (log) => {
+      if (log !== undefined) {
+        const logPath = path.join(workspaceDir, log.name);
+        if (log.append === true) fs.appendFileSync(logPath, log.text);
+        else fs.writeFileSync(logPath, log.text);
+      }
+      ctx.emitUpdate({
+        sessionId: NATIVE_SESSION_ID,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { text: AGENT_ERROR_CHUNK },
+        },
+      });
+      ctx.sendResult(promptRequestId, { stopReason: "end_turn" });
+    },
+    failTurn: (message, code = -32000) => {
+      ctx.sendError(promptRequestId, code, message);
     },
   };
 
@@ -109,7 +165,7 @@ function createScriptedFakeAcpChild(
           jsonrpc: "2.0",
           id: msg.id,
           result: {
-            sessionId: "native-diag-sess-1",
+            sessionId: NATIVE_SESSION_ID,
             configOptions: [
               {
                 id: "model",
@@ -124,6 +180,7 @@ function createScriptedFakeAcpChild(
         send({ jsonrpc: "2.0", id: msg.id, result: {} });
       } else if (msg.method === "session/prompt") {
         promptTurn += 1;
+        promptRequestId = msg.id;
         void Promise.resolve(onPrompt(ctx, promptTurn));
       }
     }
@@ -516,14 +573,7 @@ describe("AgySessionWorker diagnostics integration", () => {
               workerLog,
               "E1113 20:12:05.437065     391 errorreport.go:273] agent executor error: generating and executing: serializing trajectory: maxMessageTokens must be positive, got 0\n",
             );
-            ctx.emitUpdate({
-              sessionId: "native-diag-sess-1",
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { text: "\n⚠ Agent execution terminated due to error.\n" },
-              },
-            });
-            ctx.sendResult(3, { stopReason: "end_turn" });
+            ctx.terminateTurn();
           },
           (ctx) => {
             fs.writeFileSync(
@@ -577,27 +627,13 @@ describe("AgySessionWorker diagnostics integration", () => {
             ctx.stderr.write(
               "E1113 20:05:08.100000     500 errorreport.go:273] RESOURCE_EXHAUSTED\n",
             );
-            ctx.emitUpdate({
-              sessionId: "native-diag-sess-1",
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { text: "\n⚠ Agent execution terminated due to error.\n" },
-              },
-            });
-            ctx.sendResult(3, { stopReason: "end_turn" });
+            ctx.terminateTurn();
           } else {
             fs.appendFileSync(
               workerLog,
               "E1113 20:05:14.429000     429 errorreport.go:429] upstream dial 127.0.0.1:42912 failed after 429ms\n",
             );
-            ctx.emitUpdate({
-              sessionId: "native-diag-sess-1",
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { text: "\n⚠ Agent execution terminated due to error.\n" },
-              },
-            });
-            ctx.sendResult(4, { stopReason: "end_turn" });
+            ctx.terminateTurn();
           }
         }),
     });
@@ -628,18 +664,10 @@ describe("AgySessionWorker diagnostics integration", () => {
       workspaceDir: ws,
       spawnFn: () =>
         createScriptedFakeAcpChild(ws, (ctx) => {
-          fs.writeFileSync(
-            path.join(ws, "agy-acp.log.77777"),
-            "E1113 20:16:00.000001     777 auth.go:44] rpc error: code = Unauthenticated desc = please sign in\n",
-          );
-          ctx.emitUpdate({
-            sessionId: "native-diag-sess-1",
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { text: "\n⚠ Agent execution terminated due to error.\n" },
-            },
+          ctx.terminateTurn({
+            name: "agy-acp.log.77777",
+            text: "E1113 20:16:00.000001     777 auth.go:44] rpc error: code = Unauthenticated desc = please sign in\n",
           });
-          ctx.sendResult(3, { stopReason: "end_turn" });
         }),
     });
 
@@ -657,337 +685,225 @@ describe("AgySessionWorker diagnostics integration", () => {
       await worker.close("test_done");
     }
   });
+  const AUTH_EXPIRED_MESSAGE =
+    "Antigravity CLI authentication expired. Please sign in again.";
+  const QUOTA_EXHAUSTED_MESSAGE = "Account quota exhausted";
 
-  test("regression #2: direct RPC auth errors ('You are not logged into Antigravity.' / 'not signed in') return 401 while ambient startup log noise stays 500", async () => {
-    for (const rpcMsg of [
-      "You are not logged into Antigravity.",
-      "User is not signed in",
-    ]) {
-      const ws = makeTempDir("worker-rpc-auth-");
-      const worker = new AgySessionWorker(account, `diag-rpc-${Date.now()}`, mcpServer, {
-        workspaceDir: ws,
-        spawnFn: () =>
-          createScriptedFakeAcpChild(ws, (ctx) => {
-            ctx.sendError(3, -32000, rpcMsg);
-          }),
-      });
-      try {
-        await worker.start();
-        const res = await encodeAnthropicSseResponse(
-          "gemini-4-carbon",
-          worker.startPromptTurn([{ type: "text", text: "hi" }]),
+  /**
+   * Every worker→HTTP case runs the same pipeline: start the worker, hand its
+   * turn stream to `encodeAnthropicSseResponse`, then assert the response shape.
+   * Only the scripted failure and the expected status/header/body differ, so
+   * they live in this table instead of being copy-pasted per scenario.
+   */
+  const DIAGNOSED_TURN_CASES: DiagnosedTurnCase[] = [
+    // regression #2: a direct RPC auth failure is a 401, never a generic 500.
+    ...["You are not logged into Antigravity.", "User is not signed in"].map(
+      (rpcMessage, index): DiagnosedTurnCase => ({
+        name: `regression #2: direct RPC auth error ${JSON.stringify(rpcMessage)} returns 401 with the expired header`,
+        workspacePrefix: "worker-rpc-auth-",
+        sessionId: `diag-rpc-auth-${index}`,
+        script: (ctx) => {
+          ctx.failTurn(rpcMessage);
+        },
+        status: 401,
+        signInHeader: "expired",
+        errorType: "authentication_error",
+        message: AUTH_EXPIRED_MESSAGE,
+      }),
+    ),
+
+    // regression #2 contrast: the same phrasing as ambient startup chatter is not auth.
+    {
+      name: "regression #2: ambient 'not logged in' startup noise in worker log and stderr stays 500",
+      workspacePrefix: "worker-ambient-auth-",
+      sessionId: "diag-ambient-500",
+      startup: (ctx) => {
+        fs.writeFileSync(
+          path.join(ctx.workspaceDir, "agy-acp.log.88888"),
+          "E1113 20:16:00.000001     888 errorreport.go:273] error getting token source: You are not logged into Antigravity.\n",
         );
-        expect(res.status).toBe(401);
-        expect(res.headers.get(SIGN_IN_HEADER)).toBe("expired");
-        const body: any = await res.json();
-        expect(body).toEqual({
-          type: "error",
-          error: {
-            type: "authentication_error",
-            message: "Antigravity CLI authentication expired. Please sign in again.",
-          },
+        ctx.stderr.write(
+          "E1113 20:16:00.000001     888 errorreport.go:273] You are not logged into Antigravity.\n",
+        );
+      },
+      script: (ctx) => {
+        ctx.terminateTurn({
+          name: "agy-acp.log.88888",
+          append: true,
+          text: "E1113 20:16:05.000001     888 errorreport.go:273] error getting token source: You are not logged into Antigravity.\n",
         });
-      } finally {
-        await worker.close("test_done");
-      }
-    }
+      },
+      status: 500,
+      signInHeader: null,
+      errorType: "api_error",
+      message: GENERIC_FAILURE_MESSAGE,
+    },
 
-    // Contrast: ambient startup 'You are not logged into Antigravity.' in worker log + generic failure must remain 500
-    const wsAmbient = makeTempDir("worker-ambient-auth-");
-    const workerLog = path.join(wsAmbient, "agy-acp.log.88888");
-    const workerAmbient = new AgySessionWorker(account, "diag-ambient-500", mcpServer, {
-      workspaceDir: wsAmbient,
-      spawnFn: () =>
-        createScriptedFakeAcpChild(
-          wsAmbient,
-          (ctx) => {
-            fs.appendFileSync(
-              workerLog,
-              "E1113 20:16:05.000001     888 errorreport.go:273] error getting token source: You are not logged into Antigravity.\n",
-            );
-            ctx.emitUpdate({
-              sessionId: "native-diag-sess-1",
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { text: "\n⚠ Agent execution terminated due to error.\n" },
-              },
-            });
-            ctx.sendResult(3, { stopReason: "end_turn" });
-          },
-          (ctx) => {
-            fs.writeFileSync(
-              workerLog,
-              "E1113 20:16:00.000001     888 errorreport.go:273] error getting token source: You are not logged into Antigravity.\n",
-            );
-            ctx.stderr.write(
-              "E1113 20:16:00.000001     888 errorreport.go:273] You are not logged into Antigravity.\n",
-            );
-          },
-        ),
+    // regression #3: a numbered worker log written during the turn, before content.
+    {
+      name: "regression #3: numbered worker log HTTP 429 before first content returns 429 JSON",
+      workspacePrefix: "worker-http-429-",
+      sessionId: "diag-http-429",
+      script: (ctx) => {
+        ctx.terminateTurn({
+          name: "agy-acp.log.91001",
+          text: "E1113 20:17:00.000001     910 http.go:100] HTTP 429\n",
+        });
+      },
+      status: 429,
+      signInHeader: null,
+      errorType: "rate_limit_error",
+      message: QUOTA_EXHAUSTED_MESSAGE,
+    },
+    {
+      name: "regression #3: numbered worker log 'Please sign in' before first content returns 401 with the expired header",
+      workspacePrefix: "worker-http-401-",
+      sessionId: "diag-http-401",
+      script: (ctx) => {
+        ctx.terminateTurn({
+          name: "agy-acp.log.91002",
+          text: "E1113 20:17:01.000001     910 auth.go:100] Please sign in\n",
+        });
+      },
+      status: 401,
+      signInHeader: "expired",
+      errorType: "authentication_error",
+      message: AUTH_EXPIRED_MESSAGE,
+    },
+    {
+      name: "regression #3: numbered worker log maxMessageTokens=0 returns the public context-budget 500",
+      workspacePrefix: "worker-http-budget-500-",
+      sessionId: "diag-http-budget-500",
+      script: (ctx) => {
+        ctx.terminateTurn({
+          name: "agy-acp.log.91004",
+          text: "E1113 20:17:01.500001     910 errorreport.go:273] agent executor error: generating and executing: serializing trajectory: maxMessageTokens must be positive, got 0\n",
+        });
+      },
+      status: 500,
+      signInHeader: null,
+      errorType: "api_error",
+      message: CONTEXT_BUDGET_FAILURE_MESSAGE,
+      checkRaw: (raw) => {
+        expect(raw).not.toMatch(/quota|rate.?limit/i);
+      },
+    },
+
+    // regression #4: the public 500 must never echo private paths or credentials.
+    {
+      name: "regression #4: generic 500 never leaks quotaProject metadata, private paths, or raw secrets",
+      workspacePrefix: "worker-http-500-",
+      sessionId: "diag-http-500",
+      script: (ctx) => {
+        fs.writeFileSync(
+          path.join(ctx.workspaceDir, "agy-acp.log.91003"),
+          [
+            "I1113 20:17:02.000001     910 server_oauth.go:221] applyAuthResult: email=u@example.com, authMethod=consumer, quotaProject=internal-proj-secret",
+            "E1113 20:17:02.000002     910 executor.go:99] agent executor error: unexpected failure at /Users/private/repo/secret.ts with token ya29.secret-token and quotaProject=internal-proj-secret",
+            "",
+          ].join("\n"),
+        );
+        ctx.failTurn(
+          "ACP process exited at /Users/private/repo/secret.ts: Bearer ya29.secret-token quotaProject=internal-proj-secret",
+        );
+      },
+      status: 500,
+      signInHeader: null,
+      errorType: "api_error",
+      message: GENERIC_FAILURE_MESSAGE,
+      forbidden: [
+        "quotaProject",
+        "internal-proj-secret",
+        "/Users/private/",
+        "ya29.secret-token",
+      ],
+      checkRaw: (raw) => {
+        expect(raw).not.toMatch(/quota/i);
+      },
+    },
+
+    // regression #5b: exit-wrapper text that embeds the old startup stderr tail.
+    {
+      name: "regression #5b: AcpConnection exit wrapper with a startup stderr tail stays the generic 500",
+      workspacePrefix: "worker-exit-wrapper-",
+      sessionId: "diag-exit-wrapper",
+      startup: (ctx) => {
+        ctx.stderr.write(
+          [
+            "E1113 20:00:00.000001 1 startup.go:1] You are not logged into Antigravity.",
+            "E1113 20:00:00.000002 1 startup.go:2] RESOURCE_EXHAUSTED quotaProject=internal-proj-secret",
+            "",
+          ].join("\n"),
+        );
+      },
+      script: (ctx) => {
+        ctx.failTurn(
+          [
+            "ACP request 'session/prompt' (id: 4) aborted: ACP process exited (code: 1, signal: null). Stderr tail:",
+            "E1113 20:00:00.000001 1 startup.go:1] You are not logged into Antigravity.",
+            "E1113 20:00:00.000002 1 startup.go:2] RESOURCE_EXHAUSTED quotaProject=internal-proj-secret",
+          ].join("\n"),
+        );
+      },
+      status: 500,
+      signInHeader: null,
+      errorType: "api_error",
+      message: GENERIC_FAILURE_MESSAGE,
+      forbidden: ["quotaProject", "internal-proj-secret"],
+    },
+
+    // regression #5b: a real process exit mid-prompt is a 502, not auth/quota.
+    {
+      name: "regression #5b: process exit during session/prompt returns 502 with no expired header",
+      workspacePrefix: "worker-exit-event-",
+      sessionId: "diag-exit-event",
+      startup: (ctx) => {
+        ctx.stderr.write(
+          "E1113 20:00:00.000001 1 startup.go:1] You are not logged into Antigravity.\n",
+        );
+      },
+      script: (ctx) => {
+        ctx.exitProcess(1, null);
+      },
+      status: 502,
+      signInHeader: null,
+      errorType: "api_error",
+    },
+  ];
+
+  /** Runs one table row: worker → response, asserting every declared field. */
+  async function expectDiagnosedTurn(turnCase: DiagnosedTurnCase): Promise<void> {
+    const ws = makeTempDir(turnCase.workspacePrefix);
+    const worker = new AgySessionWorker(account, turnCase.sessionId, mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () => createScriptedFakeAcpChild(ws, turnCase.script, turnCase.startup),
     });
+
     try {
-      await workerAmbient.start();
+      await worker.start();
       const res = await encodeAnthropicSseResponse(
         "gemini-4-carbon",
-        workerAmbient.startPromptTurn([{ type: "text", text: "hi" }]),
+        worker.startPromptTurn([{ type: "text", text: "hi" }]),
       );
-      expect(res.status).toBe(500);
-      expect(res.headers.get(SIGN_IN_HEADER)).toBeNull();
-    } finally {
-      await workerAmbient.close("test_done");
-    }
-  });
+      expect(res.status).toBe(turnCase.status);
+      expect(res.headers.get(SIGN_IN_HEADER)).toBe(turnCase.signInHeader);
 
-  test("regression #3 & #4: worker -> encodeAnthropicSseResponse emits HTTP 429/500/401 JSON + expired header and never leaks raw quotaProject metadata", async () => {
-    // 1) HTTP 429 from numbered log before first content
-    const ws429 = makeTempDir("worker-http-429-");
-    const w429 = new AgySessionWorker(account, "diag-http-429", mcpServer, {
-      workspaceDir: ws429,
-      spawnFn: () =>
-        createScriptedFakeAcpChild(ws429, (ctx) => {
-          fs.writeFileSync(
-            path.join(ws429, "agy-acp.log.91001"),
-            "E1113 20:17:00.000001     910 http.go:100] HTTP 429\n",
-          );
-          ctx.emitUpdate({
-            sessionId: "native-diag-sess-1",
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { text: "\n⚠ Agent execution terminated due to error.\n" },
-            },
-          });
-          ctx.sendResult(3, { stopReason: "end_turn" });
-        }),
-    });
-    try {
-      await w429.start();
-      const res = await encodeAnthropicSseResponse(
-        "gemini-4-carbon",
-        w429.startPromptTurn([{ type: "text", text: "hi" }]),
-      );
-      expect(res.status).toBe(429);
-      expect(res.headers.get(SIGN_IN_HEADER)).toBeNull();
-      expect(await res.json()).toEqual({
-        type: "error",
-        error: {
-          type: "rate_limit_error",
-          message: "Account quota exhausted",
-        },
-      });
-    } finally {
-      await w429.close("test_done");
-    }
+      const raw = await res.text();
+      for (const needle of turnCase.forbidden ?? []) expect(raw).not.toContain(needle);
+      turnCase.checkRaw?.(raw);
 
-    // 2) HTTP 401 with x-magpie-sign-in: expired before first content
-    const ws401 = makeTempDir("worker-http-401-");
-    const w401 = new AgySessionWorker(account, "diag-http-401", mcpServer, {
-      workspaceDir: ws401,
-      spawnFn: () =>
-        createScriptedFakeAcpChild(ws401, (ctx) => {
-          fs.writeFileSync(
-            path.join(ws401, "agy-acp.log.91002"),
-            "E1113 20:17:01.000001     910 auth.go:100] Please sign in\n",
-          );
-          ctx.emitUpdate({
-            sessionId: "native-diag-sess-1",
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { text: "\n⚠ Agent execution terminated due to error.\n" },
-            },
-          });
-          ctx.sendResult(3, { stopReason: "end_turn" });
-        }),
-    });
-    try {
-      await w401.start();
-      const res = await encodeAnthropicSseResponse(
-        "gemini-4-carbon",
-        w401.startPromptTurn([{ type: "text", text: "hi" }]),
-      );
-      expect(res.status).toBe(401);
-      expect(res.headers.get(SIGN_IN_HEADER)).toBe("expired");
-      expect(await res.json()).toEqual({
-        type: "error",
-        error: {
-          type: "authentication_error",
-          message: "Antigravity CLI authentication expired. Please sign in again.",
-        },
-      });
-    } finally {
-      await w401.close("test_done");
-    }
-
-    // 3) HTTP context_budget 500 from numbered worker log before first content
-    const wsBudget = makeTempDir("worker-http-budget-500-");
-    const wBudget = new AgySessionWorker(account, "diag-http-budget-500", mcpServer, {
-      workspaceDir: wsBudget,
-      spawnFn: () =>
-        createScriptedFakeAcpChild(wsBudget, (ctx) => {
-          fs.writeFileSync(
-            path.join(wsBudget, "agy-acp.log.91004"),
-            "E1113 20:17:01.500001     910 errorreport.go:273] agent executor error: generating and executing: serializing trajectory: maxMessageTokens must be positive, got 0\n",
-          );
-          ctx.emitUpdate({
-            sessionId: "native-diag-sess-1",
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { text: "\n⚠ Agent execution terminated due to error.\n" },
-            },
-          });
-          ctx.sendResult(3, { stopReason: "end_turn" });
-        }),
-    });
-    try {
-      await wBudget.start();
-      const res = await encodeAnthropicSseResponse(
-        "gemini-4-carbon",
-        wBudget.startPromptTurn([{ type: "text", text: "hi" }]),
-      );
-      expect(res.status).toBe(500);
-      expect(res.headers.get(SIGN_IN_HEADER)).toBeNull();
-      const rawBudgetJson = await res.text();
-      expect(rawBudgetJson).not.toMatch(/quota|rate.?limit/i);
-      expect(JSON.parse(rawBudgetJson)).toEqual({
-        type: "error",
-        error: {
-          type: "api_error",
-          message: CONTEXT_BUDGET_FAILURE_MESSAGE,
-        },
-      });
-    } finally {
-      await wBudget.close("test_done");
-    }
-
-    // 4) Public generic 500 never emits raw quotaProject metadata, private paths, or raw secrets
-    const ws500 = makeTempDir("worker-http-500-");
-    const w500 = new AgySessionWorker(account, "diag-http-500", mcpServer, {
-      workspaceDir: ws500,
-      spawnFn: () =>
-        createScriptedFakeAcpChild(ws500, (ctx) => {
-          fs.writeFileSync(
-            path.join(ws500, "agy-acp.log.91003"),
-            [
-              "I1113 20:17:02.000001     910 server_oauth.go:221] applyAuthResult: email=u@example.com, authMethod=consumer, quotaProject=internal-proj-secret",
-              "E1113 20:17:02.000002     910 executor.go:99] agent executor error: unexpected failure at /Users/private/repo/secret.ts with token ya29.secret-token and quotaProject=internal-proj-secret",
-              "",
-            ].join("\n"),
-          );
-          ctx.sendError(
-            3,
-            -32000,
-            "ACP process exited at /Users/private/repo/secret.ts: Bearer ya29.secret-token quotaProject=internal-proj-secret",
-          );
-        }),
-    });
-    try {
-      await w500.start();
-      const res = await encodeAnthropicSseResponse(
-        "gemini-4-carbon",
-        w500.startPromptTurn([{ type: "text", text: "hi" }]),
-      );
-      expect(res.status).toBe(500);
-      expect(res.headers.get(SIGN_IN_HEADER)).toBeNull();
-      const rawJson = await res.text();
-      expect(rawJson).not.toContain("quotaProject");
-      expect(rawJson).not.toContain("internal-proj-secret");
-      expect(rawJson).not.toContain("/Users/private/");
-      expect(rawJson).not.toContain("ya29.secret-token");
-      expect(rawJson).not.toMatch(/quota/i);
-      const parsed: any = JSON.parse(rawJson);
-      expect(parsed).toEqual({
-        type: "error",
-        error: {
-          type: "api_error",
-          message: GENERIC_FAILURE_MESSAGE,
-        },
-      });
-    } finally {
-      await w500.close("test_done");
-    }
-  });
-
-  test("regression #5b: AcpConnection exit wrapper and process exit ignore embedded startup stderr tail (no 401/429, no expired header)", async () => {
-    // 1) Prompt error carrying the AcpConnection exit wrapper + startup stderr tail -> HTTP 500 GENERIC_FAILURE_MESSAGE
-    const wsWrapper = makeTempDir("worker-exit-wrapper-");
-    const wWrapper = new AgySessionWorker(account, "diag-exit-wrapper", mcpServer, {
-      workspaceDir: wsWrapper,
-      spawnFn: () =>
-        createScriptedFakeAcpChild(
-          wsWrapper,
-          (ctx) => {
-            ctx.sendError(
-              3,
-              -32000,
-              [
-                "ACP request 'session/prompt' (id: 4) aborted: ACP process exited (code: 1, signal: null). Stderr tail:",
-                "E1113 20:00:00.000001 1 startup.go:1] You are not logged into Antigravity.",
-                "E1113 20:00:00.000002 1 startup.go:2] RESOURCE_EXHAUSTED quotaProject=internal-proj-secret",
-              ].join("\n"),
-            );
-          },
-          (ctx) => {
-            ctx.stderr.write(
-              [
-                "E1113 20:00:00.000001 1 startup.go:1] You are not logged into Antigravity.",
-                "E1113 20:00:00.000002 1 startup.go:2] RESOURCE_EXHAUSTED quotaProject=internal-proj-secret",
-                "",
-              ].join("\n"),
-            );
-          },
-        ),
-    });
-    try {
-      await wWrapper.start();
-      const res = await encodeAnthropicSseResponse(
-        "gemini-4-carbon",
-        wWrapper.startPromptTurn([{ type: "text", text: "hi" }]),
-      );
-      expect(res.status).toBe(500);
-      expect(res.headers.get(SIGN_IN_HEADER)).toBeNull();
-      const rawJson = await res.text();
-      expect(rawJson).not.toContain("quotaProject");
-      expect(rawJson).not.toContain("internal-proj-secret");
-      expect(JSON.parse(rawJson)).toEqual({
-        type: "error",
-        error: {
-          type: "api_error",
-          message: GENERIC_FAILURE_MESSAGE,
-        },
-      });
-    } finally {
-      await wWrapper.close("test_done");
-    }
-
-    // 2) Actual process exit event during session/prompt -> HTTP 502 (not 401/429) and no expired header
-    const wsExit = makeTempDir("worker-exit-event-");
-    const wExit = new AgySessionWorker(account, "diag-exit-event", mcpServer, {
-      workspaceDir: wsExit,
-      spawnFn: () =>
-        createScriptedFakeAcpChild(
-          wsExit,
-          (ctx) => {
-            ctx.exitProcess(1, null);
-          },
-          (ctx) => {
-            ctx.stderr.write(
-              "E1113 20:00:00.000001 1 startup.go:1] You are not logged into Antigravity.\n",
-            );
-          },
-        ),
-    });
-    try {
-      await wExit.start();
-      const res = await encodeAnthropicSseResponse(
-        "gemini-4-carbon",
-        wExit.startPromptTurn([{ type: "text", text: "hi" }]),
-      );
-      expect(res.status).toBe(502);
-      expect(res.headers.get(SIGN_IN_HEADER)).toBeNull();
-      const body: any = await res.json();
+      const body: any = JSON.parse(raw);
       expect(body.type).toBe("error");
-      expect(body.error?.type).toBe("api_error");
+      expect(body.error?.type).toBe(turnCase.errorType);
+      if (turnCase.message !== undefined) expect(body.error?.message).toBe(turnCase.message);
     } finally {
-      await wExit.close("test_done");
+      await worker.close("test_done");
     }
-  });
+  }
+
+  for (const turnCase of DIAGNOSED_TURN_CASES) {
+    test(turnCase.name, async () => {
+      await expectDiagnosedTurn(turnCase);
+    });
+  }
 });

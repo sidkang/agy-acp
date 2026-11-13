@@ -14,6 +14,15 @@ export interface StepTokenUsage {
   context?: number;
 }
 
+/** The five per-step token counters `agy` records for one model step. */
+interface StepCounters {
+  input: number;
+  output: number;
+  write: number;
+  read: number;
+  thinking: number;
+}
+
 let opener:
   | ((file: string) => {
       all: (sql: string, ...args: any[]) => any[];
@@ -151,14 +160,11 @@ function walk(
 const count = (value: any): number =>
   Number.isSafeInteger(value) && value > 0 ? value : 0;
 
-function decodeUsage(buf: Uint8Array): {
-  input: number;
-  output: number;
-  write: number;
-  read: number;
-  thinking: number;
-} | null {
-  const usage = { input: 0, output: 0, write: 0, read: 0, thinking: 0 };
+/** Same counter rule, for raw ACP usage fields that arrive as strings. */
+const tokenCount = (value: unknown): number => count(Number(value));
+
+function decodeUsage(buf: Uint8Array): StepCounters | null {
+  const usage: StepCounters = { input: 0, output: 0, write: 0, read: 0, thinking: 0 };
   const ok = walk(buf, (field, wire, n) => {
     if (wire !== 0) return;
     if (field === 2) usage.input = count(n);
@@ -170,13 +176,7 @@ function decodeUsage(buf: Uint8Array): {
   return ok ? usage : null;
 }
 
-export function decodeStepUsage(metadata: any): {
-  input: number;
-  output: number;
-  write: number;
-  read: number;
-  thinking: number;
-} | null {
+export function decodeStepUsage(metadata: any): StepCounters | null {
   const buf =
     metadata instanceof Uint8Array
       ? metadata
@@ -196,14 +196,9 @@ export function decodeStepUsage(metadata: any): {
   return ok ? stats : null;
 }
 
-export function decodeGenerationUsage(data: any): {
-  input: number;
-  output: number;
-  write: number;
-  read: number;
-  thinking: number;
-  context?: number;
-} | null {
+export function decodeGenerationUsage(
+  data: any,
+): (StepCounters & { context?: number }) | null {
   const buf =
     data instanceof Uint8Array
       ? data
@@ -350,11 +345,6 @@ export function readConversationStepUsages(
   return readFromTarget(resolved);
 }
 
-function tokenCount(v: any): number {
-  const n = Number(v);
-  return Number.isSafeInteger(n) && n > 0 ? n : 0;
-}
-
 export function normalizeRawAcpUsage(usage: any): {
   input: number;
   read: number;
@@ -431,13 +421,13 @@ export function settleStepUsage(
   }
 
   const normalized = normalizeRawAcpUsage(rawAcpUsage);
-  const count = Math.max(1, stepCountInPrompt);
-  if (count > 1) {
+  const stepsInPrompt = Math.max(1, stepCountInPrompt);
+  if (stepsInPrompt > 1) {
     return {
-      inputTokens: Math.round(normalized.input / count),
+      inputTokens: Math.round(normalized.input / stepsInPrompt),
       outputTokens: normalized.output,
-      cacheReadInputTokens: Math.round(normalized.read / count),
-      cacheCreationInputTokens: Math.round(normalized.write / count),
+      cacheReadInputTokens: Math.round(normalized.read / stepsInPrompt),
+      cacheCreationInputTokens: Math.round(normalized.write / stepsInPrompt),
     };
   }
 

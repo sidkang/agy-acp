@@ -6,11 +6,14 @@ import type { AccountDescriptor, PersistedAuthMetadata } from "../types";
 import {
   execAgyBounded,
   getPluginDataRoot,
+  isPidAlive,
   killProcessTree,
   redactSecrets,
   resolveIsolatedHomeDir,
   spawnAgy,
 } from "./env";
+
+const AGY_SIGN_IN_REQUIRED_RE = /please sign in|not (?:logged|signed) in|login required/i;
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -59,16 +62,6 @@ export const IMPORT_FROMS: Record<string, string> = {
 // in-process async tasks and separate host processes sharing the plugin data dir.
 const accountProvisionLocks = new Map<string, Promise<void>>();
 const ACCOUNT_FILE_LOCK_STALE_MS = 60_000;
-
-function isLockPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: any) {
-    return err?.code === "EPERM";
-  }
-}
 
 async function acquireAccountFileLock(
   accountRef: string,
@@ -125,7 +118,7 @@ async function acquireAccountFileLock(
     try {
       const firstRead = fs.readFileSync(lockPath, "utf8").trim();
       const ownerPid = Number(firstRead.split(":")[0]);
-      if (firstRead && ownerPid > 1 && !isLockPidAlive(ownerPid)) {
+      if (firstRead && ownerPid > 1 && !isPidAlive(ownerPid)) {
         // Guard against concurrent dead-lock sweepers: jitter + re-verify identical dead token
         await new Promise((r) => setTimeout(r, 20 + Math.floor(Math.random() * 40)));
         const secondRead = fs.readFileSync(lockPath, "utf8").trim();
@@ -336,10 +329,7 @@ export function extractAuthorizationCode(rawInput: string): string {
 
 export interface ImportedTokenCandidate {
   refreshToken: string;
-  accessToken?: string;
-  expiresIn?: number;
   email?: string;
-  project?: string;
 }
 
 function isPlainObject(v: unknown): v is Record<string, any> {
@@ -356,17 +346,14 @@ const ALLOWED_ACCOUNT_TYPES = new Set([
   "authorized_user",
 ]);
 
-function normalizeRefreshField(raw: unknown): { refreshToken: string; project?: string } | null {
+function normalizeRefreshField(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed || trimmed.startsWith("agy-isolated:")) return null;
+  // Exports may carry a `refreshToken|projectId` pair; only the token is needed.
   const pipeIdx = trimmed.indexOf("|");
-  if (pipeIdx >= 0) {
-    const rt = trimmed.slice(0, pipeIdx).trim();
-    const proj = trimmed.slice(pipeIdx + 1).trim();
-    return rt ? { refreshToken: rt, ...(proj ? { project: proj } : {}) } : null;
-  }
-  return { refreshToken: trimmed };
+  const refreshToken = (pipeIdx >= 0 ? trimmed.slice(0, pipeIdx) : trimmed).trim();
+  return refreshToken || null;
 }
 
 /**
@@ -398,7 +385,8 @@ export function parseImportedAccounts(rawText: string): ImportedTokenCandidate[]
     const rt = candidate.refreshToken.trim();
     if (!rt || /[\r\n\0]/.test(rt) || seenRefresh.has(rt)) return;
     seenRefresh.add(rt);
-    found.push({ ...candidate, refreshToken: rt });
+    const email = candidate.email?.trim();
+    found.push({ refreshToken: rt, ...(email ? { email } : {}) });
   };
 
   const visitObject = (obj: Record<string, any>, depth = 0) => {
@@ -421,36 +409,15 @@ export function parseImportedAccounts(rawText: string): ImportedTokenCandidate[]
 
     const normalized = normalizeRefreshField(rawRt);
     if (normalized) {
-      const rawAt =
-        nestedToken?.access_token ??
-        nestedToken?.accessToken ??
-        obj.access_token ??
-        obj.accessToken ??
-        obj.access;
-      const rawExp = nestedToken?.expires_in ?? obj.expires_in;
       const rawEmail =
         obj.email ??
         obj.accountId ??
         nestedToken?.email ??
         (isPlainObject(obj.metadata) ? obj.metadata.email : undefined);
-      const rawProject =
-        normalized.project ??
-        nestedToken?.project_id ??
-        nestedToken?.projectId ??
-        obj.project_id ??
-        obj.projectId ??
-        obj.project;
 
       pushCandidate({
-        refreshToken: normalized.refreshToken,
-        ...(typeof rawAt === "string" && rawAt.trim() ? { accessToken: rawAt.trim() } : {}),
-        ...(typeof rawExp === "number" && Number.isFinite(rawExp) && rawExp > 0
-          ? { expiresIn: Math.trunc(rawExp) }
-          : {}),
+        refreshToken: normalized,
         ...(typeof rawEmail === "string" && rawEmail.trim() ? { email: rawEmail.trim() } : {}),
-        ...(typeof rawProject === "string" && rawProject.trim()
-          ? { project: rawProject.trim() }
-          : {}),
       });
       return;
     }
@@ -485,7 +452,7 @@ export function parseImportedAccounts(rawText: string): ImportedTokenCandidate[]
     if (!line || line.startsWith("#")) continue;
     const normalized = normalizeRefreshField(line);
     if (normalized) {
-      pushCandidate(normalized);
+      pushCandidate({ refreshToken: normalized });
     }
   }
   return found;
@@ -699,8 +666,6 @@ export interface OAuthCodeFlowResult {
   ) => Promise<AuthMethodSuccess | AuthMethodFailed>;
 }
 
-export type OAuthFlowResult = OAuthAutoFlowResult | OAuthCodeFlowResult;
-
 export interface AuthRuntimeDeps {
   fetchFn?: typeof fetch;
   verifyAccountFn?: (
@@ -715,29 +680,12 @@ export interface AuthRuntimeDeps {
 }
 
 /**
- * Coalesces a caller's cancellation signal with a hard HTTP deadline so that
- * passing `signal` can never strip the network timeout of an OAuth request.
- */
-function combineWithTimeoutSignal(
-  callerSignal: AbortSignal | undefined,
-  timeoutMs: number
-): AbortSignal {
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  if (!callerSignal) return timeoutSignal;
-  const anySignal = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal })
-    .any;
-  if (typeof anySignal === "function") return anySignal.call(AbortSignal, [callerSignal, timeoutSignal]);
-  return callerSignal;
-}
-
-/**
  * Combines a caller's cancellation signal with a hard deadline, and reports
  * which one fired.
  *
  * `dispose()` detaches the timer and the caller's `abort` listener, so a
  * long-lived caller signal never accumulates listeners across sign-in
- * attempts (the `AbortSignal.any` form in `combineWithTimeoutSignal` cannot be
- * undone and is therefore only used for one-shot fetches).
+ * attempts. Call it only after the response body has been consumed.
  */
 export function combineSignals(
   callerSignal: AbortSignal | undefined,
@@ -931,6 +879,22 @@ function extractOAuthHttpError(bodyText: string, status: number): string {
   return redactSecrets(trimmed ? trimmed.slice(0, 300) : `HTTP ${status}`);
 }
 
+/**
+ * True when an `agy models` probe is not proof of a working sign-in: a non-zero
+ * exit, empty stdout, or the CLI asking the user to sign in.
+ */
+function agyModelsProbeFailed(probe: {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+}): boolean {
+  return (
+    probe.exitCode !== 0 ||
+    !probe.stdout.trim() ||
+    AGY_SIGN_IN_REQUIRED_RE.test(`${probe.stdout}\n${probe.stderr}`)
+  );
+}
+
 async function defaultVerifyIsolatedAccount(
   account: AccountDescriptor,
   signal?: AbortSignal
@@ -940,11 +904,7 @@ async function defaultVerifyIsolatedAccount(
     signal,
   });
   const combined = `${probe.stdout}\n${probe.stderr}`.trim();
-  if (
-    probe.exitCode !== 0 ||
-    !probe.stdout.trim() ||
-    /please sign in|not (?:logged|signed) in|login required/i.test(combined)
-  ) {
+  if (agyModelsProbeFailed(probe)) {
     if (/aicode_scope_missing|missing.*scope/i.test(combined)) {
       return {
         ok: false,
@@ -988,6 +948,7 @@ async function provisionIsolatedAccountFromTokens(
   // just minted the pair moments ago. This validates the refresh_token and avoids
   // fabricating a fresh expiry for stale exported access_tokens.
   if (!accessToken) {
+    const combined = combineSignals(options?.signal, 30_000);
     try {
       const tokenRes = await doFetch(GOOGLE_TOKEN_URL, {
         method: "POST",
@@ -998,7 +959,7 @@ async function provisionIsolatedAccountFromTokens(
           client_id: GOOGLE_CLIENT_ID,
           client_secret: GOOGLE_CLIENT_SECRET,
         }).toString(),
-        signal: combineWithTimeoutSignal(options?.signal, 30_000),
+        signal: combined.signal,
       });
       const tokenText = await tokenRes.text();
       if (!tokenRes.ok) {
@@ -1035,16 +996,19 @@ async function provisionIsolatedAccountFromTokens(
           ...(hint ? { accountId: hint } : {}),
         },
       };
+    } finally {
+      combined.dispose();
     }
   }
 
   // Require canonical verified identity from Google userinfo so an unverified
   // email field in an imported JSON file can never overwrite another account's slot.
   let verifiedEmail = "";
+  const whoCombined = combineSignals(options?.signal, 20_000);
   try {
     const whoRes = await doFetch(GOOGLE_USERINFO_URL, {
       headers: { Authorization: `Bearer ${accessToken}` },
-      signal: combineWithTimeoutSignal(options?.signal, 20_000),
+      signal: whoCombined.signal,
     });
     const whoText = await whoRes.text();
     if (!whoRes.ok) {
@@ -1071,6 +1035,8 @@ async function provisionIsolatedAccountFromTokens(
         ...(hint ? { accountId: hint } : {}),
       },
     };
+  } finally {
+    whoCombined.dispose();
   }
 
   if (!verifiedEmail) {
@@ -1103,10 +1069,9 @@ async function provisionIsolatedAccountFromTokens(
 
     const isolatedHomeDir = resolveIsolatedHomeDir(accountRef);
     const stampPath = path.join(isolatedHomeDir, ".commit-stamp");
-    const hadCommittedAccount = fs.existsSync(stampPath);
 
     const rollbackFilesystem = () => {
-      if (!dirExistedBefore && !hadCommittedAccount && !fs.existsSync(stampPath)) {
+      if (!dirExistedBefore && !fs.existsSync(stampPath)) {
         try {
           fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
         } catch {}
@@ -1149,7 +1114,6 @@ async function provisionIsolatedAccountFromTokens(
       }
 
       const commitStamp = crypto.randomUUID();
-      const stampPath = path.join(isolatedHomeDir, ".commit-stamp");
       const stampTmp = `${stampPath}.${process.pid}.tmp`;
       fs.writeFileSync(stampTmp, `${commitStamp}\n`, { mode: 0o600 });
       fs.renameSync(stampTmp, stampPath);
@@ -1199,7 +1163,12 @@ export async function importAccountFiles(
   const candidates: ImportedTokenCandidate[] = [];
   const seenRefresh = new Set<string>();
   const results: Array<AuthMethodSuccess | AuthMethodFailed> = [];
-  const newlyCreatedDirs: Array<{ accountRef: string; dir: string; commitStamp: string }> = [];
+  const newlyCreatedDirs: Array<{
+    accountRef: string;
+    dir: string;
+    commitStamp: string;
+    resultIndex: number;
+  }> = [];
 
   for (const raw of fileList) {
     if (results.length >= IMPORT_MAX_ACCOUNTS) break;
@@ -1230,12 +1199,27 @@ export async function importAccountFiles(
     for (const item of newlyCreatedDirs.splice(0)) {
       await withAccountProvisionLock(item.accountRef, async () => {
         try {
-          const stampPath = path.join(item.dir, ".commit-stamp");
-          const currentStamp = fs.existsSync(stampPath)
-            ? fs.readFileSync(stampPath, "utf8").trim()
-            : "";
-          if (currentStamp === item.commitStamp) {
-            fs.rmSync(item.dir, { recursive: true, force: true });
+          let rolledBack = false;
+          if (!fs.existsSync(item.dir)) {
+            rolledBack = true;
+          } else {
+            const stampPath = path.join(item.dir, ".commit-stamp");
+            const currentStamp = fs.existsSync(stampPath)
+              ? fs.readFileSync(stampPath, "utf8").trim()
+              : "";
+            if (currentStamp === item.commitStamp) {
+              fs.rmSync(item.dir, { recursive: true, force: true });
+              if (!fs.existsSync(item.dir)) rolledBack = true;
+            }
+          }
+          // Only a directory that really went away invalidates the result; an
+          // account that pre-existed the batch keeps its `success` entry.
+          if (rolledBack && results[item.resultIndex]?.type === "success") {
+            results[item.resultIndex] = {
+              type: "failed",
+              error: "Sign-in cancelled",
+              accountId: item.accountRef,
+            };
           }
         } catch {}
       });
@@ -1256,14 +1240,16 @@ export async function importAccountFiles(
       options,
       deps
     );
-    if (provisioned.createdNewDir) {
-      newlyCreatedDirs.push(provisioned.createdNewDir);
+    if (!options?.signal?.aborted || provisioned.outcome.type === "success") {
+      const resultIndex = results.push(provisioned.outcome) - 1;
+      if (provisioned.createdNewDir) {
+        newlyCreatedDirs.push({ ...provisioned.createdNewDir, resultIndex });
+      }
     }
     if (options?.signal?.aborted) {
       await cleanupBatchOnAbort();
       break;
     }
-    results.push(provisioned.outcome);
   }
 
   return results;
@@ -1417,29 +1403,34 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
                 return { type: "failed", error: "Google returned no authorization code" };
               }
 
-              const tokenRes = await doFetch(GOOGLE_TOKEN_URL, {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: new URLSearchParams({
-                  grant_type: "authorization_code",
-                  code: granted.code,
-                  redirect_uri: redirectUri,
-                  client_id: GOOGLE_CLIENT_ID,
-                  client_secret: GOOGLE_CLIENT_SECRET,
-                  code_verifier: verifier,
-                }).toString(),
-                signal: combineWithTimeoutSignal(flow.signal, 30_000),
-              });
-
-              const tokenText = await tokenRes.text();
-              if (!tokenRes.ok) {
-                return {
-                  type: "failed",
-                  error: `Google token exchange failed (${tokenRes.status}): ${extractOAuthHttpError(
-                    tokenText,
-                    tokenRes.status
-                  )}`,
-                };
+              const tokenCombined = combineSignals(flow.signal, 30_000);
+              let tokenText: string;
+              try {
+                const tokenRes = await doFetch(GOOGLE_TOKEN_URL, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                  body: new URLSearchParams({
+                    grant_type: "authorization_code",
+                    code: granted.code,
+                    redirect_uri: redirectUri,
+                    client_id: GOOGLE_CLIENT_ID,
+                    client_secret: GOOGLE_CLIENT_SECRET,
+                    code_verifier: verifier,
+                  }).toString(),
+                  signal: tokenCombined.signal,
+                });
+                tokenText = await tokenRes.text();
+                if (!tokenRes.ok) {
+                  return {
+                    type: "failed",
+                    error: `Google token exchange failed (${tokenRes.status}): ${extractOAuthHttpError(
+                      tokenText,
+                      tokenRes.status
+                    )}`,
+                  };
+                }
+              } finally {
+                tokenCombined.dispose();
               }
 
               const tokenJson = parseJsonSafe(tokenText);
@@ -1558,13 +1549,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
           signal: options?.signal,
         });
 
-        if (
-          res.exitCode !== 0 ||
-          /please sign in|not (?:logged|signed) in|login required/i.test(
-            res.stdout + res.stderr
-          ) ||
-          !res.stdout.trim()
-        ) {
+        if (agyModelsProbeFailed(res)) {
           return {
             type: "failed",
             error:
@@ -1816,13 +1801,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
                 signal: callbackOpts?.signal ?? flow.signal,
               });
 
-              if (
-                probe.exitCode !== 0 ||
-                !probe.stdout.trim() ||
-                /please sign in|not (?:logged|signed) in|login required/i.test(
-                  probe.stdout + probe.stderr
-                )
-              ) {
+              if (agyModelsProbeFailed(probe)) {
                 throw new Error(
                   `agy models verification failed: exitCode=${probe.exitCode}, output=${redactSecrets(
                     (probe.stdout + " " + probe.stderr).trim()
@@ -1876,7 +1855,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
             callbackOpts?: { signal?: AbortSignal }
           ): Promise<AuthMethodSuccess | AuthMethodFailed> => {
             if (used) {
-              throw new Error("Callback has already been invoked");
+              return { type: "failed", error: "Callback has already been invoked" };
             }
             used = true;
             // The callback now owns the tail of the flow; the watchdog keeps

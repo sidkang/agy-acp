@@ -7,6 +7,7 @@ import {
   readStoredAgyOAuthCredentials,
   redactSecrets,
 } from "../accounts/env";
+import { combineSignals } from "../accounts/auth";
 
 export class UsageError extends Error {
   constructor(message: string) {
@@ -123,38 +124,31 @@ const refreshedTokenCache = new Map<
   { accessToken: string; expiresAtMs: number }
 >();
 
-function combineAbortSignal(
-  callerSignal: AbortSignal | undefined,
-  timeoutMs: number,
-): AbortSignal {
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  if (!callerSignal) return timeoutSignal;
-  if (typeof (AbortSignal as any).any === "function") {
-    return (AbortSignal as any).any([callerSignal, timeoutSignal]);
-  }
-  return callerSignal.aborted ? callerSignal : timeoutSignal;
-}
-
 async function fetchCodeAssistPayload(
   accessToken: string,
   signal?: AbortSignal,
 ): Promise<{ status: number; body: any }> {
-  const res = await fetch(CODE_ASSIST_LOAD_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": `antigravity/hub/1.21.9 ${platformTag()}`,
-    },
-    body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
-    signal: combineAbortSignal(signal, PLAN_FETCH_TIMEOUT_MS),
-  });
-  const text = await res.text();
-  let body: any = null;
+  const combined = combineSignals(signal, PLAN_FETCH_TIMEOUT_MS);
   try {
-    body = JSON.parse(text);
-  } catch {}
-  return { status: res.status, body };
+    const res = await fetch(CODE_ASSIST_LOAD_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent": `antigravity/hub/1.21.9 ${platformTag()}`,
+      },
+      body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+      signal: combined.signal,
+    });
+    const text = await res.text();
+    let body: any = null;
+    try {
+      body = JSON.parse(text);
+    } catch {}
+    return { status: res.status, body };
+  } finally {
+    combined.dispose();
+  }
 }
 
 async function refreshAccessTokenForPlan(
@@ -166,29 +160,34 @@ async function refreshAccessTokenForPlan(
   if (cached && cached.expiresAtMs - Date.now() > 2 * 60 * 1000) {
     return cached.accessToken;
   }
-  const res = await fetch(GOOGLE_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: GOOGLE_CLIENT_ID,
-      client_secret: GOOGLE_CLIENT_SECRET,
-    }).toString(),
-    signal: combineAbortSignal(signal, PLAN_FETCH_TIMEOUT_MS),
-  });
-  if (!res.ok) return undefined;
-  const parsed: any = await res.json();
-  const accessToken =
-    typeof parsed?.access_token === "string" ? parsed.access_token.trim() : "";
-  if (!accessToken) return undefined;
-  const expiresInSec = Number(parsed?.expires_in) || 3600;
-  refreshedTokenCache.set(refreshToken, {
-    accessToken,
-    expiresAtMs: Date.now() + expiresInSec * 1000,
-  });
-  pruneQuotaCaches(Date.now());
-  return accessToken;
+  const combined = combineSignals(signal, PLAN_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(GOOGLE_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+      }).toString(),
+      signal: combined.signal,
+    });
+    if (!res.ok) return undefined;
+    const parsed: any = await res.json();
+    const accessToken =
+      typeof parsed?.access_token === "string" ? parsed.access_token.trim() : "";
+    if (!accessToken) return undefined;
+    const expiresInSec = Number(parsed?.expires_in) || 3600;
+    refreshedTokenCache.set(refreshToken, {
+      accessToken,
+      expiresAtMs: Date.now() + expiresInSec * 1000,
+    });
+    pruneQuotaCaches(Date.now());
+    return accessToken;
+  } finally {
+    combined.dispose();
+  }
 }
 
 /**
@@ -407,11 +406,10 @@ export function parseUsageReport(
       ).trim();
       const period = cadence(bucket, id, label);
       const fraction = extractRemainingFraction(bucket);
-      const isKnown = fraction !== undefined;
       const resetsAt = parseResetTime(bucket["reset_time"] ?? bucket["resetTime"]);
 
       // Models scoping
-      let matchedModels: string[] | undefined;
+      let matchedModels: string[];
       if (poolLower.includes("gemini")) {
         matchedModels = catalogModelIds.filter((m) => /^gemini-/i.test(m));
       } else if (poolLower.includes("claude") || poolLower.includes("gpt")) {
@@ -421,36 +419,28 @@ export function parseUsageReport(
       }
 
       const windowName = windowPool ? period.name : `${pool} · ${period.name}`;
+      // Unknown quota stays unmeasurable and aside: Magpie must never read it as
+      // "0% used" and route turns into an unknown bucket.
+      const used =
+        fraction === undefined
+          ? null
+          : fraction <= 0
+            ? 100
+            : Math.min(99.9, Math.max(0, Math.round((1 - fraction) * 100 * 10) / 10));
       // A pool with no catalog model to gate can never be an account-wide
       // routing block: Magpie would otherwise mark every model exhausted.
-      const aside = !quotaRouting || !matchedModels || matchedModels.length === 0;
-      if (isKnown) {
-        const rawUsed = (1 - fraction!) * 100;
-        const used =
-          fraction! <= 0
-            ? 100
-            : Math.min(99.9, Math.max(0, Math.round(rawUsed * 10) / 10));
-        windows.push({
-          name: windowName,
-          pool: windowPool,
-          aside,
-          used,
-          ...(period.span ? { span: period.span } : {}),
-          ...(resetsAt ? { resetsAt } : {}),
-          ...(matchedModels && matchedModels.length > 0 ? { models: matchedModels } : {}),
-        });
-      } else {
-        windows.push({
-          name: windowName,
-          pool: windowPool,
-          aside: true,
-          used: null,
-          display: "Limits not available",
-          ...(period.span ? { span: period.span } : {}),
-          ...(resetsAt ? { resetsAt } : {}),
-          ...(matchedModels && matchedModels.length > 0 ? { models: matchedModels } : {}),
-        });
-      }
+      const aside = used === null || !quotaRouting || matchedModels.length === 0;
+
+      windows.push({
+        name: windowName,
+        pool: windowPool,
+        aside,
+        used,
+        ...(used === null ? { display: "Limits not available" } : {}),
+        ...(period.span ? { span: period.span } : {}),
+        ...(resetsAt ? { resetsAt } : {}),
+        ...(matchedModels.length > 0 ? { models: matchedModels } : {}),
+      });
     }
   }
 
@@ -551,11 +541,6 @@ export function __getQuotaCacheStatsForTest(): {
   };
 }
 
-/**
- * Only a measured, signed-in result is worth replaying. An `expired` or
- * transient failure must be retried on the next call so a fresh sign-in (or a
- * recovered CLI) is visible immediately instead of after 30s.
- */
 const activeUsageTempDirs = new Set<string>();
 let usageExitHookRegistered = false;
 
@@ -572,6 +557,11 @@ function ensureUsageExitHookOnce(): void {
   });
 }
 
+/**
+ * Only a measured, signed-in result is worth replaying. An `expired` or
+ * transient failure must be retried on the next call so a fresh sign-in (or a
+ * recovered CLI) is visible immediately instead of after 30s.
+ */
 function isCacheableUsageResult(result: AccountUsageResult): boolean {
   return result.signIn === "kept" && result.error === undefined && result.windows.length > 0;
 }

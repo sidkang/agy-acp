@@ -309,10 +309,7 @@ rl.on("line", async (line) => {
     }
 
     // Check for TOOL_CALL
-    if (
-      promptText.includes("TRIGGER_TOOL_CALL") ||
-      promptText.includes("CALL_TOOL")
-    ) {
+    if (promptText.includes("TRIGGER_TOOL_CALL")) {
       try {
         const toolResult = await callMcpTool(
           "get_weather",
@@ -340,43 +337,6 @@ rl.on("line", async (line) => {
               cachedReadTokens: 10,
               cachedWriteTokens: 5,
             },
-          },
-        });
-      } catch (err: any) {
-        if (!cancelled) {
-          send({
-            jsonrpc: "2.0",
-            id,
-            error: { code: -32603, message: err?.message || String(err) },
-          });
-        }
-      }
-      return;
-    }
-
-    // Check for PARALLEL_TOOLS
-    if (promptText.includes("TRIGGER_PARALLEL_TOOLS")) {
-      try {
-        const [res1, res2] = await Promise.all([
-          callMcpTool("tool_a", { param: "A" }, "call_parallel_1"),
-          callMcpTool("tool_b", { param: "B" }, "call_parallel_2"),
-        ]);
-
-        if (cancelled) return;
-
-        const text1 = res1?.content?.[0]?.text ?? "A";
-        const text2 = res2?.content?.[0]?.text ?? "B";
-
-        notify("session/update", {
-          sessionUpdate: "agent_message_chunk",
-          content: { text: `Parallel results: ${text1} and ${text2}` },
-        });
-
-        send({
-          jsonrpc: "2.0",
-          id,
-          result: {
-            usage: { inputTokens: 60, outputTokens: 30 },
           },
         });
       } catch (err: any) {

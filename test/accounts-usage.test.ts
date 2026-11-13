@@ -8,21 +8,20 @@ import {
   buildAgyEnvAndArgs,
   getBrowserShimDir,
   getPluginDataRoot,
-  killProcessTree,
   readStoredAgyOAuthCredentials,
   redactSecrets,
-  resolveAgyBinary,
   resolveIsolatedHomeDir,
   sweepStaleAccountStorage,
 } from "../src/accounts/env";
 import {
+  accountRefFromEmail,
   createAuthMethods,
   extractAuthorizationCode,
   importAccountFiles,
   parseImportedAccounts,
   resolveAccountDescriptor,
-  writeIsolatedAgyOAuthToken,
 } from "../src/accounts/auth";
+import { buildProviderOptionSchemas, readProviderOptions } from "../src/options";
 import {
   buildCatalog,
   buildProviderModels,
@@ -41,9 +40,11 @@ import {
   queryAccountUsage,
 } from "../src/usage/quota";
 import { readConversationStepUsages } from "../src/usage/step-usage";
+import { withEnv } from "./fixtures/helpers";
 
 const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-accounts-usage-test-"));
 const ORIGINAL_DATA_DIR = process.env.ANTIGRAVITY_MAGPIE_DATA_DIR;
+const ORIGINAL_AGY_ACP_DATA_DIR = process.env.AGY_ACP_DATA_DIR;
 const ORIGINAL_AGY_PATH = process.env.AGY_PATH;
 
 const VALID_UUID = "e2b65597-96a9-46be-8f3e-52ebc689b7b9";
@@ -61,10 +62,8 @@ const MOCK_AGY_BIN = path.join(
 
 function ensureMockAgyBin(): string {
   const content = process.platform === "win32" ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n";
+  // `mode` is applied by the open(2) call itself, so no follow-up chmod is needed.
   fs.writeFileSync(MOCK_AGY_BIN, content, { mode: 0o755 });
-  try {
-    fs.chmodSync(MOCK_AGY_BIN, 0o755);
-  } catch {}
   return MOCK_AGY_BIN;
 }
 
@@ -158,10 +157,18 @@ const REAL_USAGE_JSON = {
 };
 
 beforeAll(() => {
+  // `getPluginDataRoot()` prefers AGY_ACP_DATA_DIR over ANTIGRAVITY_MAGPIE_DATA_DIR,
+  // so pin both at this file's sandbox root instead of inheriting the runner's.
+  process.env.AGY_ACP_DATA_DIR = TEST_DIR;
   process.env.ANTIGRAVITY_MAGPIE_DATA_DIR = TEST_DIR;
 });
 
 afterAll(() => {
+  if (ORIGINAL_AGY_ACP_DATA_DIR !== undefined) {
+    process.env.AGY_ACP_DATA_DIR = ORIGINAL_AGY_ACP_DATA_DIR;
+  } else {
+    delete process.env.AGY_ACP_DATA_DIR;
+  }
   if (ORIGINAL_DATA_DIR !== undefined) {
     process.env.ANTIGRAVITY_MAGPIE_DATA_DIR = ORIGINAL_DATA_DIR;
   } else {
@@ -233,7 +240,7 @@ describe("src/accounts/env.ts", () => {
     }
   });
 
-  test("buildAgyEnvAndArgs sets up isolated environment correctly", () => {
+  test("buildAgyEnvAndArgs sets up isolated environment correctly", async () => {
     const isolatedAccount: AccountDescriptor = {
       slotKey: `agy-isolated:${VALID_UUID}`,
       accountRef: VALID_UUID,
@@ -242,68 +249,60 @@ describe("src/accounts/env.ts", () => {
       isolatedHomeDir: resolveIsolatedHomeDir(VALID_UUID),
     };
 
-    // Point `agy` resolution at a throwaway executable: CI has no `agy` install.
-    const prevAgyPath = process.env.AGY_PATH;
-    process.env.AGY_PATH = ensureMockAgyBin();
+    // `agy` resolution points at a throwaway executable (CI has no `agy` install),
+    // and every cross-contaminating var is polluted to prove it gets purged.
+    await withEnv(
+      {
+        AGY_PATH: ensureMockAgyBin(),
+        GEMINI_API_KEY: "polluted-gemini",
+        GOOGLE_API_KEY: "polluted-google",
+        GOOGLE_APPLICATION_CREDENTIALS: "polluted-creds",
+        ANTIGRAVITY_APP_DATA_DIR: "polluted-app-data",
+        ANTIGRAVITY_CONFIG_REL_DIR: "polluted-config-rel",
+      },
+      () => {
+        const acpResult = buildAgyEnvAndArgs(isolatedAccount, ["acp", "--login"]);
+        const shimDir = getBrowserShimDir();
 
-    // Set cross-contaminating env vars to check that they get purged
-    process.env.GEMINI_API_KEY = "polluted-gemini";
-    process.env.GOOGLE_API_KEY = "polluted-google";
-    process.env.GOOGLE_APPLICATION_CREDENTIALS = "polluted-creds";
-    process.env.ANTIGRAVITY_APP_DATA_DIR = "polluted-app-data";
-    process.env.ANTIGRAVITY_CONFIG_REL_DIR = "polluted-config-rel";
+        // Verify sanitization
+        expect(acpResult.env.GEMINI_API_KEY).toBeUndefined();
+        expect(acpResult.env.GOOGLE_API_KEY).toBeUndefined();
+        expect(acpResult.env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
+        expect(acpResult.env.ANTIGRAVITY_APP_DATA_DIR).toBeUndefined();
+        expect(acpResult.env.ANTIGRAVITY_CONFIG_REL_DIR).toBeUndefined();
 
-    try {
-      const acpResult = buildAgyEnvAndArgs(isolatedAccount, ["acp", "--login"]);
-      const shimDir = getBrowserShimDir();
+        // Verify browser suppression
+        expect(acpResult.env.BROWSER).toBe("/usr/bin/false");
+        expect(acpResult.env.PATH?.startsWith(shimDir)).toBe(true);
+        expect(acpResult.env.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
 
-      // Verify sanitization
-      expect(acpResult.env.GEMINI_API_KEY).toBeUndefined();
-      expect(acpResult.env.GOOGLE_API_KEY).toBeUndefined();
-      expect(acpResult.env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
-      expect(acpResult.env.ANTIGRAVITY_APP_DATA_DIR).toBeUndefined();
-      expect(acpResult.env.ANTIGRAVITY_CONFIG_REL_DIR).toBeUndefined();
+        // Verify isolated tokens & directories
+        expect(acpResult.env.HOME).toBe(isolatedAccount.isolatedHomeDir!);
+        expect(acpResult.env.SSH_CONNECTION).toBe("127.0.0.1 0 127.0.0.1 22");
+        expect(acpResult.env.XDG_CONFIG_HOME).toBe(
+          path.join(isolatedAccount.isolatedHomeDir!, ".config")
+        );
 
-      // Verify browser suppression
-      expect(acpResult.env.BROWSER).toBe("/usr/bin/false");
-      expect(acpResult.env.PATH?.startsWith(shimDir)).toBe(true);
-      expect(acpResult.env.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
+        // Verify args for `acp` have absolute --gemini-dir and relative --app-data-dir
+        expect(acpResult.finalArgs[0]).toBe("acp");
+        const geminiIdx = acpResult.finalArgs.indexOf("--gemini-dir");
+        expect(geminiIdx).toBeGreaterThan(0);
+        expect(acpResult.finalArgs[geminiIdx + 1]).toBe(
+          path.join(isolatedAccount.isolatedHomeDir!, ".gemini")
+        );
+        const appDataIdx = acpResult.finalArgs.indexOf("--app-data-dir");
+        expect(appDataIdx).toBeGreaterThan(0);
+        expect(acpResult.finalArgs[appDataIdx + 1]).toBe("antigravity-cli");
+        expect(path.isAbsolute(acpResult.finalArgs[appDataIdx + 1]!)).toBe(false);
 
-      // Verify isolated tokens & directories
-      expect(acpResult.env.HOME).toBe(isolatedAccount.isolatedHomeDir!);
-      expect(acpResult.env.SSH_CONNECTION).toBe("127.0.0.1 0 127.0.0.1 22");
-      expect(acpResult.env.XDG_CONFIG_HOME).toBe(
-        path.join(isolatedAccount.isolatedHomeDir!, ".config")
-      );
-
-      // Verify args for `acp` have absolute --gemini-dir and relative --app-data-dir
-      expect(acpResult.finalArgs[0]).toBe("acp");
-      const geminiIdx = acpResult.finalArgs.indexOf("--gemini-dir");
-      expect(geminiIdx).toBeGreaterThan(0);
-      expect(acpResult.finalArgs[geminiIdx + 1]).toBe(
-        path.join(isolatedAccount.isolatedHomeDir!, ".gemini")
-      );
-      const appDataIdx = acpResult.finalArgs.indexOf("--app-data-dir");
-      expect(appDataIdx).toBeGreaterThan(0);
-      expect(acpResult.finalArgs[appDataIdx + 1]).toBe("antigravity-cli");
-      expect(path.isAbsolute(acpResult.finalArgs[appDataIdx + 1]!)).toBe(false);
-
-      // Verify args for `models` do NOT append --gemini-dir
-      const modelsResult = buildAgyEnvAndArgs(isolatedAccount, ["models"]);
-      expect(modelsResult.finalArgs).toEqual(["models"]);
-    } finally {
-      // Clean up test pollution
-      delete process.env.GEMINI_API_KEY;
-      delete process.env.GOOGLE_API_KEY;
-      delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
-      delete process.env.ANTIGRAVITY_APP_DATA_DIR;
-      delete process.env.ANTIGRAVITY_CONFIG_REL_DIR;
-      if (prevAgyPath === undefined) delete process.env.AGY_PATH;
-      else process.env.AGY_PATH = prevAgyPath;
-    }
+        // Verify args for `models` do NOT append --gemini-dir
+        const modelsResult = buildAgyEnvAndArgs(isolatedAccount, ["models"]);
+        expect(modelsResult.finalArgs).toEqual(["models"]);
+      }
+    );
   });
 
-  test("buildAgyEnvAndArgs keeps loopback out of proxies and applies Magpie proxy fallbacks", () => {
+  test("buildAgyEnvAndArgs keeps loopback out of proxies and applies Magpie proxy fallbacks", async () => {
     const isolatedAccount: AccountDescriptor = {
       slotKey: `agy-isolated:${OTHER_UUID}`,
       accountRef: OTHER_UUID,
@@ -312,52 +311,36 @@ describe("src/accounts/env.ts", () => {
       isolatedHomeDir: resolveIsolatedHomeDir(OTHER_UUID),
     };
 
-    const prev = {
-      AGY_PATH: process.env.AGY_PATH,
-      NO_PROXY: process.env.NO_PROXY,
-      no_proxy: process.env.no_proxy,
-      HTTPS_PROXY: process.env.HTTPS_PROXY,
-      https_proxy: process.env.https_proxy,
-      HTTP_PROXY: process.env.HTTP_PROXY,
-      http_proxy: process.env.http_proxy,
-      ALL_PROXY: process.env.ALL_PROXY,
-      all_proxy: process.env.all_proxy,
-      MAGPIE_HTTPS_PROXY: process.env.MAGPIE_HTTPS_PROXY,
-      MAGPIE_HTTP_PROXY: process.env.MAGPIE_HTTP_PROXY,
-      MAGPIE_ALL_PROXY: process.env.MAGPIE_ALL_PROXY,
-    };
-    try {
-      process.env.NO_PROXY = "example.com,localhost";
-      delete process.env.no_proxy;
-      delete process.env.HTTPS_PROXY;
-      delete process.env.https_proxy;
-      delete process.env.HTTP_PROXY;
-      delete process.env.http_proxy;
-      delete process.env.ALL_PROXY;
-      delete process.env.all_proxy;
-      process.env.MAGPIE_HTTPS_PROXY = "http://proxy.example:8443";
-      process.env.MAGPIE_HTTP_PROXY = "http://proxy.example:8080";
-      process.env.MAGPIE_ALL_PROXY = "socks5://proxy.example:1080";
-      // Point `agy` resolution at a throwaway executable: CI has no `agy` install.
-      process.env.AGY_PATH = ensureMockAgyBin();
+    await withEnv(
+      {
+        // Point `agy` resolution at a throwaway executable: CI has no `agy` install.
+        AGY_PATH: ensureMockAgyBin(),
+        NO_PROXY: "example.com,localhost",
+        no_proxy: undefined,
+        HTTPS_PROXY: undefined,
+        https_proxy: undefined,
+        HTTP_PROXY: undefined,
+        http_proxy: undefined,
+        ALL_PROXY: undefined,
+        all_proxy: undefined,
+        MAGPIE_HTTPS_PROXY: "http://proxy.example:8443",
+        MAGPIE_HTTP_PROXY: "http://proxy.example:8080",
+        MAGPIE_ALL_PROXY: "socks5://proxy.example:1080",
+      },
+      () => {
+        const result = buildAgyEnvAndArgs(isolatedAccount, ["models"]);
 
-      const result = buildAgyEnvAndArgs(isolatedAccount, ["models"]);
-
-      expect(result.env.NO_PROXY).toBe("example.com,localhost,127.0.0.1,::1");
-      expect(result.env.no_proxy).toBe("127.0.0.1,localhost,::1");
-      expect(result.env.HTTPS_PROXY).toBe("http://proxy.example:8443");
-      expect(result.env.HTTP_PROXY).toBe("http://proxy.example:8080");
-      expect(result.env.ALL_PROXY).toBe("socks5://proxy.example:1080");
-      expect(result.env.USERPROFILE).toBe(isolatedAccount.isolatedHomeDir!);
-    } finally {
-      for (const [key, value] of Object.entries(prev)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
+        expect(result.env.NO_PROXY).toBe("example.com,localhost,127.0.0.1,::1");
+        expect(result.env.no_proxy).toBe("127.0.0.1,localhost,::1");
+        expect(result.env.HTTPS_PROXY).toBe("http://proxy.example:8443");
+        expect(result.env.HTTP_PROXY).toBe("http://proxy.example:8080");
+        expect(result.env.ALL_PROXY).toBe("socks5://proxy.example:1080");
+        expect(result.env.USERPROFILE).toBe(isolatedAccount.isolatedHomeDir!);
       }
-    }
+    );
   });
 
-  test("buildAgyEnvAndArgs preserves host settings for host accounts", () => {
+  test("buildAgyEnvAndArgs preserves host settings for host accounts", async () => {
     const hostAccount: AccountDescriptor = {
       slotKey: "agy",
       accountRef: "host",
@@ -367,17 +350,12 @@ describe("src/accounts/env.ts", () => {
     };
 
     // Point `agy` resolution at a throwaway executable: CI has no `agy` install.
-    const prevAgyPath = process.env.AGY_PATH;
-    process.env.AGY_PATH = ensureMockAgyBin();
-    try {
+    await withEnv({ AGY_PATH: ensureMockAgyBin() }, () => {
       const result = buildAgyEnvAndArgs(hostAccount, ["models"]);
       expect(result.env.SSH_CONNECTION).toBe(process.env.SSH_CONNECTION);
       expect(result.finalArgs).toEqual(["models"]);
       expect(result.env.BROWSER).toBe("/usr/bin/false");
-    } finally {
-      if (prevAgyPath === undefined) delete process.env.AGY_PATH;
-      else process.env.AGY_PATH = prevAgyPath;
-    }
+    });
   });
 
   test("redactSecrets sanitizes OAuth codes, tokens, Bearer auth, and loopback mcp tokens", () => {
@@ -448,7 +426,7 @@ describe("src/accounts/env.ts", () => {
     }
   });
 
-  test("sweepStaleAccountStorage prunes stale unprotected artifacts and preserves protected and fresh ones", () => {
+  test("sweepStaleAccountStorage prunes stale unprotected artifacts and preserves protected and fresh ones", async () => {
     const tempDataDir = fs.mkdtempSync(path.join(TEST_DIR, "sweep-data-"));
     const cliDir = path.join(
       tempDataDir,
@@ -513,9 +491,7 @@ describe("src/accounts/env.ts", () => {
     fs.utimesSync(path.join(nestedBrainDir, ".system_generated"), oldTime, oldTime);
     fs.utimesSync(nestedBrainDir, oldTime, oldTime);
 
-    const prevAgyAcpDataDir = process.env.AGY_ACP_DATA_DIR;
-    process.env.AGY_ACP_DATA_DIR = tempDataDir;
-    try {
+    await withEnv({ AGY_ACP_DATA_DIR: tempDataDir }, () => {
       const removed = sweepStaleAccountStorage({
         now: nowMs,
         protectedSessionIds: new Set(["keep-sess"]),
@@ -532,13 +508,7 @@ describe("src/accounts/env.ts", () => {
       expect(fs.existsSync(freshDb)).toBe(true);
       expect(fs.existsSync(freshLog)).toBe(true);
       expect(fs.existsSync(nestedFreshFile)).toBe(true);
-    } finally {
-      if (prevAgyAcpDataDir !== undefined) {
-        process.env.AGY_ACP_DATA_DIR = prevAgyAcpDataDir;
-      } else {
-        delete process.env.AGY_ACP_DATA_DIR;
-      }
-    }
+    });
   });
 });
 
@@ -608,7 +578,7 @@ describe("src/accounts/auth.ts", () => {
       parseImportedAccounts(JSON.stringify({ refresh_token: "1//04rtA", email: "a@example.com" }))
     ).toEqual([{ refreshToken: "1//04rtA", email: "a@example.com" }]);
 
-    // 2. agy native antigravity-oauth-token format
+    // 2. agy native antigravity-oauth-token format (only the refresh_token survives)
     expect(
       parseImportedAccounts(
         JSON.stringify({
@@ -616,7 +586,7 @@ describe("src/accounts/auth.ts", () => {
           auth_method: "consumer",
         })
       )
-    ).toEqual([{ refreshToken: "1//04rtB", accessToken: "ya29.at", expiresIn: 3500 }]);
+    ).toEqual([{ refreshToken: "1//04rtB" }]);
 
     // 3. opencode-antigravity-auth / Magpie plugin-auth entry ("rt|project")
     expect(
@@ -627,7 +597,7 @@ describe("src/accounts/auth.ts", () => {
           accountId: "c@example.com",
         })
       )
-    ).toEqual([{ refreshToken: "1//04rtC", project: "proj-123", email: "c@example.com" }]);
+    ).toEqual([{ refreshToken: "1//04rtC", email: "c@example.com" }]);
 
     // 4. Multi-account { accounts: [...] } with deduplication
     expect(
@@ -645,10 +615,10 @@ describe("src/accounts/auth.ts", () => {
       { refreshToken: "1//04rt2", email: "two@example.com" },
     ]);
 
-    // 5. Plain newline-separated refresh tokens with comments
+    // 5. Plain newline-separated refresh tokens with comments ("|project" stripped)
     expect(parseImportedAccounts("# exported\n1//04line1\n\n1//04line2|my-proj\n")).toEqual([
       { refreshToken: "1//04line1" },
-      { refreshToken: "1//04line2", project: "my-proj" },
+      { refreshToken: "1//04line2" },
     ]);
 
     // 6. Rejects non-Antigravity account JSON
@@ -853,7 +823,8 @@ describe("src/accounts/auth.ts", () => {
     });
     expect(stillOpen).toBe(false);
 
-    // 7. Cancelled batch import rolls back newly created account directories
+    // 7. Cancelled batch import rolls back newly created account directories and
+    //    rewrites their outcomes so no `success` points at a deleted home.
     const batchAbort = new AbortController();
     let seenBatchCalls = 0;
     const abortedBatch = await importAccountFiles(
@@ -872,9 +843,15 @@ describe("src/accounts/auth.ts", () => {
         },
       }
     );
-    expect(abortedBatch.length).toBe(1);
-    const { accountRefFromEmail } = await import("../src/accounts/auth");
-    const b1Dir = path.join(TEST_DIR, "accounts", accountRefFromEmail("t_b1@example.com"));
+    const b1AccountRef = accountRefFromEmail("t_b1@example.com");
+    const b1Dir = path.join(TEST_DIR, "accounts", b1AccountRef);
+    // b1 was already committed when the abort landed on b2, so the batch cleanup
+    // rolls its home back and rewrites its `success` to `failed` (without appending
+    // an extra entry for the uncommitted b2).
+    expect(abortedBatch).toHaveLength(1);
+    expect(abortedBatch[0]?.type).toBe("failed");
+    expect((abortedBatch[0] as any)?.error).toBe("Sign-in cancelled");
+    expect((abortedBatch[0] as any)?.accountId).toBe(b1AccountRef);
     expect(fs.existsSync(b1Dir)).toBe(false);
 
     // 8. Legacy random-UUID account loaded via resolveAccountDescriptor is reused in-place on re-import
@@ -932,6 +909,82 @@ describe("src/accounts/auth.ts", () => {
     );
   });
 
+  test("mid-batch abort keeps an updated pre-existing account's success and its directory", async () => {
+    // The minted access_token encodes the refresh-token suffix so userinfo can
+    // answer with a stable, per-token email address.
+    const emailFor = (refreshToken: string): string => `${refreshToken.slice(-4)}@example.com`;
+    const mockFetch = (async (input: any, init?: any) => {
+      const url = typeof input === "string" ? input : input.url;
+      if (url.includes("oauth2.googleapis.com/token")) {
+        const refreshToken = new URLSearchParams(String(init?.body ?? "")).get("refresh_token") ?? "";
+        return new Response(
+          JSON.stringify({ access_token: `ya29.${refreshToken.slice(-4)}`, expires_in: 3600 }),
+          { status: 200 }
+        );
+      }
+      const authorization = new Headers(init?.headers).get("Authorization") ?? "";
+      return new Response(JSON.stringify({ email: `${authorization.slice(-4)}@example.com` }), {
+        status: 200,
+      });
+    }) as typeof fetch;
+
+    // Seed one committed account so the batch below updates a pre-existing home.
+    const seeded = await importAccountFiles(
+      [JSON.stringify({ refresh_token: "1//04exist_u1" })],
+      undefined,
+      { fetchFn: mockFetch, verifyAccountFn: async () => ({ ok: true }) }
+    );
+    expect(seeded[0]?.type).toBe("success");
+    const existingRef = (seeded[0] as any).metadata.accountRef;
+    const existingDir = path.join(TEST_DIR, "accounts", existingRef);
+    const existingStamp = path.join(existingDir, ".commit-stamp");
+    const existingToken = path.join(
+      existingDir,
+      ".gemini",
+      "antigravity-cli",
+      "antigravity-oauth-token"
+    );
+    expect(fs.existsSync(existingStamp)).toBe(true);
+
+    const batchAbort = new AbortController();
+    let verifyCalls = 0;
+    const mixedBatch = await importAccountFiles(
+      [
+        JSON.stringify({
+          accounts: [
+            { refresh_token: "1//04exist_u1" },
+            { refresh_token: "1//04fresh_u2" },
+            { refresh_token: "1//04abort_u3" },
+          ],
+        }),
+      ],
+      { signal: batchAbort.signal },
+      {
+        fetchFn: mockFetch,
+        verifyAccountFn: async () => {
+          if (++verifyCalls === 3) batchAbort.abort();
+          return { ok: true };
+        },
+      }
+    );
+
+    const freshRef = accountRefFromEmail(emailFor("1//04fresh_u2"));
+    expect(mixedBatch.length).toBe(2);
+    // The account that already existed keeps its `success` and its committed home.
+    expect(mixedBatch[0]?.type).toBe("success");
+    expect((mixedBatch[0] as any)?.metadata.accountRef).toBe(existingRef);
+    expect(fs.existsSync(existingStamp)).toBe(true);
+    expect(fs.existsSync(existingToken)).toBe(true);
+
+    // The newly created account committed before abort was rolled back and rewritten.
+    expect(mixedBatch[1]).toEqual({
+      type: "failed",
+      error: "Sign-in cancelled",
+      accountId: freshRef,
+    });
+    expect(fs.existsSync(path.join(TEST_DIR, "accounts", freshRef))).toBe(false);
+  });
+
   test("createAuthMethods registers terminal code OAuth and Host API methods", async () => {
     const methods = createAuthMethods();
     expect(methods.length).toBe(4);
@@ -966,10 +1019,7 @@ exit 1
       { mode: 0o755 }
     );
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
-    try {
+    await withEnv({ AGY_PATH: mockAgyPath }, async () => {
       const flow = await oauthMethod.authorize({ label: "test-auth-user" });
       expect("url" in flow).toBe(true);
       if ("type" in flow && flow.type === "failed") {
@@ -987,17 +1037,16 @@ exit 1
         expect(cbResult.metadata.email).toMatch(/^test-auth-user \([0-9a-f]{8}\)$/);
       }
 
-      await expect(oauthResult.callback("code-again")).rejects.toThrow(
-        "Callback has already been invoked"
-      );
+      // A second `callback()` is refused instead of throwing: Magpie retries pastes.
+      expect(await oauthResult.callback("code-again")).toEqual({
+        type: "failed",
+        error: "Callback has already been invoked",
+      });
 
       const hostAdopt = (await hostMethod.authorize()) as { type: string; metadata?: any };
       expect(hostAdopt.type).toBe("success");
       expect(hostAdopt.metadata?.mode).toBe("host");
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 
   test("createAuthMethods redacts OAuth secrets from a failing agy sign-in output", async () => {
@@ -1014,10 +1063,7 @@ exit 1
       { mode: 0o755 }
     );
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
-    try {
+    await withEnv({ AGY_PATH: mockAgyPath }, async () => {
       const oauthMethod = createAuthMethods()[3]!;
       const flow = (await oauthMethod.authorize()) as { type: string; error?: string };
       expect(flow.type).toBe("failed");
@@ -1026,10 +1072,7 @@ exit 1
       expect(error).toContain("[REDACTED]");
       expect(error).not.toContain("4/0AeanLeakedAuthCode1234567890");
       expect(error).not.toContain("ya29.secretToken123");
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 
   test("createAuthMethods redacts secrets from agy models verification failures", async () => {
@@ -1051,10 +1094,7 @@ exit 1
       { mode: 0o755 }
     );
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
-    try {
+    await withEnv({ AGY_PATH: mockAgyPath }, async () => {
       const oauthMethod = createAuthMethods()[3]!;
       const flow = (await oauthMethod.authorize()) as any;
       expect(flow.method).toBe("code");
@@ -1064,18 +1104,14 @@ exit 1
       expect(result.error).toContain("[REDACTED]");
       expect(result.error).not.toContain("ya29.verifySecret");
       expect(result.error).not.toContain("1//04verifySecret");
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 
   test("a failed file-lock acquisition does not wedge the in-memory provisioning lock", async () => {
-    const { accountRefFromEmail } = await import("../src/accounts/auth");
     const email = "lock_release_d1@example.com";
     const accountRef = accountRefFromEmail(email);
 
-    const lockFetch = (async (input: any, init?: any) => {
+    const lockFetch = (async (input: any, _init?: any) => {
       const url = typeof input === "string" ? input : input.url;
       if (url.includes("oauth2.googleapis.com/token")) {
         return new Response(
@@ -1164,9 +1200,6 @@ exit 1
       { mode: 0o755 }
     );
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
     const isAlive = (pid: number): boolean => {
       try {
         process.kill(pid, 0);
@@ -1191,38 +1224,39 @@ exit 1
     let childPid = 0;
 
     try {
-      const oauthMethod = createAuthMethods()[3]!;
-      const flow = (await (oauthMethod as any).authorize(undefined, {
-        signal: controller.signal,
-      })) as any;
-      expect(flow.method).toBe("code");
-      expect(flow.url).toContain("https://accounts.google.com/o/oauth2/auth");
+      await withEnv({ AGY_PATH: mockAgyPath }, async () => {
+        const oauthMethod = createAuthMethods()[3]!;
+        const flow = (await (oauthMethod as any).authorize(undefined, {
+          signal: controller.signal,
+        })) as any;
+        expect(flow.method).toBe("code");
+        expect(flow.url).toContain("https://accounts.google.com/o/oauth2/auth");
 
-      const createdDirs = fs
-        .readdirSync(accountsDir)
-        .filter((name) => !dirsBefore.has(name));
-      expect(createdDirs).toHaveLength(1);
-      const tempDir = path.join(accountsDir, createdDirs[0]!);
-      expect(fs.existsSync(tempDir)).toBe(true);
+        const createdDirs = fs
+          .readdirSync(accountsDir)
+          .filter((name) => !dirsBefore.has(name));
+        expect(createdDirs).toHaveLength(1);
+        const tempDir = path.join(accountsDir, createdDirs[0]!);
+        expect(fs.existsSync(tempDir)).toBe(true);
 
-      expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
-      childPid = Number(fs.readFileSync(pidFile, "utf8").trim());
-      expect(childPid).toBeGreaterThan(1);
-      expect(isAlive(childPid)).toBe(true);
+        expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+        childPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+        expect(childPid).toBeGreaterThan(1);
+        expect(isAlive(childPid)).toBe(true);
 
-      // Abandon the sign-in: the URL was handed to the user, `callback` never runs.
-      controller.abort();
+        // Abandon the sign-in: the URL was handed to the user, `callback` never runs.
+        controller.abort();
 
-      expect(await waitFor(() => !isAlive(childPid))).toBe(true);
-      expect(await waitFor(() => !fs.existsSync(tempDir))).toBe(true);
+        expect(await waitFor(() => !isAlive(childPid))).toBe(true);
+        expect(await waitFor(() => !fs.existsSync(tempDir))).toBe(true);
+      });
     } finally {
+      // Never leave a stray mock `agy acp --login` behind, even when an assertion fails.
       if (childPid > 1 && isAlive(childPid)) {
         try {
           process.kill(childPid, "SIGKILL");
         } catch {}
       }
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
     }
   });
 
@@ -1243,9 +1277,6 @@ exit 1
 `,
       { mode: 0o755 }
     );
-
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
 
     const isAlive = (pid: number): boolean => {
       try {
@@ -1270,29 +1301,30 @@ exit 1
     let childPid = 0;
 
     try {
-      const oauthMethod = createAuthMethods({ terminalFlowTimeoutMs: 800 })[3]!;
-      const flow = (await (oauthMethod as any).authorize()) as any;
-      expect(flow.method).toBe("code");
+      await withEnv({ AGY_PATH: mockAgyPath }, async () => {
+        const oauthMethod = createAuthMethods({ terminalFlowTimeoutMs: 800 })[3]!;
+        const flow = (await (oauthMethod as any).authorize()) as any;
+        expect(flow.method).toBe("code");
 
-      const createdDirs = fs
-        .readdirSync(accountsDir)
-        .filter((name) => !dirsBefore.has(name));
-      expect(createdDirs).toHaveLength(1);
-      const tempDir = path.join(accountsDir, createdDirs[0]!);
-      expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
-      childPid = Number(fs.readFileSync(pidFile, "utf8").trim());
-      expect(isAlive(childPid)).toBe(true);
+        const createdDirs = fs
+          .readdirSync(accountsDir)
+          .filter((name) => !dirsBefore.has(name));
+        expect(createdDirs).toHaveLength(1);
+        const tempDir = path.join(accountsDir, createdDirs[0]!);
+        expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+        childPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+        expect(isAlive(childPid)).toBe(true);
 
-      expect(await waitFor(() => !isAlive(childPid))).toBe(true);
-      expect(await waitFor(() => !fs.existsSync(tempDir))).toBe(true);
+        expect(await waitFor(() => !isAlive(childPid))).toBe(true);
+        expect(await waitFor(() => !fs.existsSync(tempDir))).toBe(true);
+      });
     } finally {
+      // Never leave a stray mock `agy acp --login` behind, even when an assertion fails.
       if (childPid > 1 && isAlive(childPid)) {
         try {
           process.kill(childPid, "SIGKILL");
         } catch {}
       }
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
     }
   });
 });
@@ -1482,10 +1514,7 @@ describe("src/usage/catalog.ts", () => {
     const mockAgyPath = path.join(TEST_DIR, "mock-agy-catalog-switch.sh");
     fs.writeFileSync(mockAgyPath, `#!/bin/sh\ncat "${modelsFile}"\n`, { mode: 0o755 });
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
-    try {
+    await withEnv({ AGY_PATH: mockAgyPath }, async () => {
       const slotKey = "shared-catalog-slot";
       const accountA: AccountDescriptor = {
         slotKey,
@@ -1525,10 +1554,7 @@ describe("src/usage/catalog.ts", () => {
       const catalogAAgain = await service.getCatalog(accountA);
       expect(catalogAAgain.rawIds.has("gemini-4-argon-medium")).toBe(true);
       expect(catalogAAgain.rawIds.has("claude-opus-5-5-high")).toBe(false);
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 });
 
@@ -1727,10 +1753,7 @@ cat "${fixturePath}"
       { mode: 0o755 }
     );
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
-    try {
+    await withEnv({ AGY_PATH: mockAgyPath }, async () => {
       const account: AccountDescriptor = {
         slotKey: "quota-test-slot",
         accountRef: "host",
@@ -1753,10 +1776,7 @@ cat "${fixturePath}"
       // Third call should be served from 30s cache
       const r3 = await queryAccountUsage(account, ["gemini-3.8-flash"], { quotaRouting: false });
       expect(r3.windows.length).toBe(4);
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 
   test("queryAccountUsage detects authentication expiration", async () => {
@@ -1770,10 +1790,7 @@ exit 1
       { mode: 0o755 }
     );
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockExpiredAgy;
-
-    try {
+    await withEnv({ AGY_PATH: mockExpiredAgy }, async () => {
       const account: AccountDescriptor = {
         slotKey: "expired-test-slot",
         accountRef: "host",
@@ -1786,10 +1803,7 @@ exit 1
       expect(result.signIn).toBe("expired");
       expect(result.windows).toEqual([]);
       expect(result.error).toContain("authentication expired");
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 
   test("queryAccountUsage scopes cache and single-flight by accountRef, not just slotKey", async () => {
@@ -1798,10 +1812,7 @@ exit 1
     const mockAgyPath = path.join(TEST_DIR, "mock-agy-quota-switch.sh");
     fs.writeFileSync(mockAgyPath, `#!/bin/sh\ncat "${fixturePath}"\n`, { mode: 0o755 });
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
-    try {
+    await withEnv({ AGY_PATH: mockAgyPath }, async () => {
       const slotKey = "shared-quota-slot";
       const accountA: AccountDescriptor = {
         slotKey,
@@ -1854,10 +1865,7 @@ exit 1
       // Account A is still served from its own cached result.
       const resultAAgain = await queryAccountUsage(accountA, [], { quotaRouting: false });
       expect(resultAAgain.windows.length).toBe(4);
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 
   test("queryAccountUsage does not cache expired or failed results", async () => {
@@ -1877,10 +1885,7 @@ cat "${fixturePath}"
       { mode: 0o755 }
     );
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
-    try {
+    await withEnv({ AGY_PATH: mockAgyPath }, async () => {
       const account: AccountDescriptor = {
         slotKey: "expiry-retry-slot",
         accountRef: "host",
@@ -1898,10 +1903,7 @@ cat "${fixturePath}"
       const recovered = await queryAccountUsage(account, [], { quotaRouting: false });
       expect(recovered.signIn).toBe("kept");
       expect(recovered.windows.length).toBe(4);
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 
   test("queryAccountUsage redacts secrets from failed agy output", async () => {
@@ -1915,10 +1917,7 @@ exit 1
       { mode: 0o755 }
     );
 
-    const prevAgy = process.env.AGY_PATH;
-    process.env.AGY_PATH = mockAgyPath;
-
-    try {
+    await withEnv({ AGY_PATH: mockAgyPath }, async () => {
       const account: AccountDescriptor = {
         slotKey: "redact-quota-slot",
         accountRef: "host",
@@ -1933,10 +1932,7 @@ exit 1
       expect(result.error).toContain("[REDACTED]");
       expect(result.error).not.toContain("1//04secretToken");
       expect(result.error).not.toContain("4/0AeanLeakedQuotaCode1234567890");
-    } finally {
-      if (prevAgy) process.env.AGY_PATH = prevAgy;
-      else delete process.env.AGY_PATH;
-    }
+    });
   });
 });
 
@@ -2024,6 +2020,48 @@ describe("src/usage/step-usage.ts", () => {
         delete process.env.AGY_BRIDGE_CONVERSATIONS_DIR;
       }
     }
+  });
+});
+
+describe("src/options.ts", () => {
+  test("buildProviderOptionSchemas defaults match readProviderOptions fallbacks", async () => {
+    const schemas = buildProviderOptionSchemas();
+    expect(schemas.map((schema) => schema.key)).toEqual([
+      "quota_routing",
+      "cloak_prompts",
+      "minimal_agent",
+      "expose_thinking",
+    ]);
+
+    // Clear the env overrides so the schema defaults and the state fallbacks are
+    // compared on their own, without a shell-level AGY_MAGPIE_* skewing one side.
+    await withEnv(
+      {
+        AGY_MAGPIE_QUOTA_ROUTING: undefined,
+        AGY_MAGPIE_CLOAK_PROMPTS: undefined,
+        AGY_MAGPIE_MINIMAL_AGENT: undefined,
+        AGY_MAGPIE_EXPOSE_THINKING: undefined,
+      },
+      () => {
+        const defaults = readProviderOptions({}, undefined);
+        expect(defaults).toEqual({
+          quotaRouting: false,
+          cloakPrompts: true,
+          minimalAgent: false,
+          exposeThinking: true,
+        });
+
+        const defaultByKey: Record<string, boolean> = {
+          quota_routing: defaults.quotaRouting,
+          cloak_prompts: defaults.cloakPrompts,
+          minimal_agent: defaults.minimalAgent,
+          expose_thinking: defaults.exposeThinking,
+        };
+        expect(schemas.map((schema) => schema.default)).toEqual(
+          schemas.map((schema) => defaultByKey[schema.key]!)
+        );
+      }
+    );
   });
 });
 

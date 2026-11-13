@@ -230,7 +230,7 @@ function createRgba(width: number, height: number): Uint8Array {
 function clampByte(value: number): number {
   if (value <= 0) return 0;
   if (value >= 255) return 255;
-  return value < 0 ? 0 : value > 255 ? 255 : value | 0;
+  return value | 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +728,6 @@ interface JpegComponent {
 interface JpegFrame {
   width: number;
   height: number;
-  progressive: boolean;
   maxH: number;
   maxV: number;
   mcusX: number;
@@ -975,7 +974,6 @@ function decodeJpegScan(
   };
 
   const first = scan[0]!;
-  const narrow = !interleaved || first.component.h * first.component.v === 1;
   // A non-interleaved scan walks the component's own block grid, which may be
   // smaller than the MCU-padded coefficient plane.
   const blocksWide = interleaved
@@ -993,7 +991,6 @@ function decodeJpegScan(
   const totalUnits = interleaved
     ? frame.mcusX * frame.mcusY
     : blocksWide * blocksHigh;
-  void narrow;
 
   let sinceRestart = 0;
   for (let unit = 0; unit < totalUnits; unit += 1) {
@@ -1140,6 +1137,11 @@ function decodeJpeg(raw: Uint8Array): RgbaImage | null {
         }
       } else if (isSofMarker(marker)) {
         if (segment.length < 6) return null;
+        // Only baseline (SOF0), extended sequential (SOF1) and progressive
+        // (SOF2) Huffman frames are decodable here; arithmetic-coded and
+        // lossless SOF processes would decode to garbage instead of failing.
+        const progressive = marker === 0xc2;
+        if (marker !== 0xc0 && marker !== 0xc1 && !progressive) return null;
         const precision = segment[0]!;
         const height = readU16BE(segment, 1);
         const width = readU16BE(segment, 3);
@@ -1193,7 +1195,6 @@ function decodeJpeg(raw: Uint8Array): RgbaImage | null {
         frame = {
           width,
           height,
-          progressive: marker === 0xc2,
           maxH,
           maxV,
           mcusX: shape.mcusX,
@@ -1631,6 +1632,32 @@ function lzwDecode(data: Uint8Array, minimumCodeSize: number, out: Uint8Array): 
 // ---------------------------------------------------------------------------
 
 /**
+ * Decodes already-probed bytes into RGBA8, `null` on anything it cannot handle.
+ *
+ * Split out of `decodeImageRgba` so the inline-image fitter, which had to probe
+ * the dimensions anyway, does not parse the same header twice. Never throws:
+ * untrusted bytes surface as `null` (passed through untouched).
+ */
+function decodeCheckedImageRgba(raw: Uint8Array, dimensions: ImageDimensions): RgbaImage | null {
+  try {
+    switch (dimensions.format) {
+      case "png":
+        return decodePng(raw);
+      case "jpeg":
+        return decodeJpeg(raw);
+      case "gif":
+        return decodeGif(raw);
+      case "webp":
+        // WebP needs a VP8 decoder this module does not carry; the image is
+        // passed through untouched instead of being corrupted.
+        return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Decodes any PNG, JPEG or GIF this module understands into RGBA8.
  *
  * Never throws: image bytes are untrusted caller input, so an unexpected
@@ -1644,18 +1671,7 @@ export function decodeImageRgba(raw: Uint8Array): RgbaImage | null {
     const pixels = dimensions.width * dimensions.height;
     if (!Number.isFinite(pixels) || pixels <= 0) return null;
     if (raw.length + pixels * 4 > MAX_DECODE_HOLD_BYTES) return null;
-    switch (dimensions.format) {
-      case "png":
-        return decodePng(raw);
-      case "jpeg":
-        return decodeJpeg(raw);
-      case "gif":
-        return decodeGif(raw);
-      case "webp":
-        // WebP needs a VP8 decoder this module does not carry; the image is
-        // passed through untouched instead of being corrupted.
-        return null;
-    }
+    return decodeCheckedImageRgba(raw, dimensions);
   } catch {
     return null;
   }
@@ -2354,7 +2370,7 @@ function fitInlineImageOrPassthrough(
     return passthrough();
   }
 
-  const decoded = decodeImageRgba(raw);
+  const decoded = decodeCheckedImageRgba(raw, dimensions);
   if (decoded === null) return passthrough();
 
   const longest = Math.max(decoded.width, decoded.height);

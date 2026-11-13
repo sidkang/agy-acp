@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   BridgeHttpError,
   type AccountDescriptor,
+  type EffortLevel,
   type NormalizedAnthropicRequest,
   type TurnStreamEvent,
 } from "../src/types";
@@ -15,7 +16,6 @@ import {
 import { GlobalScheduler } from "../src/runtime/scheduler";
 import {
   AgySessionWorker,
-  createSyntheticThinkingSignature,
   sweepStaleWorkspaces,
   type ModelSelection,
 } from "../src/runtime/worker";
@@ -26,15 +26,7 @@ import {
 } from "../src/protocol/anthropic";
 import { getSharedMcpServer } from "../src/mcp/http-server";
 import { settleStepUsage } from "../src/usage/step-usage";
-
-const fakeAcpPath = path.resolve(__dirname, "fixtures/fake-acp.ts");
-
-function spawnFakeAcp(account: AccountDescriptor, args: string[], opts?: any) {
-  return spawn("bun", ["run", fakeAcpPath], {
-    cwd: opts?.cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-}
+import { FAKE_ACP_PATH, spawnFakeAcp } from "./fixtures/helpers";
 
 const testAccount: AccountDescriptor = {
   slotKey: "agy#test1",
@@ -44,9 +36,39 @@ const testAccount: AccountDescriptor = {
   isolatedHomeDir: null,
 };
 
+/**
+ * Builds a request with the boilerplate every case shares. `sessionId`
+ * defaults to `null` (stateless) so a session test has to name its key.
+ */
+function makeReq(
+  messages: NormalizedAnthropicRequest["messages"],
+  overrides: Partial<NormalizedAnthropicRequest> = {},
+): NormalizedAnthropicRequest {
+  return {
+    model: "claude-opus-4-6-thinking",
+    system: "",
+    messages,
+    tools: [],
+    toolChoice: { type: "auto" },
+    stream: true,
+    thinkingEnabled: false,
+    sessionId: null,
+    ...overrides,
+  };
+}
+
+function sel(
+  rawModelId = "claude-opus-4-6-thinking",
+  effort?: EffortLevel,
+): ModelSelection {
+  return effort !== undefined
+    ? { rawModelId, configModelValue: rawModelId, effort }
+    : { rawModelId, configModelValue: rawModelId };
+}
+
 describe("AcpConnection", () => {
   test("exchanges JSON-RPC requests and notifications with fake ACP", async () => {
-    const child = spawn("bun", ["run", fakeAcpPath], {
+    const child = spawn("bun", ["run", FAKE_ACP_PATH], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -97,7 +119,7 @@ describe("AcpConnection", () => {
   });
 
   test("handles server-initiated session/request_permission with deny", async () => {
-    const child = spawn("bun", ["run", fakeAcpPath], {
+    const child = spawn("bun", ["run", FAKE_ACP_PATH], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -256,27 +278,17 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("1. Multi-turn warm session reuse + mid-session model/effort switch", async () => {
     const sessionId = `test-sess-${Date.now()}`;
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "System prompt test",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Turn 1 user message" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "System prompt test", sessionId },
+    );
 
-    const sel1: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-      effort: "low",
-    };
+    const sel1 = sel("gemini-3.8-flash", "low");
 
     const events1: TurnStreamEvent[] = [];
     for await (const event of coordinator.executeTurn(testAccount, req1, sel1)) {
@@ -295,10 +307,8 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(text1).toContain("effort=low");
 
     // Turn 2 on same session with model/effort switch
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-4-hydrogen",
-      system: "System prompt test",
-      messages: [
+    const req2 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Turn 1 user message" }],
@@ -312,18 +322,10 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           content: [{ type: "text", text: "Turn 2 user message" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-4-hydrogen", system: "System prompt test", sessionId },
+    );
 
-    const sel2: ModelSelection = {
-      rawModelId: "gemini-4-hydrogen",
-      configModelValue: "gemini-4-hydrogen",
-      effort: "high",
-    };
+    const sel2 = sel("gemini-4-hydrogen", "high");
 
     const events2: TurnStreamEvent[] = [];
     for await (const event of coordinator.executeTurn(testAccount, req2, sel2)) {
@@ -355,30 +357,21 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Tool system prompt",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Please TRIGGER_TOOL_CALL" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Tool system prompt", tools, sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     // Turn 1
     const events1: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req1, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req1, selection)) {
       events1.push(event);
     }
 
@@ -389,16 +382,14 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const finish1 = events1.find((e) => e.type === "finish");
     expect(finish1?.type === "finish" && finish1.stopReason).toBe("tool_use");
 
-    const sessionKey = `${testAccount.slotKey}::${sessionId}`;
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
     const worker = coordinator.getActiveWorker(sessionKey);
     expect(worker?.state).toBe("AWAITING_TOOL_RESULTS");
 
     // Turn 2 delivers tool_result
     const toolCallId = (toolUse as any).id;
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Tool system prompt",
-      messages: [
+    const req2 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Please TRIGGER_TOOL_CALL" }],
@@ -426,15 +417,11 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Tool system prompt", tools, sessionId },
+    );
 
     const events2: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req2, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req2, selection)) {
       events2.push(event);
     }
 
@@ -464,30 +451,21 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Late sibling test",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Please TRIGGER_LATE_SIBLING" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Late sibling test", tools, sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     // Turn 1
     const events1: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req1, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req1, selection)) {
       events1.push(event);
     }
 
@@ -500,10 +478,8 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     await new Promise((r) => setTimeout(r, 120));
 
     // Turn 2: resolve tool_a
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Late sibling test",
-      messages: [
+    const req2 = makeReq(
+      [
         ...req1.messages,
         {
           role: "assistant",
@@ -521,15 +497,11 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Late sibling test", tools, sessionId },
+    );
 
     const events2: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req2, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req2, selection)) {
       events2.push(event);
     }
 
@@ -540,10 +512,8 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const call2Id = (toolUse2[0] as any).id;
 
     // Turn 3: resolve tool_b
-    const req3: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Late sibling test",
-      messages: [
+    const req3 = makeReq(
+      [
         ...req2.messages,
         {
           role: "assistant",
@@ -561,15 +531,11 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Late sibling test", tools, sessionId },
+    );
 
     const events3: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req3, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req3, selection)) {
       events3.push(event);
     }
 
@@ -579,32 +545,23 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("4. AbortSignal during GENERATING cancels promptly", async () => {
     const sessionId = `test-abort-${Date.now()}`;
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Cancel test",
-      messages: [
+    const req = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Please TRIGGER_CANCEL_TEST" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Cancel test", sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     const controller = new AbortController();
     const generator = coordinator.executeTurn(
       testAccount,
       req,
-      sel,
+      selection,
       undefined,
       controller.signal,
     );
@@ -619,7 +576,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const remaining = await generator.next();
     expect(remaining.done).toBe(true);
 
-    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(worker?.state).toBe("IDLE");
   });
 
@@ -633,50 +590,35 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Branch test",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Branch test", tools, sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     // Turn 1 leaves worker in AWAITING_TOOL_RESULTS
-    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req1, selection)) {}
 
     // Send branched request (completely different history)
-    const reqBranch: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Branch test",
-      messages: [
+    const reqBranch = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Unrelated new branch question" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Branch test", tools, sessionId },
+    );
 
     let caughtError: any = null;
     try {
-      for await (const _ of coordinator.executeTurn(testAccount, reqBranch, sel)) {}
+      for await (const _ of coordinator.executeTurn(testAccount, reqBranch, selection)) {}
     } catch (err) {
       caughtError = err;
     }
@@ -686,7 +628,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(caughtError?.message).toContain("Cannot branch session while tool calls are pending");
 
     // Worker remains unharmed in AWAITING_TOOL_RESULTS
-    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(worker?.state).toBe("AWAITING_TOOL_RESULTS");
   });
 
@@ -700,37 +642,26 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Steer test",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Steer test", tools, sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     let toolCallId = "";
-    for await (const event of coordinator.executeTurn(testAccount, req1, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req1, selection)) {
       if (event.type === "tool_use") toolCallId = event.id;
     }
 
     // Turn 2 with tool_result AND steering text
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Steer test",
-      messages: [
+    const req2 = makeReq(
+      [
         ...req1.messages,
         {
           role: "assistant",
@@ -759,15 +690,11 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Steer test", tools, sessionId },
+    );
 
     const events2: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req2, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req2, selection)) {
       events2.push(event);
     }
 
@@ -834,30 +761,20 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("8. Thinking accumulation and synthetic thinking signature", async () => {
     const sessionId = `test-think-${Date.now()}`;
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Think test",
-      messages: [
+    const req = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_THINKING" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: true,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Think test", thinkingEnabled: true, sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-      effort: "medium",
-    };
+    const selection = sel("gemini-3.8-flash", "medium");
 
     const events: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req, selection)) {
       events.push(event);
     }
 
@@ -870,29 +787,20 @@ describe("Runtime Sessions & Coordinator Integration", () => {
   });
 
   test("9. Stateless request (sessionId === null) runs on ephemeral worker", async () => {
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Stateless test",
-      messages: [
+    const req = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Stateless prompt" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId: null,
-    };
+      { model: "gemini-3.8-flash", system: "Stateless test" },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     const events: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req, selection)) {
       events.push(event);
     }
 
@@ -901,14 +809,12 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(finish?.type === "finish" && finish.stopReason).toBe("end_turn");
 
     // Worker was ephemeral and closed
-    expect(coordinator.getActiveWorker(`${testAccount.slotKey}::null`)).toBeUndefined();
+    expect(coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::null`)).toBeUndefined();
   });
 
   test("10. Orphan tool_result is rejected up front with 400", async () => {
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Orphan test",
-      messages: [
+    const req = makeReq(
+      [
         {
           role: "user",
           content: [
@@ -921,21 +827,18 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId: `test-orphan-${Date.now()}`,
-    };
+      {
+        model: "gemini-3.8-flash",
+        system: "Orphan test",
+        sessionId: `test-orphan-${Date.now()}`,
+      },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     let caught: any = null;
     try {
-      for await (const _ of coordinator.executeTurn(testAccount, req, sel)) {}
+      for await (const _ of coordinator.executeTurn(testAccount, req, selection)) {}
     } catch (err) {
       caught = err;
     }
@@ -947,29 +850,20 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("11. Error marker withholding and rate-limit diagnosis", async () => {
     const sessionId = `test-err-${Date.now()}`;
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Error test",
-      messages: [
+    const req = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_ERROR_TERMINATION" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Error test", sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     const events: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req, selection)) {
       events.push(event);
     }
 
@@ -987,30 +881,21 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("12. Nested session/update envelope parsing and session ID filtering", async () => {
     const sessionId = `test-nested-${Date.now()}`;
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "",
-      messages: [
+    const req = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "Hello nested" }] },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
     const events: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req, selection)) {
       events.push(event);
     }
 
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker).toBeDefined();
 
@@ -1030,24 +915,15 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("13. Streaming turn commits committedMessages before yielding finish (SSE consumer early exit)", async () => {
     const sessionId = `test-commit-before-finish-${Date.now()}`;
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "",
-      messages: [
+    const req = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "Commits early" }] },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
-    const generator = coordinator.executeTurn(testAccount, req, sel);
+    const generator = coordinator.executeTurn(testAccount, req, selection);
     for await (const event of generator) {
       if (event.type === "finish") {
         // Break immediately on finish (same as encodeAnthropicSseResponse calling iterator.return())
@@ -1056,7 +932,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     }
 
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     );
     expect(worker).toBeDefined();
     expect(worker!.committedMessages.length).toBe(2);
@@ -1080,28 +956,19 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "",
-      messages: [
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "TRIGGER_CANCEL_TEST" }] },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", tools, sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
     const controller = new AbortController();
     const gen1 = coordinator.executeTurn(
       testAccount,
       req1,
-      sel,
+      selection,
       undefined,
       controller.signal,
     );
@@ -1110,27 +977,21 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     for await (const _ of gen1) {}
 
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     );
     expect(worker?.state).toBe("IDLE");
 
     // Turn 2 on same session triggers a tool call: openTurnWindow must ensure tool is exposed
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "",
-      messages: [
+    const req2 = makeReq(
+      [
         ...worker!.committedMessages,
         { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", tools, sessionId },
+    );
 
     const events2: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req2, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req2, selection)) {
       events2.push(event);
     }
 
@@ -1144,24 +1005,17 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("15. worker.close() unregisters from LoopbackMcpServer and sessionLocks map cleans up", async () => {
     const sessionId = `test-cleanup-${Date.now()}`;
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "",
-      messages: [
+    const req = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "Cleanup test" }] },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
+    const sessions = (mcpServer as any).sessions as Map<string, unknown>;
+    const before = new Set(sessions.keys());
 
-    for await (const _ of coordinator.executeTurn(testAccount, req, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req, selection)) {}
 
     const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
     // sessionLocks map must be cleaned up after turn finishes
@@ -1169,40 +1023,34 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
     const worker = coordinator.getActiveWorker(sessionKey)!;
     expect(worker).toBeDefined();
-    const token = (worker as any).mcpToken;
-    expect(token).toBeDefined();
-    expect((mcpServer as any).sessions.has(token)).toBe(true);
+    // The MCP registration token is no longer exposed on the worker, so the
+    // token this worker just registered is the one that appeared in the server.
+    const registered = [...sessions.keys()].filter((t) => !before.has(t));
+    expect(registered.length).toBeGreaterThanOrEqual(1);
+    const token = registered[0]!;
+    expect(sessions.has(token)).toBe(true);
 
     // Close worker
     await worker.close("manual_test_close");
 
     // Must be unregistered from LoopbackMcpServer
-    expect((mcpServer as any).sessions.has(token)).toBe(false);
+    expect(sessions.has(token)).toBe(false);
   });
 
   test("16. Re-authenticated account mismatch retires old worker instead of reusing", async () => {
     const sessionId = `test-reauth-${Date.now()}`;
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "",
-      messages: [
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "First account" }] },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
-    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req1, selection)) {}
 
     const worker1 = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker1).toBeDefined();
     expect(worker1.account.accountRef).toBe(testAccount.accountRef);
@@ -1220,14 +1068,14 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       ],
     };
 
-    for await (const _ of coordinator.executeTurn(reauthAccount, req2, sel)) {}
+    for await (const _ of coordinator.executeTurn(reauthAccount, req2, selection)) {}
 
     // worker1 should have been closed with account_mismatch
     expect(worker1.state).toBe("CLOSED");
 
     // New active worker has the new accountRef
     const worker2 = coordinator.getActiveWorker(
-      `${reauthAccount.slotKey}::${sessionId}`,
+      `${reauthAccount.slotKey}::${reauthAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker2).toBeDefined();
     expect(worker2.account.accountRef).toBe(reauthAccount.accountRef);
@@ -1235,52 +1083,43 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("17. Rotating x-anthropic-billing-header: cch=... across turns reuses the warm worker (0 session resets!)", async () => {
     const sessionId = `test-billing-${Date.now()}`;
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system:
-        "x-anthropic-billing-header: cch=1111aaaa;\nYou are a helpful coding assistant.",
-      messages: [
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "Hello turn 1" }] },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      {
+        model: "gemini-3.8-flash",
+        system: "x-anthropic-billing-header: cch=1111aaaa;\nYou are a helpful coding assistant.",
+        sessionId,
+      },
+    );
+    const selection = sel("gemini-3.8-flash");
 
-    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req1, selection)) {}
 
     const worker1 = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker1).toBeDefined();
     expect(worker1.state).toBe("IDLE");
 
     // Turn 2 has a DIFFERENT cch hash on the billing header
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system:
-        "x-anthropic-billing-header: cch=2222bbbb;\nYou are a helpful coding assistant.",
-      messages: [
+    const req2 = makeReq(
+      [
         ...worker1.committedMessages,
         { role: "user", content: [{ type: "text", text: "Hello turn 2" }] },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      {
+        model: "gemini-3.8-flash",
+        system: "x-anthropic-billing-header: cch=2222bbbb;\nYou are a helpful coding assistant.",
+        sessionId,
+      },
+    );
 
-    for await (const _ of coordinator.executeTurn(testAccount, req2, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req2, selection)) {}
 
     const worker2 = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker2).toBe(worker1); // Reused identical warm worker, 0 resets!
     expect(worker1.state).toBe("IDLE");
@@ -1296,28 +1135,19 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         inputSchema: { type: "object" },
       },
     ];
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Test reminders",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", system: "Test reminders", tools, sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
     const events1: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req1, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req1, selection)) {
       events1.push(ev);
     }
     const toolUse1 = events1.find((e) => e.type === "tool_use") as any;
@@ -1325,7 +1155,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const toolCallId1 = toolUse1.id;
 
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker.state).toBe("AWAITING_TOOL_RESULTS");
 
@@ -1352,7 +1182,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       ],
     };
     const events2: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req2, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req2, selection)) {
       events2.push(ev);
     }
     expect(worker.state).toBe("IDLE");
@@ -1370,7 +1200,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       ],
     };
     const events3: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req3, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req3, selection)) {
       events3.push(ev);
     }
     const toolUse3 = events3.find((e) => e.type === "tool_use") as any;
@@ -1400,7 +1230,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       ],
     };
     const events4: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req4, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req4, selection)) {
       events4.push(ev);
     }
     expect(worker.state).toBe("IDLE");
@@ -1417,28 +1247,19 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         inputSchema: { type: "object" },
       },
     ];
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Key ordering test",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", system: "Key ordering test", tools, sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
     const events1: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req1, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req1, selection)) {
       events1.push(ev);
     }
     const toolUse1 = events1.find((e) => e.type === "tool_use") as any;
@@ -1446,7 +1267,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const toolCallId = toolUse1.id;
 
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker.state).toBe("AWAITING_TOOL_RESULTS");
 
@@ -1488,7 +1309,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     };
 
     const events: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req2, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req2, selection)) {
       events.push(ev);
     }
     expect(worker.state).toBe("IDLE");
@@ -1498,27 +1319,18 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("20. Assistant prefill merges onto a single assistant message in committedMessages and reuses warm session on Turn N+1", async () => {
     const sessionId = `test-prefill-${Date.now()}`;
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Prefill test",
-      messages: [
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "What is 2+2?" }] },
         { role: "assistant", content: [{ type: "text", text: "Answer: " }] },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", system: "Prefill test", sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
-    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req1, selection)) {}
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker).toBeDefined();
 
@@ -1539,9 +1351,9 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       ],
     };
 
-    for await (const _ of coordinator.executeTurn(testAccount, req2, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req2, selection)) {}
     const worker2 = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker2).toBe(worker); // Warm reuse!
     expect(worker.state).toBe("IDLE");
@@ -1565,35 +1377,26 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       );
     }
 
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Budget test",
-      messages: [
+    const req = makeReq(
+      [
         ...priorMessages,
         {
           role: "user",
           content: [{ type: "text", text: "TARGET_CURRENT_TURN_PROMPT" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+      { model: "gemini-3.8-flash", system: "Budget test", sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
     let finishEvent: any = null;
-    for await (const ev of coordinator.executeTurn(testAccount, req, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req, selection)) {
       if (ev.type === "finish") finishEvent = ev;
     }
     expect(finishEvent).toBeDefined();
 
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker).toBeDefined();
     expect(worker.state).toBe("IDLE");
@@ -1661,50 +1464,40 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const tools = [
       { name: "bash", description: "Bash", inputSchema: { type: "object" } },
     ];
-    const reqMain: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Main tool session",
-      messages: [{ role: "user", content: [{ type: "text", text: "Start" }] }],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const reqMain = makeReq(
+      [{ role: "user", content: [{ type: "text", text: "Start" }] }],
+      { model: "gemini-3.8-flash", system: "Main tool session", tools, sessionId },
+    );
+    const selection = sel("gemini-3.8-flash");
 
-    for await (const _ of coordinator.executeTurn(sideAccount, reqMain, sel)) {}
+    for await (const _ of coordinator.executeTurn(sideAccount, reqMain, selection)) {}
     const mainWorker = coordinator.getActiveWorker(
-      `${sideAccount.slotKey}::${sessionId}`,
+      `${sideAccount.slotKey}::${sideAccount.accountRef}::${sessionId}`,
     )!;
     expect(mainWorker).toBeDefined();
     expect(mainWorker.state).toBe("IDLE");
     expect(mainWorker.registeredTools.length).toBe(1);
 
     // Send title side-request with tools: [] and completely different question
-    const reqTitle: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Title generator",
-      messages: [
+    const reqTitle = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Generate a short title" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "none" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    for await (const _ of coordinator.executeTurn(sideAccount, reqTitle, sel)) {}
+      {
+        model: "gemini-3.8-flash",
+        system: "Title generator",
+        toolChoice: { type: "none" },
+        sessionId,
+      },
+    );
+    for await (const _ of coordinator.executeTurn(sideAccount, reqTitle, selection)) {}
 
     // The main worker is STILL active and IDLE! Not evicted or closed!
     const checkWorker = coordinator.getActiveWorker(
-      `${sideAccount.slotKey}::${sessionId}`,
+      `${sideAccount.slotKey}::${sideAccount.accountRef}::${sessionId}`,
     )!;
     expect(checkWorker).toBe(mainWorker);
     expect(mainWorker.state).toBe("IDLE");
@@ -1770,13 +1563,13 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
     let workerCount = 0;
     const spawnDelayedCancel = (
-      account: AccountDescriptor,
-      args: string[],
+      _account: AccountDescriptor,
+      _args: string[],
       opts?: any,
     ) => {
       workerCount++;
       const currentWorkerNum = workerCount;
-      const child = spawn("bun", ["run", fakeAcpPath], {
+      const child = spawn("bun", ["run", FAKE_ACP_PATH], {
         cwd: opts?.cwd,
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -1785,7 +1578,6 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         const origStdout = child.stdout;
         const origStdin = child.stdin;
         let promptId: any = null;
-        let cancelSeen = false;
 
         const origWrite = origStdin.write.bind(origStdin);
         (origStdin as any).write = (chunk: any, ...writeArgs: any[]) => {
@@ -1793,7 +1585,6 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           try {
             const parsed = JSON.parse(str.trim());
             if (parsed.method === "session/prompt") promptId = parsed.id;
-            if (parsed.method === "session/cancel") cancelSeen = true;
           } catch {}
           return (origWrite as any)(chunk, ...writeArgs);
         };
@@ -1824,46 +1615,35 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       return child;
     };
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Steer cancel delay test",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Steer cancel delay test", tools, sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     // Turn 1 leaves worker in AWAITING_TOOL_RESULTS with call_weather_1
     const events1: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req1, sel, {
+    for await (const ev of coordinator.executeTurn(testAccount, req1, selection, {
       spawnFn: spawnDelayedCancel,
     })) {
       events1.push(ev);
     }
     const toolUse = events1.find((e) => e.type === "tool_use");
     expect(toolUse).toBeDefined();
-    const worker1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(worker1?.state).toBe("AWAITING_TOOL_RESULTS");
 
     // Turn 2: Provide tool_result AND a steering message with steerCancelTimeoutMs: 50
     // Because worker 1 delays response on cancel, oldPromptPromise will not settle within 50ms.
     // Worker 1 should be retired via SteerReplayNeededError and the request replayed on fresh Worker 2!
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Steer cancel delay test",
-      messages: [
+    const req2 = makeReq(
+      [
         ...req1.messages,
         {
           role: "assistant",
@@ -1885,15 +1665,11 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Steer cancel delay test", tools, sessionId },
+    );
 
     const events2: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req2, sel, {
+    for await (const ev of coordinator.executeTurn(testAccount, req2, selection, {
       spawnFn: spawnDelayedCancel,
       steerCancelTimeoutMs: 50,
     })) {
@@ -1907,7 +1683,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(worker1?.state).toBe("CLOSED");
 
     // And active worker is a new fresh worker (worker 2)
-    const worker2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(worker2).toBeDefined();
     expect(worker2).not.toBe(worker1);
 
@@ -1929,30 +1705,21 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Late sibling steer test",
-      messages: [
+    const req1 = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "Please TRIGGER_LATE_SIBLING" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Late sibling steer test", tools, sessionId },
+    );
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     // Turn 1
     const events1: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req1, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req1, selection)) {
       events1.push(event);
     }
 
@@ -1964,14 +1731,12 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     // Wait slightly so late sibling call_late_2 arrives in broker
     await new Promise((r) => setTimeout(r, 120));
 
-    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(worker?.broker.hasPendingWork()).toBe(true);
 
     // Turn 2: User provides tool_result for call 1 AND a steering message
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Late sibling steer test",
-      messages: [
+    const req2 = makeReq(
+      [
         ...req1.messages,
         {
           role: "assistant",
@@ -1993,15 +1758,11 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Late sibling steer test", tools, sessionId },
+    );
 
     const events2: TurnStreamEvent[] = [];
-    for await (const event of coordinator.executeTurn(testAccount, req2, sel)) {
+    for await (const event of coordinator.executeTurn(testAccount, req2, selection)) {
       events2.push(event);
     }
 
@@ -2030,44 +1791,33 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     // Turn 1 with 3 messages so worker has 4 committed messages
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Compaction test",
-      messages: [
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "What is your name?" }] },
         { role: "assistant", content: [{ type: "text", text: "I am Magpie." }] },
         { role: "user", content: [{ type: "text", text: "Please TRIGGER_TOOL_CALL" }] },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Compaction test", tools, sessionId },
+    );
 
     const events1: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req1, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req1, selection)) {
       events1.push(ev);
     }
     const toolUse = events1.find((e) => e.type === "tool_use");
     expect(toolUse).toBeDefined();
 
-    const worker1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(worker1?.state).toBe("AWAITING_TOOL_RESULTS");
     expect(worker1?.committedMessages.length).toBe(4);
 
     // Turn 2: Pi auto-compacted transcript arriving while worker is AWAITING_TOOL_RESULTS!
     // Shorter transcript (3 messages < 4 committed) with <summary>
-    const reqCompacted: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Compaction test",
-      messages: [
+    const reqCompacted = makeReq(
+      [
         {
           role: "user",
           content: [
@@ -2093,15 +1843,11 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Compaction test", tools, sessionId },
+    );
 
     const events2: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, reqCompacted, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, reqCompacted, selection)) {
       events2.push(ev);
     }
 
@@ -2112,7 +1858,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(worker1?.state).toBe("CLOSED");
 
     // A fresh worker was spawned and is active
-    const worker2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(worker2).toBeDefined();
     expect(worker2).not.toBe(worker1);
 
@@ -2129,32 +1875,23 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Whitespace strip test",
-      messages: [
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Whitespace strip test", tools, sessionId },
+    );
 
     const events1: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req1, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req1, selection)) {
       events1.push(ev);
     }
     const toolUse = events1.find((e) => e.type === "tool_use");
     expect(toolUse).toBeDefined();
 
-    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(worker?.state).toBe("AWAITING_TOOL_RESULTS");
 
     // Simulate that Turn 1 assistant message committed whitespace-only block before tool_use
@@ -2170,10 +1907,8 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     ];
 
     // Pi's anthropic-messages.js stripped the whitespace block "\n\n", sending ONLY tool_use:
-    const req2: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Whitespace strip test",
-      messages: [
+    const req2 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
         {
           role: "assistant",
@@ -2191,16 +1926,12 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           ],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Whitespace strip test", tools, sessionId },
+    );
 
     // Should NOT throw 409!
     const events2: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req2, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req2, selection)) {
       events2.push(ev);
     }
 
@@ -2213,33 +1944,24 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("29. Standalone <conversation>200KB...</conversation>\\nSummarize the above. compaction prompt -> clips inside <conversation> while keeping Summarize the above. intact under 112 KiB", async () => {
     const sessionId = `test-standalone-compaction-${Date.now()}`;
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     const bigBody = "Conversation text line. ".repeat(8 * 1024); // ~200 KiB
     const fullText = `<conversation>\n${bigBody}\n</conversation>\nSummarize the above.`;
     expect(Buffer.byteLength(fullText, "utf-8")).toBeGreaterThan(150 * 1024);
 
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Compaction prompt test",
-      messages: [
+    const req = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: fullText }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Compaction prompt test", sessionId },
+    );
 
     const events: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req, selection)) {
       events.push(ev);
     }
 
@@ -2255,7 +1977,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(textDeltas).toContain("...[truncated middle for prompt budget]...");
     expect(textDeltas).toContain("</conversation>\nSummarize the above.");
 
-    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     await worker?.close("test_done");
   });
 
@@ -2283,24 +2005,15 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       spawnFn: spawnFakeAcp,
     });
     const sessionId = `test-oversized-park-${Date.now()}`;
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "test",
-      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    for await (const _ of localCoord.executeTurn(testAccount, req, sel)) {
+    const selection = sel("gemini-3.8-flash");
+    const req = makeReq(
+      [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      { model: "gemini-3.8-flash", system: "test", sessionId },
+    );
+    for await (const _ of localCoord.executeTurn(testAccount, req, selection)) {
       // consume
     }
-    const w = localCoord.getActiveWorker(`${testAccount.slotKey}::${sessionId}`)!;
+    const w = localCoord.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`)!;
     expect(w).toBeDefined();
     // Simulate a 5 MiB base64 image in committedMessages
     w.committedMessages.push({
@@ -2310,7 +2023,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     w.lastActivityAt = Date.now() - 1_000;
     const reaped = await localScheduler.reapIdleWorkers();
     expect(reaped).toBe(1);
-    expect((localCoord as any).parkedSessions.size).toBe(0);
+    expect(localCoord.shelf.memorySessions.size).toBe(0);
     localScheduler.destroy();
 
     // 3. Real child host calling process.exit(0) kills its agy worker and deletes workspaceDir
@@ -2324,7 +2037,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         getSharedMcpServer(),
         {
           spawnFn: (_acc, _args, opts) =>
-            spawn("bun", ["run", ${JSON.stringify(fakeAcpPath)}], {
+            spawn("bun", ["run", ${JSON.stringify(FAKE_ACP_PATH)}], {
               cwd: opts?.cwd,
               stdio: ["pipe", "pipe", "pipe"],
             }),
@@ -2364,27 +2077,22 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     defaultSched.destroy();
 
     const sessionId = `test-minimal-switch-${Date.now()}`;
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Stay concise.",
-      messages: [{ role: "user", content: [{ type: "text", text: "turn 1" }] }],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-      workDir: "/Users/example/project",
-    };
+    const req1 = makeReq(
+      [{ role: "user", content: [{ type: "text", text: "turn 1" }] }],
+      {
+        model: "gemini-3.8-flash",
+        system: "Stay concise.",
+        sessionId,
+        workDir: "/Users/example/project",
+      },
+    );
 
     for await (const _ of coordinator.executeTurn(
       testAccount,
       req1,
-      sel,
+      selection,
       {
         providerOptions: {
           quotaRouting: false,
@@ -2397,7 +2105,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       // consume
     }
 
-    const w1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const w1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(w1).toBeDefined();
     expect(w1?.minimalAgent).toBe(false);
     expect(w1?.effectiveSystemPrompt).toContain("where every tool runs");
@@ -2416,7 +2124,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     for await (const _ of coordinator.executeTurn(
       testAccount,
       req2,
-      sel,
+      selection,
       {
         providerOptions: {
           quotaRouting: false,
@@ -2429,7 +2137,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       // consume
     }
 
-    const w2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const w2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(w1?.state).toBe("CLOSED");
     expect(w2).toBeDefined();
     expect(w2).not.toBe(w1);
@@ -2449,10 +2157,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       spawnFn: spawnFakeAcp,
     });
     const sessionId = `test-side-prefix-${Date.now()}`;
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
     const tools = [
       {
         name: "read",
@@ -2461,21 +2166,15 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       },
     ];
 
-    const mainReq: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Main coding session",
-      messages: [{ role: "user", content: [{ type: "text", text: "Hello main" }] }],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+    const mainReq = makeReq(
+      [{ role: "user", content: [{ type: "text", text: "Hello main" }] }],
+      { model: "gemini-3.8-flash", system: "Main coding session", tools, sessionId },
+    );
     let mainReply = "";
-    for await (const ev of sideCoord.executeTurn(testAccount, mainReq, sel)) {
+    for await (const ev of sideCoord.executeTurn(testAccount, mainReq, selection)) {
       if (ev.type === "text_delta") mainReply += ev.text;
     }
-    const mainWorker = sideCoord.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    const mainWorker = sideCoord.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`);
     expect(mainWorker).toBeDefined();
     const committedBefore = mainWorker!.committedMessages.length;
 
@@ -2490,10 +2189,10 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       tools: [],
       toolChoice: { type: "auto" },
     };
-    for await (const _ of sideCoord.executeTurn(testAccount, sideMatchingNoTools, sel)) {
+    for await (const _ of sideCoord.executeTurn(testAccount, sideMatchingNoTools, selection)) {
       // consume
     }
-    expect(sideCoord.getActiveWorker(`${testAccount.slotKey}::${sessionId}`)).toBe(mainWorker);
+    expect(sideCoord.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`)).toBe(mainWorker);
     expect(mainWorker!.state).toBe("IDLE");
     expect(mainWorker!.committedMessages.length).toBe(committedBefore);
 
@@ -2503,10 +2202,10 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       tools,
       toolChoice: { type: "none" },
     };
-    for await (const _ of sideCoord.executeTurn(testAccount, sideToolChoiceNone, sel)) {
+    for await (const _ of sideCoord.executeTurn(testAccount, sideToolChoiceNone, selection)) {
       // consume
     }
-    expect(sideCoord.getActiveWorker(`${testAccount.slotKey}::${sessionId}`)).toBe(mainWorker);
+    expect(sideCoord.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`)).toBe(mainWorker);
     expect(mainWorker!.state).toBe("IDLE");
     expect(mainWorker!.committedMessages.length).toBe(committedBefore);
 
@@ -2525,10 +2224,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       mcpServer,
       spawnFn: spawnFakeAcp,
     });
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
     const tools = [
       {
         name: "get_weather",
@@ -2540,31 +2236,30 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const turn1SessionId = `magpie-turn1-${Date.now()}`;
     const turn2SessionId = `magpie-turn2-${Date.now()}`;
 
-    const turn1Req: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Tool re-key test",
-      messages: [
+    const turn1Req = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_TOOL_CALL please" }],
         },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId: turn1SessionId,
-    };
+      {
+        model: "gemini-3.8-flash",
+        system: "Tool re-key test",
+        tools,
+        sessionId: turn1SessionId,
+      },
+    );
 
     let emittedToolCall: any = null;
-    for await (const ev of tightCoord.executeTurn(testAccount, turn1Req, sel)) {
+    for await (const ev of tightCoord.executeTurn(testAccount, turn1Req, selection)) {
       if (ev.type === "tool_use") emittedToolCall = ev;
     }
     expect(emittedToolCall).toBeDefined();
     expect(tightSched.getActiveCount()).toBe(1);
 
     const turn1Worker = tightCoord.getActiveWorker(
-      `${testAccount.slotKey}::${turn1SessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${turn1SessionId}`,
     );
     expect(turn1Worker).toBeDefined();
     expect(turn1Worker!.state).toBe("AWAITING_TOOL_RESULTS");
@@ -2602,16 +2297,16 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     };
 
     let turn2Text = "";
-    for await (const ev of tightCoord.executeTurn(testAccount, turn2Req, sel)) {
+    for await (const ev of tightCoord.executeTurn(testAccount, turn2Req, selection)) {
       if (ev.type === "text_delta") turn2Text += ev.text;
     }
     expect(turn2Text).toContain("68F sunny");
     expect(tightSched.getActiveCount()).toBe(1);
     expect(
-      tightCoord.getActiveWorker(`${testAccount.slotKey}::${turn1SessionId}`),
+      tightCoord.getActiveWorker(`${testAccount.slotKey}::${testAccount.accountRef}::${turn1SessionId}`),
     ).toBeUndefined();
     const rekeyedWorker = tightCoord.getActiveWorker(
-      `${testAccount.slotKey}::${turn2SessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${turn2SessionId}`,
     );
     expect(rekeyedWorker).toBe(turn1Worker);
     expect(rekeyedWorker!.sessionId).toBe(turn2SessionId);
@@ -2643,29 +2338,20 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       );
     }
 
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-4-hydrogen",
-      system: "Large history spillover test",
-      messages: [
+    const req = makeReq(
+      [
         ...priorMessages,
         {
           role: "user",
           content: [{ type: "text", text: "INSPECT_SYSTEM_APPEND final question" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-4-hydrogen",
-      configModelValue: "gemini-4-hydrogen",
-    };
+      { model: "gemini-4-hydrogen", system: "Large history spillover test", sessionId },
+    );
+    const selection = sel("gemini-4-hydrogen");
 
     let reply = "";
-    for await (const ev of coordinator.executeTurn(testAccount, req, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req, selection)) {
       if (ev.type === "text_delta") reply += ev.text;
     }
 
@@ -2677,7 +2363,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(reply).not.toContain("[... omitted ");
 
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker.systemHistorySeedApplied).toBe(true);
     expect(Buffer.byteLength(reply, "utf-8")).toBeLessThan(120 * 1024);
@@ -2701,33 +2387,24 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       );
     }
 
-    const req: NormalizedAnthropicRequest = {
-      model: "gemini-4-hydrogen",
-      system: "Seed cap test",
-      messages: [
+    const req = makeReq(
+      [
         ...priorMessages,
         {
           role: "user",
           content: [{ type: "text", text: "SEED_CAP final question" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    const sel: ModelSelection = {
-      rawModelId: "gemini-4-hydrogen",
-      configModelValue: "gemini-4-hydrogen",
-    };
+      { model: "gemini-4-hydrogen", system: "Seed cap test", sessionId },
+    );
+    const selection = sel("gemini-4-hydrogen");
 
-    for await (const _ev of coordinator.executeTurn(testAccount, req, sel)) {
+    for await (const _ev of coordinator.executeTurn(testAccount, req, selection)) {
       // drain
     }
 
     const worker = coordinator.getActiveWorker(
-      `${testAccount.slotKey}::${sessionId}`,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`,
     )!;
     expect(worker.systemHistorySeedApplied).toBe(true);
     const seed = worker.appliedSystemHistorySeed ?? "";
@@ -2754,11 +2431,8 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const SECRET_ONLY_IN_TURN_1 = "nebula-99";
     const SYSTEM_PROMPT_TEXT = "PERSISTED_SYSTEM_PROMPT_SECRET_LINE";
     const sessionId = `test-persist-resume-${Date.now()}`;
-    const sessionKey = `${testAccount.slotKey}::${sessionId}`;
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
+    const selection = sel("gemini-3.8-flash");
 
     const schedA = new GlobalScheduler({
       maxGlobalWorkers: 2,
@@ -2778,19 +2452,17 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         role: "user",
         content: [{ type: "text", text: `Turn 1 secret ${SECRET_ONLY_IN_TURN_1}` }],
       };
-      const turn1Req: NormalizedAnthropicRequest = {
-        model: "gemini-3.8-flash",
-        system: `You are a helpful agent.\n${SYSTEM_PROMPT_TEXT}`,
-        messages: [turn1User],
-        tools: [],
-        toolChoice: { type: "auto" },
-        stream: true,
-        thinkingEnabled: false,
-        sessionId,
-      };
+      const turn1Req = makeReq(
+        [turn1User],
+        {
+          model: "gemini-3.8-flash",
+          system: `You are a helpful agent.\n${SYSTEM_PROMPT_TEXT}`,
+          sessionId,
+        },
+      );
 
       let turn1Answer = "";
-      for await (const ev of coordA.executeTurn(testAccount, turn1Req, sel)) {
+      for await (const ev of coordA.executeTurn(testAccount, turn1Req, selection)) {
         if (ev.type === "text_delta") turn1Answer += ev.text;
       }
       expect(turn1Answer).toContain(SECRET_ONLY_IN_TURN_1);
@@ -2831,7 +2503,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         mcpServer,
         spawnFn: spawnFakeAcp,
       });
-      expect((coordB as any).parkedSessions.size).toBe(0);
+      expect(coordB.shelf.memorySessions.size).toBe(0);
 
       // 4. Turn 2 resumes the exact native session and only sends the delta.
       const turn2Req: NormalizedAnthropicRequest = {
@@ -2847,7 +2519,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       };
 
       let turn2Answer = "";
-      for await (const ev of coordB.executeTurn(testAccount, turn2Req, sel)) {
+      for await (const ev of coordB.executeTurn(testAccount, turn2Req, selection)) {
         if (ev.type === "text_delta") turn2Answer += ev.text;
       }
 
@@ -2874,11 +2546,11 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       );
       try {
         process.env.AGY_ACP_DATA_DIR = otherDataDir;
-        (coordB as any).ensurePersistedSessionsLoaded();
-        expect(
-          (coordB as any).persistedSessionsFile,
-        ).toBe(path.join(otherDataDir, "parked-sessions.json"));
-        expect((coordB as any).persistedSessions.size).toBe(0);
+        coordB.shelf.ensureLoaded();
+        expect(coordB.shelf.loadedFile).toBe(
+          path.join(otherDataDir, "parked-sessions.json"),
+        );
+        expect(coordB.shelf.persistedSessionsMap.size).toBe(0);
       } finally {
         process.env.AGY_ACP_DATA_DIR = dataDir;
         fs.rmSync(otherDataDir, { recursive: true, force: true });
@@ -2924,27 +2596,18 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       spawnFn: spawnCounted,
     });
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
     const sessionId = `test-high2-error-${Date.now()}`;
-    const sessionKey = `${testAccount.slotKey}::${sessionId}`;
-    const errorReq: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Error retirement test",
-      messages: [
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
+    const errorReq = makeReq(
+      [
         {
           role: "user",
           content: [{ type: "text", text: "TRIGGER_ERROR_TERMINATION" }],
         },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Error retirement test", sessionId },
+    );
 
     try {
       // 1. The non-streaming JSON encoder returns immediately on `{ type: "error" }`,
@@ -2952,7 +2615,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       //    post-loop retirement code.
       const jsonRes = await collectAnthropicJsonResponse(
         "gemini-3.8-flash",
-        errCoord.executeTurn(testAccount, errorReq, sel),
+        errCoord.executeTurn(testAccount, errorReq, selection),
       );
       expect(jsonRes.status).toBeGreaterThanOrEqual(400);
       expect(spawnCount).toBe(1);
@@ -2962,7 +2625,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       // 2. The SSE encoder treats a pre-stream error the same way (source.close()).
       const sseRes = await encodeAnthropicSseResponse(
         "gemini-3.8-flash",
-        errCoord.executeTurn(testAccount, errorReq, sel),
+        errCoord.executeTurn(testAccount, errorReq, selection),
       );
       expect(sseRes.status).toBeGreaterThanOrEqual(400);
       expect(spawnCount).toBe(2);
@@ -2977,7 +2640,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         ],
       };
       let answer = "";
-      for await (const ev of errCoord.executeTurn(testAccount, okReq, sel)) {
+      for await (const ev of errCoord.executeTurn(testAccount, okReq, selection)) {
         if (ev.type === "text_delta") answer += ev.text;
       }
       expect(answer).toContain("Hello after the error");
@@ -3004,10 +2667,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const SECRET = "nebula-42";
     const sessionId = `test-high3-${Date.now()}`;
     const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
 
     const schedA = new GlobalScheduler({
       maxGlobalWorkers: 2,
@@ -3027,18 +2687,12 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         role: "user",
         content: [{ type: "text", text: `Turn 1 secret ${SECRET}` }],
       };
-      const turn1Req: NormalizedAnthropicRequest = {
-        model: "gemini-3.8-flash",
-        system: "Competing resume sources test",
-        messages: [turn1User],
-        tools: [],
-        toolChoice: { type: "auto" },
-        stream: true,
-        thinkingEnabled: false,
-        sessionId,
-      };
+      const turn1Req = makeReq(
+        [turn1User],
+        { model: "gemini-3.8-flash", system: "Competing resume sources test", sessionId },
+      );
       let turn1Answer = "";
-      for await (const ev of coordA.executeTurn(testAccount, turn1Req, sel)) {
+      for await (const ev of coordA.executeTurn(testAccount, turn1Req, selection)) {
         if (ev.type === "text_delta") turn1Answer += ev.text;
       }
       const workerA = coordA.getActiveWorker(sessionKey)!;
@@ -3060,17 +2714,19 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         mcpServer,
         spawnFn: spawnFakeAcp,
       });
-      (coordB as any).ensurePersistedSessionsLoaded();
-      const persisted = (coordB as any).persistedSessions.get(sessionKey);
+      coordB.shelf.ensureLoaded();
+      const persisted = coordB.shelf.persistedSessionsMap.get(sessionKey);
       expect(persisted).toBeDefined();
       // [turn 1 user, turn 1 assistant]
-      expect(persisted.messageDigests.length).toBe(2);
+      expect(persisted!.messageDigests.length).toBe(2);
 
       // Competing source: a stale in-memory shelf entry from an older, LONGER
       // conversation under the same session key. It fails the prefix match, so
       // it must be dropped instead of donating its ledger and system seed.
-      (coordB as any).parkedSessions.set(sessionKey, {
+      coordB.shelf.memorySessions.set(sessionKey, {
         nativeSessionId: "stale-native-session-from-old-session-a",
+        slotKey: testAccount.slotKey,
+        accountRef: testAccount.accountRef,
         committedMessages: [
           {
             role: "user",
@@ -3101,7 +2757,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         ],
       };
       let turn2Answer = "";
-      for await (const ev of coordB.executeTurn(testAccount, turn2Req, sel)) {
+      for await (const ev of coordB.executeTurn(testAccount, turn2Req, selection)) {
         if (ev.type === "text_delta") turn2Answer += ev.text;
       }
 
@@ -3118,7 +2774,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       expect(workerB.nativeSessionId).toBe(nativeSessionId);
       expect(workerB.appliedSystemHistorySeed).toBeUndefined();
       expect(workerB.committedMessages.length).toBe(4);
-      expect((coordB as any).parkedSessions.has(sessionKey)).toBe(false);
+      expect(coordB.shelf.memorySessions.has(sessionKey)).toBe(false);
     } finally {
       if (prevDataDir === undefined) {
         delete process.env.AGY_ACP_DATA_DIR;
@@ -3141,7 +2797,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
   test("38. [MED-6] steering commit-barrier timeout raises SteerReplayNeededError and replays on a fresh session", async () => {
     const sessionId = `test-med6-steer-commit-${Date.now()}`;
-    const sessionKey = `${testAccount.slotKey}::${sessionId}`;
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
     const tools = [
       {
         name: "get_weather",
@@ -3152,13 +2808,13 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
     let workerCount = 0;
     const spawnNoCommit = (
-      account: AccountDescriptor,
-      args: string[],
+      _account: AccountDescriptor,
+      _args: string[],
       opts?: any,
     ) => {
       workerCount++;
       const currentWorker = workerCount;
-      const child = spawn("bun", ["run", fakeAcpPath], {
+      const child = spawn("bun", ["run", FAKE_ACP_PATH], {
         cwd: opts?.cwd,
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -3191,25 +2847,16 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       return child;
     };
 
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Steer commit barrier test",
-      messages: [
+    const selection = sel("gemini-3.8-flash");
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
+      { model: "gemini-3.8-flash", system: "Steer commit barrier test", tools, sessionId },
+    );
 
     const events1: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, req1, sel, {
+    for await (const ev of coordinator.executeTurn(testAccount, req1, selection, {
       spawnFn: spawnNoCommit,
     })) {
       events1.push(ev);
@@ -3243,7 +2890,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     let caught: any = null;
     const events2: TurnStreamEvent[] = [];
     try {
-      for await (const ev of coordinator.executeTurn(testAccount, req2, sel, {
+      for await (const ev of coordinator.executeTurn(testAccount, req2, selection, {
         spawnFn: spawnNoCommit,
         steerToolCommitTimeoutMs: 30,
       })) {
@@ -3267,27 +2914,17 @@ describe("Runtime Sessions & Coordinator Integration", () => {
   test("39. [MED-8] switching req.workDir invalidates warm IDLE / parked / AWAITING_TOOL_RESULTS reuse", async () => {
     const workDirA = "/Users/example/project-a";
     const workDirB = "/Users/example/project-b";
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
     const sessionId = `test-med8-workdir-${Date.now()}`;
     const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Workdir reuse test",
-      messages: [
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "workdir turn 1" }] },
       ],
-      tools: [],
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-      workDir: workDirA,
-    };
-    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+      { model: "gemini-3.8-flash", system: "Workdir reuse test", sessionId, workDir: workDirA },
+    );
+    for await (const _ of coordinator.executeTurn(testAccount, req1, selection)) {}
 
     const w1 = coordinator.getActiveWorker(sessionKey)!;
     expect(w1).toBeDefined();
@@ -3303,7 +2940,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         { role: "user", content: [{ type: "text", text: "workdir turn 2" }] },
       ],
     };
-    for await (const _ of coordinator.executeTurn(testAccount, req2, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req2, selection)) {}
     expect(coordinator.getActiveWorker(sessionKey)).toBe(w1);
     expect(w1.state).toBe("IDLE");
 
@@ -3317,7 +2954,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       ],
     };
     let text3 = "";
-    for await (const ev of coordinator.executeTurn(testAccount, req3, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, req3, selection)) {
       if (ev.type === "text_delta") text3 += ev.text;
     }
     expect(text3).toContain("workdir turn 3");
@@ -3331,7 +2968,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     // Parked/persisted reuse must require the same workDir too.
     (coordinator as any).parkSession(w3);
     await w3.close("test39_park");
-    expect((coordinator as any).parkedSessions.get(sessionKey)?.workDir).toBe(
+    expect(coordinator.shelf.memorySessions.get(sessionKey)?.workDir).toBe(
       workDirB,
     );
 
@@ -3343,13 +2980,13 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         { role: "user", content: [{ type: "text", text: "workdir turn 4" }] },
       ],
     };
-    for await (const _ of coordinator.executeTurn(testAccount, req4, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req4, selection)) {}
     const w4 = coordinator.getActiveWorker(sessionKey)!;
     expect(w4).toBeDefined();
     expect(w4).not.toBe(w3);
     expect(w4.resumedFromShelf).toBe(false);
     expect(w4.workDir).toBe(workDirA);
-    expect((coordinator as any).parkedSessions.has(sessionKey)).toBe(false);
+    expect(coordinator.shelf.memorySessions.has(sessionKey)).toBe(false);
     await w4.close("test39_done");
 
     // AWAITING_TOOL_RESULTS: a workspace switch must retire instead of continuing.
@@ -3362,21 +2999,20 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         inputSchema: { type: "object" },
       },
     ];
-    const toolReq1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Workdir tool test",
-      messages: [
+    const toolReq1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
       ],
-      tools,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId: toolSessionId,
-      workDir: workDirA,
-    };
+      {
+        model: "gemini-3.8-flash",
+        system: "Workdir tool test",
+        tools,
+        sessionId: toolSessionId,
+        workDir: workDirA,
+      },
+    );
     let toolUse: any = null;
-    for await (const ev of coordinator.executeTurn(testAccount, toolReq1, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, toolReq1, selection)) {
       if (ev.type === "tool_use") toolUse = ev;
     }
     expect(toolUse).toBeDefined();
@@ -3403,7 +3039,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       ],
     };
     const toolEvents2: TurnStreamEvent[] = [];
-    for await (const ev of coordinator.executeTurn(testAccount, toolReq2, sel)) {
+    for await (const ev of coordinator.executeTurn(testAccount, toolReq2, selection)) {
       toolEvents2.push(ev);
     }
     expect(toolEvents2.some((e) => e.type === "finish")).toBe(true);
@@ -3416,10 +3052,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
   });
 
   test("40. [MED-9] a tool description change invalidates warm IDLE and parked reuse so `agy` re-fetches tools/list", async () => {
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
     const sessionId = `test-med9-tool-desc-${Date.now()}`;
     const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
     const inputSchema = {
@@ -3433,19 +3066,13 @@ describe("Runtime Sessions & Coordinator Integration", () => {
       { name: "get_weather", description: "Weather v2", inputSchema },
     ];
 
-    const req1: NormalizedAnthropicRequest = {
-      model: "gemini-3.8-flash",
-      system: "Tool description test",
-      messages: [
+    const req1 = makeReq(
+      [
         { role: "user", content: [{ type: "text", text: "tool description turn 1" }] },
       ],
-      tools: toolsV1,
-      toolChoice: { type: "auto" },
-      stream: true,
-      thinkingEnabled: false,
-      sessionId,
-    };
-    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+      { model: "gemini-3.8-flash", system: "Tool description test", tools: toolsV1, sessionId },
+    );
+    for await (const _ of coordinator.executeTurn(testAccount, req1, selection)) {}
     const w1 = coordinator.getActiveWorker(sessionKey)!;
     expect(w1).toBeDefined();
     expect(w1.registeredTools[0]!.description).toBe("Weather v1");
@@ -3459,7 +3086,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         { role: "user", content: [{ type: "text", text: "tool description turn 2" }] },
       ],
     };
-    for await (const _ of coordinator.executeTurn(testAccount, req2, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req2, selection)) {}
     expect(w1.state).toBe("CLOSED");
     const w2 = coordinator.getActiveWorker(sessionKey)!;
     expect(w2).toBeDefined();
@@ -3470,7 +3097,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     (coordinator as any).parkSession(w2);
     await w2.close("test40_park");
     expect(
-      (coordinator as any).parkedSessions.get(sessionKey)?.registeredTools[0]
+      coordinator.shelf.memorySessions.get(sessionKey)?.registeredTools[0]!
         .description,
     ).toBe("Weather v2");
 
@@ -3482,21 +3109,18 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         { role: "user", content: [{ type: "text", text: "tool description turn 3" }] },
       ],
     };
-    for await (const _ of coordinator.executeTurn(testAccount, req3, sel)) {}
+    for await (const _ of coordinator.executeTurn(testAccount, req3, selection)) {}
     const w3 = coordinator.getActiveWorker(sessionKey)!;
     expect(w3).toBeDefined();
     expect(w3).not.toBe(w2);
     expect(w3.resumedFromShelf).toBe(false);
     expect(w3.registeredTools[0]!.description).toBe("Weather v1");
-    expect((coordinator as any).parkedSessions.has(sessionKey)).toBe(false);
+    expect(coordinator.shelf.memorySessions.has(sessionKey)).toBe(false);
     await w3.close("test40_done");
   });
 
   test("41. Cancelling an unread tool_use SSE response retires the worker and cross-session adoption respects workDir", async () => {
-    const sel: ModelSelection = {
-      rawModelId: "gemini-3.8-flash",
-      configModelValue: "gemini-3.8-flash",
-    };
+    const selection = sel("gemini-3.8-flash");
     const tools = [
       {
         name: "get_weather",
@@ -3522,21 +3146,20 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     try {
       // Part A: cancelling an unread tool_use SSE response must retire the worker.
       const sidCancel = `test-unread-tool-cancel-${Date.now()}`;
-      const reqCancel: NormalizedAnthropicRequest = {
-        model: "gemini-3.8-flash",
-        system: "Unread tool cancel test",
-        messages: [
+      const reqCancel = makeReq(
+        [
           { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
         ],
-        tools,
-        toolChoice: { type: "auto" },
-        stream: true,
-        thinkingEnabled: false,
-        sessionId: sidCancel,
-      };
+        {
+          model: "gemini-3.8-flash",
+          system: "Unread tool cancel test",
+          tools,
+          sessionId: sidCancel,
+        },
+      );
       const resCancel = await encodeAnthropicSseResponse(
         reqCancel.model,
-        coord.executeTurn(testAccount, reqCancel, sel),
+        coord.executeTurn(testAccount, reqCancel, selection),
       );
       // The peeked `tool_use` already moved the worker to AWAITING_TOOL_RESULTS,
       // yet the caller never saw the tool id and no ledger was committed.
@@ -3560,7 +3183,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         workDir: "/Users/example/ws-a",
       };
       const evsA: TurnStreamEvent[] = [];
-      for await (const ev of coord.executeTurn(testAccount, reqA, sel)) {
+      for await (const ev of coord.executeTurn(testAccount, reqA, selection)) {
         evsA.push(ev);
       }
       const tuA = evsA.find((e) => e.type === "tool_use") as any;
@@ -3588,7 +3211,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           },
         ],
       };
-      for await (const _ of coord.executeTurn(testAccount, reqForkB, sel)) {}
+      for await (const _ of coord.executeTurn(testAccount, reqForkB, selection)) {}
       // Session A's pending worker in ws-a must remain untouched and alive.
       expect(coord.getActiveWorker(sk(sidA))).toBe(workerA);
       expect(workerA.state).toBe("AWAITING_TOOL_RESULTS");
@@ -3600,6 +3223,140 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     } finally {
       sched.closeAllSync("test41_done");
       sched.destroy();
+    }
+  });
+
+  test("42. an admission failure (503) never consumes the parked checkpoint, so retrying the turn resumes the same native session", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+
+    const dataDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "agy-magpie-defer-claim-"),
+    );
+    const prevDataDir = process.env.AGY_ACP_DATA_DIR;
+    process.env.AGY_ACP_DATA_DIR = dataDir;
+
+    const sched = new GlobalScheduler({
+      maxGlobalWorkers: 1,
+      maxPerAccountWorkers: 1,
+      idleTimeoutMs: 10,
+      waitTimeoutMs: 0,
+    });
+    const coord = new SessionCoordinator({
+      scheduler: sched,
+      mcpServer,
+      spawnFn: spawnFakeAcp,
+    });
+
+    const selection = sel("gemini-3.8-flash");
+    const sessionId = `test-deferred-claim-${Date.now()}`;
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
+    const blockerSessionId = `test-deferred-claim-blocker-${Date.now()}`;
+
+    let blockerWorker: AgySessionWorker | undefined;
+    let releasePin: (() => void) | undefined;
+
+    try {
+      // 1. Turn 1 leaves one warm session, then idle eviction parks it.
+      const turn1User: NormalizedAnthropicRequest["messages"][number] = {
+        role: "user",
+        content: [{ type: "text", text: "Turn 1 question" }],
+      };
+      const turn1Req = makeReq([turn1User], {
+        model: "gemini-3.8-flash",
+        system: "Deferred claim test",
+        sessionId,
+      });
+      let turn1Answer = "";
+      for await (const ev of coord.executeTurn(testAccount, turn1Req, selection)) {
+        if (ev.type === "text_delta") turn1Answer += ev.text;
+      }
+      const worker1 = coord.getActiveWorker(sessionKey)!;
+      expect(worker1).toBeDefined();
+      const nativeSessionId = worker1.nativeSessionId;
+      expect(nativeSessionId).toBeTruthy();
+
+      worker1.lastActivityAt = Date.now() - 1_000;
+      expect(await sched.reapIdleWorkers()).toBe(1);
+      expect(coord.getActiveWorker(sessionKey)).toBeUndefined();
+      const parked = coord.shelf.memorySessions.get(sessionKey);
+      expect(parked).toBeDefined();
+      expect(parked!.nativeSessionId).toBe(nativeSessionId);
+      // Drop the on-disk index: from here on only the memory shelf can resume.
+      fs.rmSync(path.join(dataDir, "parked-sessions.json"), { force: true });
+
+      // 2. Occupy the single global slot with a pinned worker of another session.
+      const blockerReq = makeReq(
+        [{ role: "user", content: [{ type: "text", text: "blocker" }] }],
+        { model: "gemini-3.8-flash", sessionId: blockerSessionId },
+      );
+      for await (const _ of coord.executeTurn(testAccount, blockerReq, selection)) {}
+      blockerWorker = coord.getActiveWorker(
+        `${testAccount.slotKey}::${testAccount.accountRef}::${blockerSessionId}`,
+      )!;
+      expect(blockerWorker).toBeDefined();
+      releasePin = blockerWorker.pin();
+      expect(sched.getActiveCount()).toBe(1);
+
+      // 3. Turn 2 cannot be admitted: it fails fast with 503 ...
+      const turn2Req = makeReq(
+        [
+          turn1User,
+          { role: "assistant", content: [{ type: "text", text: turn1Answer }] },
+          { role: "user", content: [{ type: "text", text: "INSPECT_RESUME turn 2" }] },
+        ],
+        { model: "gemini-3.8-flash", system: "Deferred claim test", sessionId },
+      );
+      let admissionError: any = null;
+      try {
+        for await (const _ of coord.executeTurn(testAccount, turn2Req, selection)) {}
+      } catch (err) {
+        admissionError = err;
+      }
+      expect(admissionError).toBeInstanceOf(BridgeHttpError);
+      expect(admissionError?.status).toBe(503);
+
+      // ... and it must leave the checkpoint that turn 2 needs untouched: a
+      // claim that ran before admission would have consumed it (and reserved
+      // the native session id) for a turn that never started.
+      const stillParked = coord.shelf.memorySessions.get(sessionKey);
+      expect(stillParked).toBeDefined();
+      expect(stillParked!.nativeSessionId).toBe(nativeSessionId);
+
+      // 4. Once the blocker is gone, the retry resumes that exact native session.
+      releasePin();
+      releasePin = undefined;
+      await blockerWorker.close("test42_unblock");
+      blockerWorker = undefined;
+
+      let turn2Answer = "";
+      for await (const ev of coord.executeTurn(testAccount, turn2Req, selection)) {
+        if (ev.type === "text_delta") turn2Answer += ev.text;
+      }
+      expect(turn2Answer).toContain(`[resumedSessionId=${nativeSessionId}]`);
+      // Delta-only prompt: the checkpoint, not a cold replay, carried turn 1.
+      expect(turn2Answer).not.toContain("<conversation_history>");
+
+      const resumedWorker = coord.getActiveWorker(sessionKey)!;
+      expect(resumedWorker).toBeDefined();
+      expect(resumedWorker).not.toBe(worker1);
+      expect(resumedWorker.resumedFromShelf).toBe(true);
+      expect(resumedWorker.nativeSessionId).toBe(nativeSessionId);
+      expect(coord.shelf.memorySessions.has(sessionKey)).toBe(false);
+      await resumedWorker.close("test42_done");
+    } finally {
+      releasePin?.();
+      try {
+        await blockerWorker?.close("test42_cleanup");
+      } catch {}
+      sched.closeAllSync("test42_cleanup");
+      sched.destroy();
+      if (prevDataDir === undefined) {
+        delete process.env.AGY_ACP_DATA_DIR;
+      } else {
+        process.env.AGY_ACP_DATA_DIR = prevDataDir;
+      }
+      fs.rmSync(dataDir, { recursive: true, force: true });
     }
   });
 });

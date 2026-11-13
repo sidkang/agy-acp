@@ -659,20 +659,30 @@ describe("batch window and parked tools/call", () => {
     expect(secondBody.result).toEqual({ content: [{ type: "text", text: "two done" }] })
   })
 
-  test("flushCurrentBatchNow exposes immediately when text/end arrives", async () => {
+  test("markHttpTurnClosed exposes immediately when text/end arrives", async () => {
     const bridge = startBridge({ batchWindowMs: 5_000 })
     bridge.broker.setTools([{ name: "echo_tool", inputSchema: echoToolSchema }])
     bridge.broker.openTurnWindow()
 
     const pending = callTool(bridge.url, "echo_tool", {}, 1)
-    await sleep(50)
-    expect(bridge.batches).toHaveLength(0)
-    bridge.broker.flushCurrentBatchNow()
-    const batch = await waitFor(() => bridge.batches[0])
-    expect(batch).toHaveLength(1)
+    try {
+      await sleep(50)
+      expect(bridge.batches).toHaveLength(0)
+      // A closed HTTP turn flushes the pending batch window instead of waiting it out.
+      bridge.broker.markHttpTurnClosed()
+      const batch = await waitFor(() => bridge.batches[0])
+      expect(batch).toHaveLength(1)
 
-    bridge.broker.deliverToolResults([{ toolUseId: batch[0]!.id, isError: false, content: [{ type: "text", text: "ok" }] }])
-    expect((await readBody(await pending)).result).toEqual({ content: [{ type: "text", text: "ok" }] })
+      bridge.broker.deliverToolResults([
+        { toolUseId: batch[0]!.id, isError: false, content: [{ type: "text", text: "ok" }] },
+      ])
+      expect((await readBody(await pending)).result).toEqual({ content: [{ type: "text", text: "ok" }] })
+    } finally {
+      // Never leave a parked tools/call behind: a dangling socket surfaces as
+      // ECONNRESET in whichever test runs next.
+      bridge.broker.cancelAll("test finished")
+      await pending.catch(() => undefined)
+    }
   })
 
   test("deliverToolResults rejects unknown and duplicate ids", async () => {

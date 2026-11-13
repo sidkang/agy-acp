@@ -27,7 +27,7 @@ import {
   type NormalizedMessage,
 } from "../types";
 import { stripVolatileSystem } from "../protocol/cloak";
-import { getPluginDataRoot } from "../accounts/env";
+import { getPluginDataRoot, isPidAlive } from "../accounts/env";
 import { resolveConversationDbPath } from "../usage/step-usage";
 import {
   type PersistedParkedSession,
@@ -190,16 +190,6 @@ function sleepSync(ms: number): void {
   }
 }
 
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: any) {
-    return err?.code === "EPERM";
-  }
-}
-
 const LOCK_STALE_MS = 15_000;
 const LOCK_POLL_MS = 5;
 /**
@@ -239,8 +229,9 @@ function tryPublishLock(lockPath: string, token: string): boolean {
           fs.closeSync(fd);
         }
         return true;
-      } catch (wxErr: any) {
-        if (wxErr?.code === "EEXIST") return false;
+      } catch {
+        // `EEXIST` (someone else won the race) and an unwritable directory mean
+        // the same thing to the caller: this writer did not publish the lock.
         return false;
       }
     }
@@ -371,15 +362,9 @@ export class ShelfStore {
   // Memory shelf
   // -------------------------------------------------------------------------
 
-  /** Number of entries currently on the memory shelf (for tests/metrics). */
-  get memorySize(): number {
-    return this.parkedSessions.size;
-  }
-
-  /** Number of entries currently on the persisted shelf (for tests/metrics). */
   /**
-   * The live memory shelf, for callers that already hold its contract (the
-   * coordinator exposes it as `parkedSessions`) and for white-box tests.
+   * The live memory shelf, for callers that already hold its contract and for
+   * white-box tests.
    */
   get memorySessions(): Map<string, ParkedSession> {
     return this.parkedSessions;
@@ -393,29 +378,6 @@ export class ShelfStore {
   /** The index file the shelf last resolved (`null` when no data root exists). */
   get loadedFile(): string | null {
     return this.cache?.file ?? null;
-  }
-
-  get persistedSize(): number {
-    return this.persistedSessions.size;
-  }
-
-  /** The memory entry for `sessionKey`, if any. */
-  getMemoryEntry(sessionKey: string): ParkedSession | undefined {
-    return this.parkedSessions.get(sessionKey);
-  }
-
-  /** The persisted entry for `sessionKey`, if any (reloads from disk first). */
-  getPersistedEntry(
-    sessionKey: string,
-    now = Date.now(),
-  ): PersistedParkedSession | undefined {
-    this.ensureLoaded(now);
-    return this.persistedSessions.get(sessionKey);
-  }
-
-  /** Every memory key, newest last (insertion order). */
-  memoryKeys(): string[] {
-    return [...this.parkedSessions.keys()];
   }
 
   // -------------------------------------------------------------------------
@@ -475,36 +437,32 @@ export class ShelfStore {
       return;
     }
 
-    const next = new Map<string, PersistedParkedSession>();
-    let loadFailed = true;
+    let next: Map<string, PersistedParkedSession>;
+    let loadFailed = false;
     try {
-      const parsed: any = JSON.parse(fs.readFileSync(file, "utf8"));
-      const sessions = parsed?.sessions;
-      if (sessions && typeof sessions === "object") {
-        for (const [key, raw] of Object.entries(
-          sessions as Record<string, unknown>,
-        )) {
-          const entry = normalizePersistedEntry(raw);
-          if (entry) next.set(key, entry);
-        }
-      }
-      loadFailed = false;
-    } catch {}
+      next = this.parseSessionsFile(file);
+    } catch (err: any) {
+      next = new Map();
+      // `ENOENT` means the file is gone, so an empty map is the truth. Anything
+      // else (a truncated or unreadable file) makes it a guess, and a guess must
+      // never be read as "there is no checkpoint on disk".
+      loadFailed = err?.code !== "ENOENT";
+    }
     this.persistedSessions = next;
     this.shelfLoadFailed = loadFailed;
     this.cache = { file, mtimeMs, size };
     this.prunePersisted(now);
   }
 
-  /** Reads the on-disk index fresh, without touching the in-memory cache. */
-  private readDiskSessions(file: string): Map<string, PersistedParkedSession> {
+  /**
+   * Reads a shelf file as a session map. Throws when the file cannot be read or
+   * is not JSON, so each caller decides what that means for it.
+   */
+  private parseSessionsFile(
+    file: string,
+  ): Map<string, PersistedParkedSession> {
+    const parsed: any = JSON.parse(fs.readFileSync(file, "utf8"));
     const out = new Map<string, PersistedParkedSession>();
-    let parsed: any;
-    try {
-      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    } catch {
-      return out;
-    }
     const sessions = parsed?.sessions;
     if (!sessions || typeof sessions !== "object") return out;
     for (const [key, raw] of Object.entries(
@@ -514,6 +472,18 @@ export class ShelfStore {
       if (entry) out.set(key, entry);
     }
     return out;
+  }
+
+  /** Reads the on-disk index fresh, without touching the in-memory cache. */
+  private readDiskSessions(file: string): Map<string, PersistedParkedSession> {
+    try {
+      return this.parseSessionsFile(file);
+    } catch {
+      // No file (or an unreadable one) is an empty index for a mutation: the
+      // caller's entry is added to whatever can be read, and the write either
+      // lands or reports failure.
+      return new Map();
+    }
   }
 
   private prunePersistedMap(
@@ -645,20 +615,6 @@ export class ShelfStore {
   // Public mutations
   // -------------------------------------------------------------------------
 
-  /** Could parking this worker leave behind a resume source of any kind? */
-  canRetainCheckpoint(snapshot: WorkerParkSnapshot): boolean {
-    if (!snapshot.nativeSessionId) return false;
-    if (this.canPersist(snapshot)) return true;
-    return (
-      estimateParkedBytes(
-        snapshot.committedMessages,
-        snapshot.systemPrompt,
-        snapshot.appliedSystemHistorySeed,
-        snapshot.registeredTools,
-      ) <= MAX_SINGLE_PARKED_BYTES
-    );
-  }
-
   /**
    * Saves a worker's session to the memory and/or persisted shelves.
    *
@@ -706,8 +662,6 @@ export class ShelfStore {
         this.parkedSessions.set(sessionKey, parked);
         this.prune(now);
         memoryRetained = this.parkedSessions.has(sessionKey);
-      } else {
-        this.prune(now);
       }
     }
 
@@ -782,11 +736,6 @@ export class ShelfStore {
     for (const [key, entry] of this.parkedSessions) {
       if (entry.nativeSessionId === nativeSessionId) this.parkedSessions.delete(key);
     }
-  }
-
-  /** Drops the memory entry for `sessionKey` (stale or incompatible). */
-  dropMemory(sessionKey: string): void {
-    this.parkedSessions.delete(sessionKey);
   }
 
   // -------------------------------------------------------------------------
@@ -981,28 +930,67 @@ export class ShelfStore {
     }
   }
 
+  /**
+   * The identity checks every shelf entry shares before its ledger is compared.
+   *
+   * At the exact key the entry already belongs to this session, so a tag an
+   * older entry never recorded is not disqualifying — a *conflicting* one is.
+   * The cross-key secondary lookup is strict instead: adopting another
+   * session's native conversation across accounts, slots or subagents would
+   * replay this conversation into the wrong agent.
+   */
+  private entryIdentityAllows(
+    fields: {
+      slotKey?: string;
+      accountRef?: string;
+      subagentId?: string;
+      minimalAgent: boolean;
+      workDir?: string;
+    },
+    params: ResolveShelfResumeParams,
+    strict: boolean,
+    subagent: "ignore" | "conflict" | "strict",
+  ): boolean {
+    const { req, account, requestedMinimalAgent } = params;
+    if (fields.minimalAgent !== requestedMinimalAgent) return false;
+    if (normalizeWorkDir(fields.workDir) !== normalizeWorkDir(req.workDir)) {
+      return false;
+    }
+    const expectedSubagent = req.subagentId ?? undefined;
+    const recordedSubagent = fields.subagentId ?? undefined;
+    if (subagent === "strict" && recordedSubagent !== expectedSubagent) {
+      return false;
+    }
+    if (
+      subagent === "conflict" &&
+      recordedSubagent !== undefined &&
+      recordedSubagent !== expectedSubagent
+    ) {
+      return false;
+    }
+    if (strict) {
+      return (
+        fields.slotKey === account.slotKey &&
+        fields.accountRef === account.accountRef
+      );
+    }
+    if (fields.slotKey !== undefined && fields.slotKey !== account.slotKey) {
+      return false;
+    }
+    return (
+      fields.accountRef === undefined || fields.accountRef === account.accountRef
+    );
+  }
+
   private matchMemoryEntry(
     entry: ParkedSession,
     params: ResolveShelfResumeParams,
     now: number,
   ): PrefixMatchResult | null {
-    const { req, account, requestedMinimalAgent } = params;
+    const { req } = params;
     if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) return null;
     if (this.reservedNativeIds.has(entry.nativeSessionId)) return null;
-    // At the exact key the entry already belongs to this session, so a missing
-    // account tag (an older in-memory entry) is not disqualifying. The
-    // cross-key secondary lookup below stays strict: it must never adopt
-    // another account's session.
-    if (entry.slotKey !== undefined && entry.slotKey !== account.slotKey) {
-      return null;
-    }
-    if (entry.accountRef !== undefined && entry.accountRef !== account.accountRef) {
-      return null;
-    }
-    if (entry.minimalAgent !== requestedMinimalAgent) return null;
-    if (normalizeWorkDir(entry.workDir) !== normalizeWorkDir(req.workDir)) {
-      return null;
-    }
+    if (!this.entryIdentityAllows(entry, params, false, "ignore")) return null;
     if (!systemPromptsMatch(entry.systemPrompt, req.system)) return null;
     if (!isToolSetCompatible(entry.registeredTools, req.tools)) return null;
     const match = matchLedgerPrefix(entry.committedMessages, req.messages);
@@ -1014,23 +1002,12 @@ export class ShelfStore {
     params: ResolveShelfResumeParams,
     now: number,
   ): PrefixMatchResult | null {
-    const { req, account, requestedMinimalAgent } = params;
+    const { req } = params;
     if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) return null;
     if (this.reservedNativeIds.has(entry.nativeSessionId)) return null;
-    if (entry.accountRef !== account.accountRef) return null;
-    // A `0.1.4` entry carries neither field; at its exact key it still belongs to
-    // this session, so a missing value is tolerated but a conflicting one is not.
-    if (entry.slotKey !== undefined && entry.slotKey !== account.slotKey) return null;
-    if (
-      entry.subagentId !== undefined &&
-      entry.subagentId !== (req.subagentId ?? undefined)
-    ) {
-      return null;
-    }
-    if (entry.minimalAgent !== requestedMinimalAgent) return null;
-    if (normalizeWorkDir(entry.workDir) !== normalizeWorkDir(req.workDir)) {
-      return null;
-    }
+    // A `0.1.4` entry carries neither slot nor subagent tag; at its exact key it
+    // still belongs to this session, so a missing value is tolerated.
+    if (!this.entryIdentityAllows(entry, params, false, "conflict")) return null;
     if (entry.systemPromptDigest !== sha256Hex(stripVolatileSystem(req.system))) {
       return null;
     }
@@ -1055,41 +1032,58 @@ export class ShelfStore {
     }
   }
 
+  /**
+   * The entry covering the longest strict prefix of the request among the shelf
+   * entries no live turn owns (newest wins ties).
+   *
+   * `compatible` is the shelf-specific half of the question — what "the same
+   * session" means for a full-text memory ledger versus a digest index — and
+   * returns the incoming prefix length it covers, or `null` when it cannot serve
+   * this request at all.
+   */
+  private bestCandidate<E extends { nativeSessionId: string; parkedAt: number }>(
+    entries: Iterable<readonly [string, E]>,
+    params: ResolveShelfResumeParams,
+    now: number,
+    compatible: (key: string, entry: E) => number | null,
+  ): { key: string; entry: E; length: number } | null {
+    let best: { key: string; entry: E; length: number } | null = null;
+    for (const [key, entry] of entries) {
+      if (key === params.sessionKey) continue;
+      if (params.isKeyBusy?.(key)) continue;
+      if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) continue;
+      if (this.reservedNativeIds.has(entry.nativeSessionId)) continue;
+      const length = compatible(key, entry);
+      if (length === null) continue;
+      // A strict prefix: an entry that already covers the whole request leaves
+      // no new turn to run, so it is not this request's session.
+      if (length >= params.req.messages.length) continue;
+      if (!best || length > best.length) best = { key, entry, length };
+    }
+    return best;
+  }
+
   /** Longest strict prefix among compatible memory entries (newest wins ties). */
   private bestMemoryCandidate(
     params: ResolveShelfResumeParams,
     now: number,
   ): ResolvedShelfResume | null {
-    const { req, account, requestedMinimalAgent } = params;
-    let best: { key: string; entry: ParkedSession; length: number } | null = null;
-
-    for (const [key, entry] of this.parkedSessions) {
-      if (key === params.sessionKey) continue;
-      if (params.isKeyBusy?.(key)) continue;
-      if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) continue;
-      if (this.reservedNativeIds.has(entry.nativeSessionId)) continue;
-      if (entry.slotKey !== account.slotKey) continue;
-      if (entry.accountRef !== account.accountRef) continue;
-      if (entry.minimalAgent !== requestedMinimalAgent) continue;
-      if ((entry.subagentId ?? undefined) !== (req.subagentId ?? undefined)) {
-        continue;
-      }
-      if (normalizeWorkDir(entry.workDir) !== normalizeWorkDir(req.workDir)) {
-        continue;
-      }
-      if (!systemPromptsMatch(entry.systemPrompt, req.system)) continue;
-      if (!isToolSetCompatible(entry.registeredTools, req.tools)) continue;
-      if (entry.committedMessages.length < 2) continue;
-      const match = matchLedgerPrefix(entry.committedMessages, req.messages);
-      if (!match.matched) continue;
-      // A strict prefix: the entry must not already cover the whole request, or
-      // there would be no new turn to run.
-      if (match.incomingPrefixLength >= req.messages.length) continue;
-      if (!best || match.incomingPrefixLength > best.length) {
-        best = { key, entry, length: match.incomingPrefixLength };
-      }
-    }
-
+    const { req } = params;
+    const best = this.bestCandidate(
+      this.parkedSessions,
+      params,
+      now,
+      (_key, entry) => {
+        if (!this.entryIdentityAllows(entry, params, true, "strict")) {
+          return null;
+        }
+        if (!systemPromptsMatch(entry.systemPrompt, req.system)) return null;
+        if (!isToolSetCompatible(entry.registeredTools, req.tools)) return null;
+        if (entry.committedMessages.length < 2) return null;
+        const match = matchLedgerPrefix(entry.committedMessages, req.messages);
+        return match.matched ? match.incomingPrefixLength : null;
+      },
+    );
     if (!best) return null;
     return {
       kind: "memory",
@@ -1105,47 +1099,38 @@ export class ShelfStore {
     params: ResolveShelfResumeParams,
     now: number,
   ): ResolvedShelfResume | null {
-    const { req, account, requestedMinimalAgent } = params;
+    const { req } = params;
     const expectedPromptDigest = sha256Hex(stripVolatileSystem(req.system));
-    const expectedWorkDir = normalizeWorkDir(req.workDir);
-    let best:
-      | { key: string; entry: PersistedParkedSession; length: number }
-      | null = null;
-
-    for (const [key, entry] of this.persistedSessions) {
-      if (key === params.sessionKey) continue;
-      if (params.isKeyBusy?.(key)) continue;
-      if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) continue;
-      if (this.reservedNativeIds.has(entry.nativeSessionId)) continue;
-      if (entry.accountRef !== account.accountRef) continue;
-      // Cross-key adoption must be strict: a legacy entry that recorded no slot
-      // or subagent may still resume at its exact key, never across boundaries.
-      if (entry.slotKey !== account.slotKey) continue;
-      if (entry.minimalAgent !== requestedMinimalAgent) continue;
-      if ((entry.subagentId ?? undefined) !== (req.subagentId ?? undefined)) {
-        continue;
-      }
-      if (subagentIdFromSessionKey(key) !== (req.subagentId ?? undefined)) {
-        continue;
-      }
-      if (normalizeWorkDir(entry.workDir) !== expectedWorkDir) continue;
-      if (entry.systemPromptDigest !== expectedPromptDigest) continue;
-      if (!toolsMatchPersistedDigests(entry.toolsDigests, req.tools)) continue;
-      if (entry.messageDigests.length < 2) continue;
-      const match = matchPersistedPrefix(entry, req.messages);
-      if (!match.matched) continue;
-      if (match.incomingPrefixLength >= req.messages.length) continue;
-      if (
-        !params.hasCustomSpawnFn &&
-        !this.conversationDbExists(account, entry.nativeSessionId)
-      ) {
-        continue;
-      }
-      if (!best || match.incomingPrefixLength > best.length) {
-        best = { key, entry, length: match.incomingPrefixLength };
-      }
-    }
-
+    const best = this.bestCandidate(
+      this.persistedSessions,
+      params,
+      now,
+      (key, entry) => {
+        // Cross-key adoption must be strict: a legacy entry that recorded no
+        // slot or subagent may still resume at its exact key, never across
+        // boundaries — and the key itself has to name this subagent.
+        if (!this.entryIdentityAllows(entry, params, true, "strict")) {
+          return null;
+        }
+        if (subagentIdFromSessionKey(key) !== (req.subagentId ?? undefined)) {
+          return null;
+        }
+        if (entry.systemPromptDigest !== expectedPromptDigest) return null;
+        if (!toolsMatchPersistedDigests(entry.toolsDigests, req.tools)) {
+          return null;
+        }
+        if (entry.messageDigests.length < 2) return null;
+        const match = matchPersistedPrefix(entry, req.messages);
+        if (!match.matched) return null;
+        if (
+          !params.hasCustomSpawnFn &&
+          !this.conversationDbExists(params.account, entry.nativeSessionId)
+        ) {
+          return null;
+        }
+        return match.incomingPrefixLength;
+      },
+    );
     if (!best) return null;
     return {
       kind: "persisted",

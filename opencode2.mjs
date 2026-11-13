@@ -15,9 +15,8 @@
 // (2.x's sdk hook doesn't carry the session), magpie's usage and checkin,
 // tools and events.
 //
-// scripts/opencode2.mjs is the one copy that is edited. Every package that
-// has it carries the same bytes as packages/<name>/opencode2.mjs, and
-// scripts/check.mjs fails when a copy differs.
+// This is the only copy: it loads this package's own 1.x plugin from
+// ./opencode.mjs, so there is no sibling copy to keep in sync.
 
 import { readFileSync } from "node:fs"
 import * as v1 from "./opencode.mjs"
@@ -33,7 +32,7 @@ const PLACEHOLDER = "opencode2-v1-key"
 // swapping @ai-sdk/* for its native providers, which never call the sdk
 // hook below; openai-compatible's is the one 2.x ships, the others are AI
 // SDK v6's dist-tag, the line 2.x's bridge runs.
-export function packageOf(npm) {
+function packageOf(npm) {
   const name = npm || "@ai-sdk/openai-compatible"
   if (name === "@ai-sdk/openai-compatible") return "aisdk:@ai-sdk/openai-compatible@2.0.41"
   if (/^@ai-sdk\/[^/@]+$/.test(name)) return `aisdk:${name}@ai-v6`
@@ -43,7 +42,7 @@ export function packageOf(npm) {
 // The plugins a 1.x module exports, as magpie's host and OpenCode 1.x read
 // them: a default {server} is the one plugin, else every function export
 // and every {server} object.
-export function pluginsOf(mod) {
+function pluginsOf(mod) {
   const d = mod?.default
   if (d && typeof d === "object" && ("server" in d || "id" in d || "tui" in d))
     return typeof d.server === "function" ? [d.server] : []
@@ -77,7 +76,7 @@ const connKey = (c) => (!c ? "" : c.type === "credential" ? `credential:${c.id}`
 // ---- sign-in ------------------------------------------------------------
 
 // fields is a 1.x method's prompts as a 2.x form.
-export function fieldsOf(prompts) {
+function fieldsOf(prompts) {
   const out = []
   for (const p of prompts ?? []) {
     if (!p?.key) continue
@@ -106,7 +105,7 @@ function v1Saved(r) {
 // both kinds, the 1.x auth kept whole in its metadata. No refresh is
 // registered, so 2.x hands the credential over as it is and the plugin's
 // own loader renews it, as it does on 1.x.
-export function credentialOf(methodID, r) {
+function credentialOf(methodID, r) {
   if (!r || r.type !== "success") throw new Error(r?.error || r?.message || "the sign-in failed")
   const saved = json(v1Saved(r))
   if (saved.type === "api")
@@ -122,7 +121,7 @@ export function credentialOf(methodID, r) {
 }
 
 // authOfValue is the 1.x auth a 2.x credential stands for.
-export function authOfValue(value) {
+function authOfValue(value) {
   if (!value) return null
   if (value.type === "oauth") {
     const v1 = record(value.metadata).v1
@@ -144,7 +143,7 @@ const MODALITIES = ["text", "audio", "image", "video", "pdf"]
 
 // internalOf is a config model as 1.x hands it to provider.models: what
 // fromModelsDevModel makes of it, with the config's own variants.
-export function internalOf(providerID, conf, key, m) {
+function internalOf(providerID, conf, key, m) {
   const mods = record(m.modalities)
   const has = (list, k) => Array.isArray(list) && list.includes(k)
   const cost = record(m.cost)
@@ -174,7 +173,7 @@ export function internalOf(providerID, conf, key, m) {
 }
 
 // modelOf is a 1.x model, in config or internal form, as a 2.x Model.Info.
-export function modelOf(providerID, provider, key, m) {
+function modelOf(providerID, provider, key, m) {
   const caps = record(m.capabilities)
   const listFrom = (obj, list) => {
     if (obj && typeof obj === "object") return MODALITIES.filter((k) => obj[k])
@@ -230,7 +229,7 @@ const urlOf = (input) => (typeof input === "string" ? input : input instanceof U
 // way 1.x would have sent it with the loader's options: the loader's base
 // URL in place of the configured one, the account's key in place of the
 // placeholder, the loader's headers added, through the loader's fetch.
-export function wrapFetch(next, base, options) {
+function wrapFetch(next, base, options) {
   return async (input, init = {}) => {
     const o = await options()
     let url = urlOf(input)
@@ -602,7 +601,7 @@ async function setupPlugin(ctx, fn, live) {
   void refresh().then(warmed, () => {})
 }
 
-export async function setup(ctx, mod = v1) {
+async function setup(ctx, mod = v1) {
   const live = { on: true }
   for (const fn of pluginsOf(mod)) {
     try {

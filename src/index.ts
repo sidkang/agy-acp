@@ -21,6 +21,7 @@ import {
   jsonErrorResponse,
   parseAnthropicRequest,
   SESSION_ID_HEADER,
+  SUBAGENT_HEADER,
 } from "./protocol/anthropic";
 import {
   buildProviderOptionSchemas,
@@ -127,8 +128,8 @@ function subagentOf(hookInput: Record<string, any> | undefined): string | undefi
     hookInput.message?.subagent;
   if (typeof direct === "string" && direct.trim()) return direct.trim();
   return (
-    readHeaderValue(hookInput.headers, "x-magpie-subagent") ??
-    readHeaderValue(hookInput.header, "x-magpie-subagent")
+    readHeaderValue(hookInput.headers, SUBAGENT_HEADER) ??
+    readHeaderValue(hookInput.header, SUBAGENT_HEADER)
   );
 }
 
@@ -419,7 +420,7 @@ async function AntigravityMagpiePlugin(
       // Magpie tells the plugin's fetch which subagent asked (X-Magpie-Subagent).
       // Forward it when the host exposes it through the hook input as well.
       const subagent = subagentOf(hookInput as Record<string, any> | undefined);
-      if (subagent) output.headers["x-magpie-subagent"] = subagent;
+      if (subagent) output.headers[SUBAGENT_HEADER] = subagent;
     },
   };
 }

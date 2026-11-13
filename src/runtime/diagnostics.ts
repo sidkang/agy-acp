@@ -19,9 +19,9 @@ import path from "node:path";
 const BASE_LOG_NAME = "agy-acp.log";
 const WORKER_LOG_RE = /^agy-acp\.log\.\d+$/;
 
-export const DEFAULT_MAX_LOG_FILES = 8;
-export const DEFAULT_MAX_BYTES_PER_LOG = 64 * 1024;
-export const DEFAULT_MAX_TOTAL_LOG_BYTES = 256 * 1024;
+const DEFAULT_MAX_LOG_FILES = 8;
+const DEFAULT_MAX_BYTES_PER_LOG = 64 * 1024;
+const DEFAULT_MAX_TOTAL_LOG_BYTES = 256 * 1024;
 
 /**
  * Public message for `agy`'s trajectory-serialization refusals.
@@ -55,14 +55,14 @@ export const CONTEXT_BUDGET_FAILURE_MESSAGE =
 export const GENERIC_FAILURE_MESSAGE =
   "Agent execution terminated due to error";
 
-export type AgentFailureKind =
+type AgentFailureKind =
   | "auth"
   | "quota"
   | "invalid_request"
   | "context_budget"
   | "internal";
 
-export interface TurnLogWatchOptions {
+interface TurnLogWatchOptions {
   maxFiles?: number;
   maxBytesPerFile?: number;
   maxTotalBytes?: number;
@@ -193,7 +193,7 @@ function hasVerdictSignal(text: string): boolean {
  * a `401`/`429` for a turn that actually failed for another reason. The tail is
  * dropped here and the turn-scoped `stderrDelta` evidence is used instead.
  */
-export function normalizeRuntimeText(text: string): string {
+function normalizeRuntimeText(text: string): string {
   return (
     text
       .replace(/\n?\s*Stderr tail:[\s\S]*$/i, "")
