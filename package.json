@@ -1,0 +1,29 @@
+{
+  "name": "agy-acp",
+  "version": "0.1.0",
+  "description": "Multi-account Antigravity ACP (agy acp) provider plugin for Magpie",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    "./server": "./src/index.ts",
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "magpie": {
+    "maxConcurrency": 16,
+    "maxAccounts": 0
+  },
+  "scripts": {
+    "typecheck": "bun x tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}
