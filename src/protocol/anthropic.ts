@@ -1328,6 +1328,7 @@ interface SseTurnState {
   openBlock: OpenSseBlock | null;
   pendingSignature: string | null;
   thinkingBlocksEmitted: number;
+  textOrToolBlocksEmitted: number;
 }
 
 function bridgeErrorFromUnknown(err: unknown): BridgeHttpError {
@@ -1362,6 +1363,7 @@ async function openThinkingBlock(state: SseTurnState, channel: SseChannel): Prom
 async function openTextBlock(state: SseTurnState, channel: SseChannel): Promise<void> {
   const index = state.nextIndex;
   state.nextIndex += 1;
+  state.textOrToolBlocksEmitted += 1;
   state.openBlock = { kind: "text", index, thinking: "", signatureSent: false };
   await channel.emit("content_block_start", {
     type: "content_block_start",
@@ -1459,6 +1461,7 @@ async function encodeSseEvent(
       await closeOpenBlock(state, channel);
       const index = state.nextIndex;
       state.nextIndex += 1;
+      state.textOrToolBlocksEmitted += 1;
       await channel.emit("content_block_start", {
         type: "content_block_start",
         index,
@@ -1477,6 +1480,10 @@ async function encodeSseEvent(
     }
     case "finish": {
       await closeOpenBlock(state, channel);
+      if (state.textOrToolBlocksEmitted === 0 && event.stopReason === "end_turn") {
+        await openTextBlock(state, channel);
+        await closeOpenBlock(state, channel);
+      }
       await emitCompletion(channel, event.stopReason, event.usage);
       return true;
     }
@@ -1500,6 +1507,7 @@ async function pumpTurnEvents(
     openBlock: null,
     pendingSignature: null,
     thinkingBlocksEmitted: 0,
+    textOrToolBlocksEmitted: 0,
   };
 
   try {
@@ -1552,6 +1560,10 @@ async function pumpTurnEvents(
     if (channel.isClosed || signal?.aborted === true) return;
     // Upstream stopped yielding without a finish event: end the message cleanly.
     await closeOpenBlock(state, channel);
+    if (state.textOrToolBlocksEmitted === 0) {
+      await openTextBlock(state, channel);
+      await closeOpenBlock(state, channel);
+    }
     await emitCompletion(channel, "end_turn", undefined);
   } catch (err) {
     // Post-200 failures can only be reported as an in-stream error frame.

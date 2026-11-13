@@ -66,6 +66,48 @@ class StderrRingBuffer {
   }
 }
 
+export function isMagpieMcpPermissionRequest(params: unknown): boolean {
+  if (!params || typeof params !== "object") return false;
+  try {
+    const raw = JSON.stringify(params);
+    return (
+      /\bfrom MCP server ["']?magpie["']?(?:\b|$)/i.test(raw) ||
+      /\bmcp\(\s*magpie\//i.test(raw) ||
+      /\bmcp_magpie_[A-Za-z0-9_-]/i.test(raw)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function selectPermissionOption(
+  options: unknown[],
+  preferAllow: boolean,
+): Record<string, any> | undefined {
+  const valid = options.filter(
+    (o): o is Record<string, any> => Boolean(o && typeof o === "object"),
+  );
+  if (preferAllow) {
+    return (
+      valid.find((o) => o.kind === "allow_once" || o.optionId === "allow_once") ??
+      valid.find((o) => o.kind === "allow_always" || o.optionId === "allow_always") ??
+      valid.find((o) =>
+        [o.kind, o.optionId, o.id, o.name, o.label].some(
+          (f) => typeof f === "string" && /allow|approve|accept/i.test(f),
+        ),
+      )
+    );
+  }
+  return (
+    valid.find((o) => o.kind === "reject_once" || o.optionId === "reject_once") ??
+    valid.find((o) => o.kind === "reject_always" || o.optionId === "reject_always") ??
+    valid.find((o) =>
+      [o.kind, o.optionId, o.id, o.name, o.label].some(
+        (f) => typeof f === "string" && /reject|deny|cancel/i.test(f),
+      ),
+    )
+  );
+}
 export class AcpConnection {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly redactor?: StderrRedactor;
@@ -183,16 +225,11 @@ export class AcpConnection {
       if (msg.method === "session/request_permission") {
         let outcome: unknown = { outcome: "cancelled" };
         const options = msg.params?.options;
+        const allowMcp = isMagpieMcpPermissionRequest(msg.params);
         if (Array.isArray(options)) {
-          const rejectOpt = options.find((o: any) => {
-            if (!o || typeof o !== "object") return false;
-            const fields = [o.kind, o.optionId, o.id, o.name, o.label];
-            return fields.some(
-              (f) => typeof f === "string" && /reject|deny|cancel/i.test(f),
-            );
-          });
-          const optionId = rejectOpt?.optionId ?? rejectOpt?.id;
-          if (rejectOpt && optionId !== undefined) {
+          const chosen = selectPermissionOption(options, allowMcp);
+          const optionId = chosen?.optionId ?? chosen?.id;
+          if (chosen && optionId !== undefined) {
             outcome = { outcome: "selected", optionId };
           }
         }

@@ -1690,6 +1690,11 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
     expect(response.status).toBe(200);
     const frames = parseSseFrames(await response.text());
     expect(frames[0]?.event).toBe("message_start");
+    // Ensures at least one empty text content_block is emitted on end_turn
+    // so OpenAI/Responses translators never see a zero-item SSE message.
+    const starts = frames.filter((f) => f.event === "content_block_start");
+    expect(starts.length).toBeGreaterThanOrEqual(1);
+    expect(asRecord(starts[0]!.data.content_block).type).toBe("text");
     expect(frames[frames.length - 1]?.event).toBe("message_stop");
   });
 

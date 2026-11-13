@@ -8,7 +8,10 @@ import {
   type NormalizedAnthropicRequest,
   type TurnStreamEvent,
 } from "../src/types";
-import { AcpConnection } from "../src/runtime/acp-connection";
+import {
+  AcpConnection,
+  isMagpieMcpPermissionRequest,
+} from "../src/runtime/acp-connection";
 import { GlobalScheduler } from "../src/runtime/scheduler";
 import {
   AgySessionWorker,
@@ -113,6 +116,97 @@ describe("AcpConnection", () => {
 
     conn.close();
     child.kill();
+  });
+
+  test("approves session/request_permission ONLY for magpie MCP tools and denies built-in tools", () => {
+    expect(
+      isMagpieMcpPermissionRequest({
+        toolCall: { title: "Run write from MCP server magpie" },
+        options: [{ kind: "allow_once", optionId: "allow_once" }],
+      }),
+    ).toBe(true);
+    expect(
+      isMagpieMcpPermissionRequest({
+        options: [
+          {
+            kind: "allow_always",
+            optionId: "allow_always",
+            name: "Yes, and always grant permission for 'mcp(magpie/write)'",
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      isMagpieMcpPermissionRequest({
+        toolCall: { title: "Run bash command rm -rf /" },
+        options: [{ kind: "allow_once", optionId: "allow_once" }],
+      }),
+    ).toBe(false);
+    expect(
+      isMagpieMcpPermissionRequest({
+        toolCall: { title: "Run write from MCP server evil" },
+      }),
+    ).toBe(false);
+
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const fakeChild: any = Object.assign(new PassThrough(), {
+      stdin,
+      stdout,
+      stderr,
+      kill: () => true,
+    });
+    const written: any[] = [];
+    stdin.on("data", (chunk) => {
+      for (const line of chunk.toString("utf8").split("\n").filter(Boolean)) {
+        written.push(JSON.parse(line));
+      }
+    });
+
+    const conn = new AcpConnection(fakeChild);
+    stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 77,
+        method: "session/request_permission",
+        params: {
+          toolCall: { title: "Run write from MCP server magpie" },
+          options: [
+            { kind: "allow_always", optionId: "allow_always" },
+            { kind: "allow_once", optionId: "allow_once" },
+            { kind: "reject_once", optionId: "reject_once" },
+          ],
+        },
+      }) + "\n",
+    );
+    stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 78,
+        method: "session/request_permission",
+        params: {
+          toolCall: { title: "Execute shell command uname -a" },
+          options: [
+            { kind: "allow_once", optionId: "allow_once" },
+            { kind: "reject_once", optionId: "reject_once" },
+          ],
+        },
+      }) + "\n",
+    );
+
+    expect(written).toHaveLength(2);
+    expect(written[0]).toEqual({
+      jsonrpc: "2.0",
+      id: 77,
+      result: { outcome: { outcome: "selected", optionId: "allow_once" } },
+    });
+    expect(written[1]).toEqual({
+      jsonrpc: "2.0",
+      id: 78,
+      result: { outcome: { outcome: "selected", optionId: "reject_once" } },
+    });
+    conn.close();
   });
 });
 
