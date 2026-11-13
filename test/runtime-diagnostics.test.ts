@@ -375,6 +375,19 @@ describe("extractErrorEvidence and classifyAgentFailure", () => {
     expect(classifyAgentFailure(raw)).toBe("context_budget");
   });
 
+  test("classifies no-messages-fit trajectory refusals as context_budget", () => {
+    const fromLog =
+      "E1113 22:38:30.717067     318 errorreport.go:273] agent executor error: generating and executing: serializing trajectory: no messages fit within the context token budget";
+    const fromRpc =
+      "serializing trajectory: no messages fit within the context token budget";
+
+    expect(classifyAgentFailure(fromLog)).toBe("context_budget");
+    expect(classifyAgentFailure(fromRpc)).toBe("context_budget");
+    expect(classifyAgentFailure(extractErrorEvidence(fromLog))).toBe(
+      "context_budget",
+    );
+  });
+
   test("classifies invalid request markers as invalid_request", () => {
     const raw =
       "E1113 20:15:00.123456     500 server.go:123] rpc error: code = InvalidArgument desc = bad request";

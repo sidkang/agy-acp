@@ -341,6 +341,27 @@ function sweepStaleWorkspacesOnce(): void {
   sweepStaleWorkspaces();
 }
 
+/**
+ * Builds the exact system text the worker appends to a session.
+ *
+ * Single source of truth: the coordinator uses it to size the history seed
+ * against the same bytes the worker will actually send, so the two never drift.
+ */
+export function buildEffectiveSystemText(
+  systemPrompt: string | undefined,
+  workDir: string | undefined,
+  cloak = true,
+): string {
+  let systemWithWorkDir = systemPrompt ?? "";
+  if (workDir && !/[\r\n\0]/.test(workDir)) {
+    const dirNote = buildWorkDirDisambiguationNote(workDir);
+    systemWithWorkDir = systemWithWorkDir.trim()
+      ? `${systemWithWorkDir}\n\n${dirNote}`
+      : dirNote;
+  }
+  return cloakSystemPrompt(systemWithWorkDir, cloak);
+}
+
 function buildWorkDirDisambiguationNote(callerWorkDir: string): string {
   return `The caller's working directory is ${JSON.stringify(callerWorkDir)}. The environment the caller describes (working directory, platform, OS, shell, git status) is where every tool runs. The bridge's temporary workspace only holds its agent configuration; where an environment given elsewhere in this conversation differs, go by the caller's instructions without checking. Never write artifacts, reports, or scratch files to <appDataDir>/brain on the bridge host; all file reads and writes must target the caller's workspace through the provided tools.`;
 }
@@ -764,16 +785,9 @@ export class AgySessionWorker {
       );
 
       // Cloak system prompt
-      let effectiveSystem = "";
-      let systemWithWorkDir = this.options.systemPrompt ?? "";
-      if (this.options.workDir && !/[\r\n\0]/.test(this.options.workDir)) {
-        const dirNote = buildWorkDirDisambiguationNote(this.options.workDir);
-        systemWithWorkDir = systemWithWorkDir.trim()
-          ? `${systemWithWorkDir}\n\n${dirNote}`
-          : dirNote;
-      }
-      effectiveSystem = cloakSystemPrompt(
-        systemWithWorkDir,
+      const effectiveSystem = buildEffectiveSystemText(
+        this.options.systemPrompt,
+        this.options.workDir,
         this.options.cloakPrompts !== false,
       );
       this.effectiveSystemPrompt = effectiveSystem;

@@ -24,7 +24,12 @@ export const DEFAULT_MAX_BYTES_PER_LOG = 64 * 1024;
 export const DEFAULT_MAX_TOTAL_LOG_BYTES = 256 * 1024;
 
 /**
- * Public message for `agy`'s `maxMessageTokens must be positive, got 0` refusal.
+ * Public message for `agy`'s trajectory-serialization refusals.
+ *
+ * Two phrasings have been observed on `agy 1.5.8`, both from the same native
+ * budget check:
+ *   - `serializing trajectory: maxMessageTokens must be positive, got 0`
+ *   - `serializing trajectory: no messages fit within the context token budget`
  *
  * Fixed and deliberately neutral: it states only the observed failure and what
  * the user can do about it.
@@ -32,13 +37,12 @@ export const DEFAULT_MAX_TOTAL_LOG_BYTES = 256 * 1024;
  * It must contain neither `quota` nor `rate limit`, not even negated. Magpie's
  * gateway scans response text with its `quotaWords` regex (`fallback.go`) and
  * parks the account when it matches, so a well-meant "this is not a quota
- * problem" would still rest the account. For the same reason it must not assert
- * a root cause: on the observed requests (~1.96 MB of history) the zero budget
- * may come from the input size rather than from the model/token configuration,
- * and that question is still open.
+ * problem" would still rest the account. It also does not assert a root cause:
+ * the measured trigger is a large `_meta.antigravity.systemPrompt.append`
+ * block, but the native budget formula is unpublished.
  */
 export const CONTEXT_BUDGET_FAILURE_MESSAGE =
-  "Antigravity CLI could not serialize this conversation: maxMessageTokens must be positive, got 0. Try a shorter conversation or another model/effort setting.";
+  "Antigravity CLI could not serialize this conversation within its context limits. Try a shorter conversation or another model/effort setting.";
 
 /**
  * Public text for an unclassified `agy` failure.
@@ -100,7 +104,9 @@ const BENIGN_PATTERNS: ReadonlyArray<RegExp> = [
 const FAILURE_WORDING_RE =
   /error|fail(?:ed|ure)?|denied|refus|exhaust|quota|throttl|rate.?limit|unauth|expired|invalid|panic|timeout|unsupported|must be positive|maxmessagetokens/i;
 
-const CONTEXT_BUDGET_RE = /maxmessagetokens must be positive/i;
+/** Both observed native trajectory-budget refusals (see the public message). */
+const CONTEXT_BUDGET_RE =
+  /maxmessagetokens must be positive|no messages fit within the context token budget/i;
 
 /** An HTTP/status/gRPC `429`, never a bare number such as a port or a pid. */
 const STATUS_429_RE =

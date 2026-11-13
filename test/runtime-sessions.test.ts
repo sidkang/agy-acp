@@ -2684,6 +2684,65 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     await worker.close("test_done");
   });
 
+  test("34b. Cold replay caps the system append seed at 512 KiB and omits the oldest turns", async () => {
+    const sessionId = `test-sys-spill-cap-${Date.now()}`;
+    const chunk = "Z".repeat(40 * 1024); // below the 64 KiB per-entry clip
+    const priorMessages: NormalizedAnthropicRequest["messages"] = [];
+    for (let i = 0; i < 30; i++) {
+      priorMessages.push(
+        {
+          role: "user",
+          content: [{ type: "text", text: `PRIOR_USER_${i} ${chunk}` }],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: `PRIOR_ASSISTANT_${i} ${chunk}` }],
+        },
+      );
+    }
+
+    const req: NormalizedAnthropicRequest = {
+      model: "gemini-4-hydrogen",
+      system: "Seed cap test",
+      messages: [
+        ...priorMessages,
+        {
+          role: "user",
+          content: [{ type: "text", text: "SEED_CAP final question" }],
+        },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    const sel: ModelSelection = {
+      rawModelId: "gemini-4-hydrogen",
+      configModelValue: "gemini-4-hydrogen",
+    };
+
+    for await (const _ev of coordinator.executeTurn(testAccount, req, sel)) {
+      // drain
+    }
+
+    const worker = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker.systemHistorySeedApplied).toBe(true);
+    const seed = worker.appliedSystemHistorySeed ?? "";
+    const seedBytes = Buffer.byteLength(seed, "utf-8");
+    // The whole append block (system text plus seed) stays inside the 512 KiB
+    // ceiling that the live probes showed is safe on agy 1.5.8.
+    expect(seedBytes).toBeLessThanOrEqual(512 * 1024);
+    expect(seedBytes).toBeGreaterThan(256 * 1024);
+    // Older turns are dropped with an explicit marker, newest kept.
+    expect(seed).toContain("[... omitted ");
+    expect(seed).not.toContain("PRIOR_USER_0 ");
+    expect(seed).toMatch(/PRIOR_(?:USER|ASSISTANT)_\d+ /);
+    await worker.close("test_done");
+  });
+
   test("35. Cross-restart resume: zero-plaintext parked-sessions.json index wakes Turn 2 via session/resume without history replay", async () => {
     const fs = await import("node:fs");
     const os = await import("node:os");

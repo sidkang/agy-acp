@@ -11,7 +11,7 @@
 ## 零、上一轮迭代方案状态核对（Baseline Continuity）
 
 ### 已在 `381f9eb4` / `20896be0` 完成并上线 `edge` 的项目
-- [x] **超长对话无损冷重放（`2 MiB` 预算）**：`session/prompt` 保留最近 `112 KiB`，更早历史自动溢出至 `_meta.antigravity.systemPrompt.append`（`<prior_conversation_history>`）。
+- [x] **超长对话冷重放（有界 append 预算）**：`session/prompt` 保留最近 `112 KiB`，更早历史溢出至 `_meta.antigravity.systemPrompt.append`（`<prior_conversation_history>`）。`0.1.4` 起 append 上限由 `2 MiB` 降到 `512 KiB`：线上实测 `agy 1.5.8` 在 760,000 字节报 `no messages fit within the context token budget`、780,000 字节及以上报 `maxMessageTokens must be positive, got 0`，原预算会稳定撞进该区间。超限时丢弃最早整条消息并写入省略标记。
 - [x] **跨重启持久化 `session/resume` 索引**：`$AGY_ACP_DATA_DIR/parked-sessions.json`（`0600` 纯 SHA-256 摘要零明文，推进前先失效旧检查点）。
 - [x] **首轮动态会话 ID 漂移热认领 + 并发扩容**：`adoptAwaitingToolWorker` 按挂起 `toolu_*` ID 原位重绑 + `18 / 36 / 36` 并发参数。
 - [x] **Session Header 双兼容**：`x-agy-session-id` + `x-magpie-session`（`ALT_SESSION_ID_HEADER`）兜底。

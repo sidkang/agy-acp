@@ -19,6 +19,7 @@ import {
 import {
   AgySessionWorker,
   SteerReplayNeededError,
+  buildEffectiveSystemText,
   type ModelSelection,
   type WorkerOptions,
 } from "../runtime/worker";
@@ -454,8 +455,51 @@ function clipHistoryText(
   return `${head}\n...[truncated]...\n${tail}`;
 }
 
-const MAX_PROMPT_BYTES =
-  Number(process.env.AGY_BRIDGE_MAX_PROMPT_BYTES) || 112 * 1024;
+function positiveIntFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.floor(parsed);
+}
+
+const MAX_PROMPT_BYTES = positiveIntFromEnv(
+  "AGY_BRIDGE_MAX_PROMPT_BYTES",
+  112 * 1024,
+);
+
+/**
+ * Byte ceiling for the `_meta.antigravity.systemPrompt.append` cold-replay
+ * block (system text plus `<prior_conversation_history>` seed together).
+ *
+ * Measured against `agy 1.5.8` with real accounts: a seed of 720,000 bytes of
+ * text (162,071 input tokens, English) is accepted, 760,000 bytes fails with
+ * `serializing trajectory: no messages fit within the context token budget`,
+ * and 780,000 bytes and above fails with
+ * `serializing trajectory: maxMessageTokens must be positive, got 0`. The
+ * boundary tracks bytes rather than tokens: 720,000 bytes of CJK text (137,721
+ * tokens) passes while 760,002 bytes of CJK text (about 145,000 tokens) fails.
+ * The previous 2 MiB default sat far past that boundary, and every live failure
+ * carried a ~1.24 MB seed.
+ *
+ * 512 KiB leaves room for the 112 KiB `session/prompt` tail and for tool and
+ * agent scaffolding while staying well below the accepted size. The exact
+ * native budget formula is not published, so this is a bounded mitigation, not
+ * a proven ceiling for every model, effort level, or future `agy` build.
+ */
+const DEFAULT_MAX_SYSTEM_HISTORY_SEED_BYTES = 512 * 1024;
+const GPT_OSS_MAX_SYSTEM_HISTORY_SEED_BYTES = 64 * 1024;
+
+function maxSystemHistorySeedBytes(modelId: string): number {
+  const override = positiveIntFromEnv(
+    "AGY_BRIDGE_MAX_SYSTEM_HISTORY_BYTES",
+    0,
+  );
+  if (override > 0) return override;
+  return /gpt-oss/i.test(modelId)
+    ? GPT_OSS_MAX_SYSTEM_HISTORY_SEED_BYTES
+    : DEFAULT_MAX_SYSTEM_HISTORY_SEED_BYTES;
+}
 const HISTORY_RECORD_NOTE =
   "Note: <conversation_history> is a read-only record of earlier turns. Do not re-execute completed tool calls or mimic [Tool Use] text syntax; invoke real MCP tools when needed.\n";
 const PRIOR_HISTORY_RECORD_NOTE =
@@ -580,6 +624,7 @@ function planColdHistoryRender(
   priorMessages: NormalizedMessage[],
   currentMessages: NormalizedMessage[],
   modelId: string,
+  systemBytes = 0,
 ): {
   systemHistorySeed?: string;
   tailPriorMessages: NormalizedMessage[];
@@ -628,14 +673,16 @@ function planColdHistoryRender(
   const seedHeader = "<prior_conversation_history>\n";
   const seedFooter =
     PRIOR_HISTORY_RECORD_NOTE + "</prior_conversation_history>";
-  const maxSeedBytes = /gpt-oss/i.test(modelId)
-    ? 256 * 1024
-    : Number(process.env.AGY_BRIDGE_MAX_SYSTEM_HISTORY_BYTES) ||
-      2 * 1024 * 1024;
+  const maxAppendBytes = maxSystemHistorySeedBytes(modelId);
   const availableForSeed = Math.max(
     0,
-    maxSeedBytes - utf8Bytes(seedHeader + seedFooter),
+    maxAppendBytes - utf8Bytes(seedHeader + seedFooter) - Math.max(0, systemBytes),
   );
+  if (availableForSeed === 0) {
+    // No room for a seed: keep the bounded prompt tail and drop the oldest
+    // turns rather than appending a block that cannot carry anything.
+    return { systemHistorySeed: undefined, tailPriorMessages };
+  }
 
   const seedEntries = overflowMessages.map((m) =>
     renderHistoryEntry(m, SEED_BLOCK_CLIP_BYTES, SEED_BLOCK_KEEP_BYTES),
@@ -1938,6 +1985,15 @@ export class SessionCoordinator {
       priorMessages,
       currentMessages,
       modelSelection.rawModelId,
+      utf8Bytes(
+        buildEffectiveSystemText(
+          req.system,
+          req.workDir,
+          options?.providerOptions?.cloakPrompts ??
+            this.providerOptions?.cloakPrompts ??
+            true,
+        ),
+      ),
     );
     const workerOptions: WorkerOptions = {
       spawnFn,
@@ -2466,6 +2522,15 @@ export class SessionCoordinator {
       priorMessages,
       currentMessages,
       modelSelection.rawModelId,
+      utf8Bytes(
+        buildEffectiveSystemText(
+          req.system,
+          req.workDir,
+          options?.providerOptions?.cloakPrompts ??
+            this.providerOptions?.cloakPrompts ??
+            true,
+        ),
+      ),
     );
     const worker = new AgySessionWorker(
       account,

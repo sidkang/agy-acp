@@ -20,6 +20,29 @@ agent executor error: generating and executing: serializing trajectory: maxMessa
 
 **边界：** 能确认错误发生在 `agy` 的 trajectory 序列化阶段，不能据此断言是账号额度耗尽，也不能单凭这一条日志确定是模型配置缺陷还是长系统提示/历史触发了预算问题。此次修复改善诊断，不声称修复了闭源 CLI 的零预算计算。
 
+### 零预算错误的实测触发条件（`0.1.4`）
+
+在 `edge` 上用真实账号复现：`agy acp --worker --disable-telemetry`，每例新建独立会话，历史通过 `_meta.antigravity.systemPrompt.append` 注入 `_meta`，模型 `gemini-4-carbon` / `high`，用户消息固定为 `Reply with the single word OK.`。
+
+| 注入的 append 体积 | 结果 |
+| --- | --- |
+| 200,000 字节 | 成功，`inputTokens 46,518` |
+| 500,000 字节 | 成功，`inputTokens 113,188` |
+| 720,000 字节（英文） | 成功，`inputTokens 162,071` |
+| 760,000 字节（英文） | 失败：`serializing trajectory: no messages fit within the context token budget` |
+| 780,000 / 786,000 / 790,000 / 1,000,000 / 1,200,000 字节 | 失败：`serializing trajectory: maxMessageTokens must be positive, got 0` |
+| 720,000 字节（中文，240,000 字） | 成功，`inputTokens 137,721` |
+| 760,002 字节（中文，253,334 字） | 失败 |
+
+结论与边界：
+
+- 触发条件是可独立复现的**大 append 块**，不是某个模型/effort 配置、MCP 3 分钟超时（无工具探针同样复现），也不是 `--process-per-session` → `--worker` 切换（两条路径都复现）。
+- 边界随字节而不是随 token 移动：720,000 字节中文（137,721 token）通过，760,002 字节中文（约 145,000 token）失败；而 720,000 字节英文（162,071 token）通过。
+- 单次 `session/prompt` 用户消息会在约 178 KB 处被静默截断（1,800,000 字符探针只计 44,603 input token），而 `systemPrompt.append` 不会被截断，所以超限直接变成硬失败。
+- 热会话不受影响：同一会话后续回合大多命中缓存（实测 `cache 199,732 + new 3,573`），只有被迫冷重放时才需要重新注入整块历史。
+- 未证明原生预算公式。`1,048,576 − 262,144 = 786,432` 与观测到的失败边界接近，但这是数值吻合，不是已验证的推导。
+- 因此把插件的 append 历史预算降到 **512 KiB**（含系统提示词与工具说明之外的实际 append 文本），并在字节预算中扣除真实系统提示文本；这是有界缓解，不是对闭源 CLI 预算算法的修复。
+
 ### 旧 429 分类存在误判风险
 
 旧代码对整段日志和整个 stderr 尾部使用 `/429|RESOURCE_EXHAUSTED|exhausted your quota|quota/i`：
@@ -45,7 +68,8 @@ Magpie 按插件给出的每账号模型表筛选候选；`FellBack` 标记不�
 - 对前台和数字 PID 后缀日志做逐文件、逐轮快照，只读当前轮新增的有界尾部。
 - 对 stderr 做逐轮增量提取，避免重用旧失败。
 - 分类前剥离日志元数据，要求明确的限流/额度错误证据；不把任意 `quota`、数字 `429` 当成限流。
-- 对 `maxMessageTokens must be positive, got 0` 返回明确但固定、安全的 500 消息，保留原始错误类别，不伪造 429 或登录失效。
+- 对两种 trajectory 序列化拒绝（`maxMessageTokens must be positive, got 0` 与 `no messages fit within the context token budget`）统一归类为 `context_budget`，返回明确但固定、安全的 500 消息，保留原始错误类别，不伪造 429 或登录失效。
+- 冷重放注入的 `<prior_conversation_history>` 系统追加块默认上限从 `2 MiB` 降到 `512 KiB`（`AGY_BRIDGE_MAX_SYSTEM_HISTORY_BYTES` 可覆盖），并在预算中扣除实际系统提示文本，避免再次进入实测失败区间。
 - 静态兜底目录补齐已知 22 个原生模型条目，保持 Carbon/Hydrogen 的真实模型与 effort 路由。
 - 不合并不同账号的权威模型列表，也不在插件中绕过 Magpie 私自读取其他账号凭据或切号。
 
