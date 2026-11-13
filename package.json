@@ -1,21 +1,36 @@
 {
   "name": "agy-acp",
   "version": "0.1.0",
-  "description": "Multi-account Antigravity ACP (agy acp) provider plugin for Magpie",
+  "description": "Multi-account Antigravity CLI (agy acp) model provider plugin for Magpie and OpenCode",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./opencode.mjs",
   "exports": {
-    "./server": "./src/index.ts",
-    ".": "./src/index.ts"
+    ".": "./opencode2.mjs",
+    "./server": "./opencode.mjs"
   },
   "files": [
     "src",
+    "assets",
+    "opencode.mjs",
+    "opencode2.mjs",
     "README.md",
-    "LICENSE"
+    "README.zh-CN.md",
+    "LICENSE",
+    "NOTICE.md"
   ],
-  "magpie": {
-    "maxConcurrency": 16,
-    "maxAccounts": 0
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "antigravity",
+    "agy",
+    "acp"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sidkang/agy-acp.git"
   },
   "scripts": {
     "typecheck": "bun x tsc --noEmit",
@@ -25,5 +40,18 @@
     "@types/bun": "latest",
     "typescript": "^5.7.0"
   },
-  "license": "MIT"
+  "magpie": {
+    "name": "Antigravity ACP",
+    "icon": "https://raw.githubusercontent.com/sidkang/agy-acp/main/assets/icon.svg",
+    "maxConcurrency": 16,
+    "options": {
+      "maxGlobalWorkers": 16,
+      "maxPerAccountWorkers": 4,
+      "idleTimeoutMs": 300000
+    },
+    "summary": {
+      "en": "Multi-account Antigravity CLI provider over ACP (agy acp): sign in to multiple isolated Google accounts or adopt your local agy login, with native HTTP MCP tool bridging, warm session reuse, session/resume, per-step cache token accounting, and quota-aware routing. Shares each Google account's Antigravity quota pool with antigravity and agy-cli.",
+      "zh": "基于本地 agy CLI（agy acp）的多账号 Antigravity 模型插件：支持隔离登录多个 Google 账号或复用本机 agy 登录，内置原生 HTTP MCP 工具桥接、热会话复用与 session/resume 续接、逐 step 缓存/Token 精确结算及配额自动切号。同一 Google 账号与 antigravity、agy-cli 共用同一额度池。"
+    }
+  }
 }

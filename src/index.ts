@@ -96,17 +96,36 @@ function subagentOf(hookInput: Record<string, any> | undefined): string | undefi
   );
 }
 
+function positiveInt(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
 async function AntigravityMagpiePlugin(
   input?: MagpiePluginInput,
   pkgOptions?: Record<string, unknown>,
 ) {
-  const scheduler = new GlobalScheduler({ installSignalHandlers: true });
-  const mcpServer = getSharedMcpServer();
   const catalogService = new CatalogService();
-  const coordinator = new SessionCoordinator({
-    scheduler,
-    mcpServer,
-  });
+  let coordinator: SessionCoordinator | null = null;
+
+  const getCoordinator = (): SessionCoordinator => {
+    if (!coordinator) {
+      const scheduler = new GlobalScheduler({
+        maxGlobalWorkers: positiveInt(pkgOptions?.maxGlobalWorkers),
+        maxPerAccountWorkers: positiveInt(pkgOptions?.maxPerAccountWorkers),
+        idleTimeoutMs:
+          positiveInt(pkgOptions?.idleTimeoutMs) ??
+          positiveInt(pkgOptions?.idleTtlMs),
+        installSignalHandlers: true,
+      });
+      const mcpServer = getSharedMcpServer();
+      coordinator = new SessionCoordinator({
+        scheduler,
+        mcpServer,
+      });
+    }
+    return coordinator;
+  };
 
   const currentSlotKey = (): string => {
     const k = input?.magpie?.account?.(PROVIDER_ID);
@@ -218,7 +237,7 @@ async function AntigravityMagpiePlugin(
                 );
               }
 
-              const events = coordinator.executeTurn(
+              const events = getCoordinator().executeTurn(
                 account,
                 req,
                 modelSelection,

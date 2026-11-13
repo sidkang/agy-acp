@@ -3,12 +3,7 @@ MIT License
 Copyright (c) 2026 DylanLIiii
 Copyright (c) 2026 gitxm
 Copyright (c) 2026 yce
-Copyright (c) 2026 agy-acp contributors
-
-Forked and rewritten in TypeScript from the MIT-licensed `agy-cli` bridge
-(`@magpie-community/opencode-agy-cli-auth` in `magpie-community/plugins`,
-originally derived from `DylanLIiii/opencode-antigravity-bridge`), whose
-portions are copyright the authors above.
+Copyright (c) 2026 sidkang
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
