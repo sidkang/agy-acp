@@ -146,6 +146,9 @@ async function AntigravityMagpiePlugin(
       entry.name ??= "Antigravity ACP";
       entry.npm ??= "@ai-sdk/anthropic";
       entry.api ??= "agy://local";
+      entry.models ??= buildProviderModels(getStaticFallbackCatalog(), {
+        includeRawIds: false,
+      });
     },
 
     auth: {
@@ -173,7 +176,7 @@ async function AntigravityMagpiePlugin(
           signal: opts?.signal,
         });
         const allModelIds = Object.keys(
-          buildProviderModels(catalog, { includeRawIds: true }),
+          buildProviderModels(catalog, { includeRawIds: false }),
         );
         const res = await queryAccountUsage(account, allModelIds, {
           quotaRouting: providerOptions.quotaRouting,
@@ -307,14 +310,14 @@ async function AntigravityMagpiePlugin(
       ) => {
         if (!ctx?.auth) {
           return buildProviderModels(getStaticFallbackCatalog(), {
-            includeRawIds: true,
+            includeRawIds: false,
           });
         }
         const slotKey = currentSlotKey();
         const account = resolveAccountDescriptor(slotKey, ctx.auth);
         return await catalogService.getModels(account, {
           signal: ctx.signal,
-          includeRawIds: true,
+          includeRawIds: false,
         });
       },
     },

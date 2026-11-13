@@ -914,10 +914,11 @@ describe("src/usage/catalog.ts", () => {
     expect(opusRoute).toBeDefined();
     expect(opusRoute?.efforts).toEqual(["low", "medium", "high"]);
 
-    // gpt-oss-120b: exposes BOTH gpt-oss-120b and gpt-oss-120b-medium
+    // gpt-oss-120b: exposes collapsed family gpt-oss-120b (no duplicate gpt-oss-120b-medium in models)
     expect(catalog.routes.has("gpt-oss-120b")).toBe(true);
     expect(catalog.models.some((m) => m.id === "gpt-oss-120b")).toBe(true);
-    expect(catalog.models.some((m) => m.id === "gpt-oss-120b-medium")).toBe(true);
+    expect(catalog.models.some((m) => m.id === "gpt-oss-120b-medium")).toBe(false);
+    expect(catalog.models.some((m) => m.id === "gemini-3.8-flash-low")).toBe(false);
 
     // Standalone models: gemini-pro-orchestrator, gemini-pro-orchestrator-argon
     expect(catalog.models.some((m) => m.id === "gemini-pro-orchestrator")).toBe(true);
@@ -1014,9 +1015,10 @@ describe("src/usage/catalog.ts", () => {
     expect(flash?.capabilities.reasoning).toBe(true);
     expect(flash?.variants).toEqual({ low: {}, medium: {}, high: {} });
 
-    // gpt-oss-120b-medium entry
-    const gptRaw = providerModels["gpt-oss-120b-medium"];
-    expect(gptRaw).toBeDefined();
+    // Collapsed family list omits raw effort variants unless includeRawIds: true
+    expect(providerModels["gpt-oss-120b"]?.variants).toEqual({ medium: {} });
+    expect(providerModels["gpt-oss-120b-medium"]).toBeUndefined();
+    expect(providerModels["gemini-3.8-flash-low"]).toBeUndefined();
   });
 
   test("buildProviderModels marks fallback catalogs with Magpie's non-enumerable fellBack symbol", () => {

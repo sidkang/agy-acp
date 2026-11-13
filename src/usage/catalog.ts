@@ -220,7 +220,7 @@ export function buildCatalog(
         byEffort,
         configModelValue: familyId,
       });
-    } else {
+    } else if (familyId !== "gpt-oss-120b") {
       // Single variant that is not a multi-variant family
       for (const item of variantItems) {
         standaloneList.push({ rawModelId: item.rawModelId, displayName: item.displayName });
@@ -228,7 +228,8 @@ export function buildCatalog(
     }
   }
 
-  // Handle gpt-oss-120b-medium special case: expose both gpt-oss-120b and gpt-oss-120b-medium
+  // Handle gpt-oss-120b-medium special case: expose collapsed family `gpt-oss-120b`
+  // with `variants: ["medium"]`, while keeping `gpt-oss-120b-medium` resolvable via `variantsMap`.
   if (rawIds.has("gpt-oss-120b-medium")) {
     if (!routes.has("gpt-oss-120b")) {
       const byEffort = new Map<EffortLevel, string>([["medium", "gpt-oss-120b-medium"]]);
@@ -254,14 +255,6 @@ export function buildCatalog(
       configModelValue: "gpt-oss-120b",
       effort: "medium",
     });
-
-    // Also keep gpt-oss-120b-medium in models if not already in standaloneList
-    if (!standaloneList.some((m) => m.rawModelId === "gpt-oss-120b-medium")) {
-      standaloneList.push({
-        rawModelId: "gpt-oss-120b-medium",
-        displayName: "GPT-OSS 120B (Medium)",
-      });
-    }
   }
 
   // Add standalone models
