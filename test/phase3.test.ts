@@ -58,6 +58,7 @@ import {
   combineSignals,
   createLoginSessionDisposer,
 } from "../src/accounts/auth";
+import pluginEntry from "../src/index";
 import { spawnFakeAcp } from "./fixtures/helpers";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
@@ -1735,5 +1736,25 @@ describe("Phase 3: CARRY-2 scripts/check-release.mjs", () => {
     );
     expect(bad.status).toBe(1);
     expect(bad.stdout + bad.stderr).toContain("✗");
+  });
+
+  test("hooks.auth.maxConcurrency defaults to 18 and respects pkgOptions.maxPerAccountWorkers", async () => {
+    expect(pluginEntry.id).toBe("agy-acp");
+
+    const defaultHooks = await pluginEntry.server();
+    expect(defaultHooks.auth.provider).toBe("agy-acp");
+    expect(defaultHooks.auth.maxConcurrency).toBe(18);
+
+    const customHooks = await pluginEntry.server(undefined, {
+      maxPerAccountWorkers: 7,
+    });
+    expect(customHooks.auth.maxConcurrency).toBe(7);
+
+    for (const invalid of [0, -4, 3.5, "not-an-int", null]) {
+      const fallbackHooks = await pluginEntry.server(undefined, {
+        maxPerAccountWorkers: invalid,
+      });
+      expect(fallbackHooks.auth.maxConcurrency).toBe(18);
+    }
   });
 });

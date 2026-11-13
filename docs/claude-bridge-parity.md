@@ -1,76 +1,80 @@
-# 与 Magpie 官方 Claude 订阅桥接（`claude_subscription`）对齐说明
+# Parity Notes: Magpie Official Claude Code Bridge (`claude_subscription`)
 
-本文记录 `agy-acp` 与 Magpie 官方内置 Claude Code CLI 桥接（`yetone/magpie/internal/gateway/claude_subscription.go`）在系统提示词、工具隔离、冷却回收及协议边界上的对照与实现结论。
-
----
-
-## 1. 是否禁用底层 CLI 自带 System Prompt（双模式支持）
-
-| 维度                            | Magpie 官方 `claude_subscription`                                                          | `agy-acp` 实现                                                                                                                                          |
-| ------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 开关名称与默认值                | `ClaudeLeanPrompt`（默认 **`false` 关闭**）                                                | `minimal_agent`（默认 **`false` 关闭**）                                                                                                                |
-| **保留原生提示词（默认）**      | 保留 Claude Code 内置系统提示词（约 ~1.1K tokens），上游看到的请求形态与真人交互式运行一致 | 隔离 Agent 配置 `excludeDefaultComponents: false`，保留 `agy` 原生组件（实测纯系统提示词约 ~1,991 tokens，第 2 步起 86%~96% 走 Prompt Cache 命中），保持完整原生请求指纹 |
-| **精简/禁用原生提示词（开启）** | 传 `--system-prompt-file` 替换内置系统提示词，仅保留最小身份头与调用方提示词               | 设 `excludeDefaultComponents: true`，剥离 `agy` 内置组件，仅剩桥接工具说明 + 调用方提示词（实测纯系统提示词降至 ~389 tokens，节省约 1.6K tokens）                       |
-| **动态切换隔离**                | `run.lean != req.leanPrompt` 时拒绝复用旧进程，立即重建会话                                | `worker.minimalAgent !== requestedMinimalAgent` 时立即关闭旧 Worker 并跳过异构冷会话缓存，按新模式重建                                                  |
+This document records the design alignment, empirical measurements, and protocol boundaries between `agy-acp` and Magpie's built-in Claude Code CLI bridge (`yetone/magpie/internal/gateway/claude_subscription.go`, `claude_room.go`, `claude_rss.go`, `claude_lost_media.go`, and `claude_images.go`).
 
 ---
 
-## 2. 不禁用原生 Prompt 时，如何注入客户端自身的 System Prompt
+## 1. Dual System-Prompt Modes (`minimal_agent`)
 
-在不关闭底层原生提示词（默认模式）下，需要同时解决 **Prompt Cache 共享**、**双工作目录环境冲突** 与 **第三方客户端特征风控** 三个问题：
-
-1. **原生系统级追加（不污染首条 User 消息）**：
-   - 官方 `claude_subscription` 使用 `--append-system-prompt-file` 将调用方指令挂在原生系统提示词之后（放在首条消息里会导致跨会话无法复用系统提示词缓存，`#2432`）。
-   - `agy-acp` 在 `session/new` 与 `session/resume` 中通过 ACP 原生扩展 `_meta.antigravity.systemPrompt.append` 注入处理后的系统提示词；仅当旧版 `agy` 不支持 `append` 能力时，才回退为首条消息开头的 `<external_system_instructions>...</external_system_instructions>` 包裹块。
-2. **工作目录与运行环境消歧（防止模型乱猜路径）**：
-   - 桥接进程运行在临时空沙盒目录（`$TMPDIR/agy-magpie-ws-*`），原生提示词中的工作目录是临时目录，而工具实际在客户端宿主目录执行。
-   - 对齐 `claude_subscription` 的 `envElsewhereLeanNote`：当请求携带 `X-Magpie-Work-Dir` 时，自动在系统指令末尾追加环境消歧说明，明确告知模型所有工具均在调用方描述的目录与系统环境中执行，无需探测核实。
-3. **动态噪声剥离与提示词脱敏（`src/protocol/cloak.ts`）**：
-   - 剥离每轮变化的 `x-anthropic-billing-header`（`cch=...`）及 `<system-reminder>` 内的动态时钟行，防止热会话被误判为提示词变更而断连；
-   - 对触发 Antigravity 上游伪 `429` 拒绝的第三方客户端特征行（Claude Code / Claude Agent SDK / Codex / Hermes / oh-my-pi RFC 2119）自动插入零宽空格；
-   - 对 DeepSeek Harness 的 `@` 路径段落做同义改写（对齐 `#1028`，避免 `gemini-4-argon` 跳过思考浅层秒回）；
-   - 会话中途出现的 `role: system / developer` 消息统一转为 `<system-reminder>` 用户块，保持多轮热会话不断开。
+| Dimension | Magpie `claude_subscription` | `agy-acp` Implementation |
+| --- | --- | --- |
+| **Option & Default** | `ClaudeLeanPrompt` (default **`false`**) | `minimal_agent` (default **`false`**) |
+| **Preserve Native Prompt (Default)** | Keeps Claude Code's built-in system prompt (~1.1K tokens) so upstream requests match interactive user sessions. | Sets `excludeDefaultComponents: false` on the isolated bridge agent, preserving native `agy` components (~1,991 system prompt tokens measured; 86%–96% prompt-cache hit rate from step 2 onward) and native request fingerprint. |
+| **Minimal / Stripped Prompt (`true`)** | Passes `--system-prompt-file` to replace the built-in system prompt, keeping only a minimal identity header and caller prompt. | Sets `excludeDefaultComponents: true`, stripping built-in `agy` components so only bridge tool instructions and the caller's prompt remain (~389 system prompt tokens measured, saving ~1.6K tokens). |
+| **Mode-Switch Isolation** | Refuses to reuse an existing process when `run.lean != req.leanPrompt` and rebuilds the session immediately. | When `worker.minimalAgent !== requestedMinimalAgent`, immediately closes the active worker and skips incompatible shelf entries (`memory` and `persisted` both match `minimalAgent`) to rebuild under the new mode. |
 
 ---
 
-## 3. 冷却回收时长、内存上限与孤儿进程防护
+## 2. System Prompt Injection & Normalization
 
-| 参数 / 机制                       | Magpie 官方 `claude_subscription`                                             | `agy-acp` 实现                                                                                                                                                                                                                                                                                                                                                                                                 |
-| --------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **热空闲超时（`idleTimeoutMs`）** | **`1 小时`**（`idleLongest = time.Hour`，对齐 1h Prompt Cache 窗口，`#463`）  | **`1 小时`**（`3,600,000 ms`，可在插件 Options 覆盖）                                                                                                                                                                                                                                                                                                                                                          |
-| **每账号热进程上限**              | `idleMost = 6`                                                                | `maxPerAccountWorkers = 18`（全局上限 `maxGlobalWorkers = 36`，`maxConcurrency = 36`）                                                                                                                                                                                                                                                                                                                         |
-| **挂起工具等待超时**              | `parkLongest = 5m`（最多保留 `parkedMost = 16`）                              | `awaitingToolTimeoutMs = 10m`（客户端中断未交 `tool_result` 自动回收）                                                                                                                                                                                                                                                                                                                                         |
-| **冷会话架（`parkedSessions`）**  | 落盘会话供 `--resume` 续接                                                    | 内存冷会话架（**TTL 6 小时 + 最多 32 条 + 单会话 ≤ 4 MiB + 总预算 ≤ 16 MiB**）+ 磁盘零明文 SHA-256 摘要索引（`$AGY_ACP_DATA_DIR/parked-sessions.json`，`0600` 原子写入），支持跨插件热更新与网关重启直接 `session/resume` |
-| **孤儿进程与临时目录清理**        | `proc.StartTree`（Unix Session / Windows Job）整树回收 + 启动清扫超时临时目录 | 1. `detached: false` 保持在 Magpie `StartTree` 进程组内，宿主遭 `SIGKILL` 时随组一并回收；<br>2. 单 Worker 关闭时按父子 PID 树自底向上清理后代进程；<br>3. 同时监听 `process.once("exit")` / `SIGINT` / `SIGTERM`（覆盖 `host.js` `stdin` 关闭时的 `process.exit(0)`），连短命 `/usage`、`models` 探测子进程与临时目录一并同步回收；<br>4. 临时目录写入 `.owner-pid`，启动及每分钟巡检自动清扫死进程遗留目录。 |
+When preserving `agy`'s built-in system prompt (default mode), the bridge must solve three problems simultaneously: **prompt-cache sharing**, **dual-directory environment disambiguation**, and **third-party harness sanitization**.
 
----
+1. **Native System-Level Append (No First-User-Message Pollution)**:
+   - `claude_subscription` uses `--append-system-prompt-file` so caller instructions sit after the native system prompt (embedding them inside the first user message breaks cross-session system-prompt caching).
+   - `agy-acp` injects the processed system prompt via the ACP extension `_meta.antigravity.systemPrompt.append` on `session/new` and `session/resume`. Only when an older `agy` binary lacks `append` capability does it fall back to prepending `<external_system_instructions>...</external_system_instructions>` to the first user message.
 
-## 4. `agy` 原生内置工具的四重封禁
+2. **Workspace & Runtime Environment Disambiguation**:
+   - The `agy` subprocess runs inside an isolated empty sandbox directory (`$TMPDIR/agy-magpie-ws-*`), whereas caller MCP tools execute in the caller's host workspace.
+   - Matching `claude_subscription`'s `envElsewhereLeanNote`, whenever a request carries `X-Magpie-Work-Dir`, `agy-acp` appends a disambiguation note instructing the model that all tools execute in the caller-described workspace and environment without probing or verifying host paths locally.
 
-确保模型 100% 只能发起客户端声明的工具调用，绝不在桥接机本地执行任何内置文件或终端操作：
-
-1. **独立 Agent Manifest 清空内置工具（`src/runtime/worker.ts`）**：每次在 `0700` 空临时目录生成 `.agents/agents/magpie-bridge/agent.md`，显式声明：
-   - `tools: []`：清空 `agy` 全部内置工具（`read_file`、`write_file`、`edit`、`run_shell_command`、`grep`、`glob`、`web_fetch`、`google_web_search`、`save_memory` 等）；会话级 `mcpServers: [{ name: "magpie", type: "http", url }]` 独立挂载，仅暴露客户端工具；
-   - `subagent: false`：禁用内置子代理派生；
-   - `inheritMcp: false` & `inheritCustomizations: false`：彻底隔离宿主机用户全局配置的 MCP、Skills 与 Hooks。
-2. **ACP 客户端能力硬关闭**：`initialize` 显式上报 `fs: { readTextFile: false, writeTextFile: false }, terminal: false`。
-3. **权限请求按结构化工具身份精准鉴权（`src/runtime/worker.ts` & `src/runtime/acp-connection.ts`）**：仅当 `session/request_permission` 结构化字段确认是本桥挂载的 `magpie` MCP 工具时才自动放行 `allow_once`，任何内置工具、终端或未知来源权限请求一律自动 `reject/deny`（无拒绝项则返回 `cancelled`）。
-4. **物理目录隔离与跨机 Brain 写入禁令**：`agy` 进程的 `cwd` 始终锁定在空临时目录 `$TMPDIR/agy-magpie-ws-*`，并在 Agent Manifest 与工作目录消歧指令中明确禁止向桥接机本地 `<appDataDir>/brain` 落盘，所有文件操作仅通过客户端 MCP 工具在调用方机器执行。
+3. **Volatile Noise Stripping & Prompt Cloaking (`src/protocol/cloak.ts`)**:
+   - Strips rotating `x-anthropic-billing-header` (`cch=...`) lines and dynamic clock lines inside `<system-reminder>` blocks so warm sessions are not misclassified as prompt mutations.
+   - Inserts zero-width spaces (`\u200B`) into third-party harness signature phrases (Claude Code / Claude Agent SDK, Codex, Hermes, and oh-my-pi RFC 2119 lines) that otherwise trigger synthetic upstream `429` refusals when `cloak_prompts` is enabled (default `true`).
+   - Rewrites the DeepSeek Harness `@`-path paragraph into equivalent prose so affected models do not skip reasoning.
+   - Converts mid-conversation `role: "system"` / `"developer"` messages into `<system-reminder>` user blocks so multi-turn warm sessions stay contiguous.
 
 ---
 
-## 5. 其他已对齐的细节与后续可扩展项
+## 3. Idle TTL, Bounded Wait-for-Room Scheduling, Single-Process RSS, Queue Caps, Storage GC & Orphan Cleanup
 
-### 已完成对齐项
+| Mechanism | Magpie `claude_subscription` | `agy-acp` Implementation |
+| --- | --- | --- |
+| **Idle Worker TTL** | `1h` (`idleLongest = time.Hour`), keeping warm processes alive across the prompt-cache window. | `idleTimeoutMs: 3600000` (`1h`); `awaitingToolTimeoutMs: 600000` (`10m`); reaper runs every `60s`. |
+| **Pool Sizing & Bounded Wait-for-Room** | `claudeRoom` (`claude_room.go`) queues saturated requests up to `2m` (respecting request cancellation) and wakes waiters in FIFO order when any slot opens. | `GlobalScheduler` (`src/runtime/scheduler.ts`) defaults to `16` global / `6` per-account (configured in `package.json` `magpie.options` as `maxGlobalWorkers: 36`, `maxPerAccountWorkers: 18`), with bounded FIFO Wait-for-Room (`waitTimeoutMs: 60s`, `maxWaiters: 128`; `0` restores immediate `503`). Locks are never held while waiting, so saturation on `Account A` never blocks `Account B`. |
+| **Single-Process Model & Memory** | One `claude` process per session (~86–112 MiB anonymous RSS). | Uses single-process `agy acp --worker --disable-telemetry` instead of `--process-per-session` (`agy 1.5.8` measured: 0 child processes, ~212 MiB RSS during turns, ~175 MiB after `session/resume`, down from 350–388 MiB across 2 processes under `--process-per-session`). Plain `--stdio` without `--worker` cannot be used because it omits `mcpCapabilities.http` and silently drops `session/new` HTTP `mcpServers`. |
+| **Post-Turn RSS Parking & Recycling** | `claude_rss.go` checks process-tree RSS after turns (1/8 host RAM, floor `1 GiB`) and parks/replaces oversized processes. | `src/runtime/rss.ts` samples process-tree RSS (Linux `/proc`, single `ps` snapshot on macOS/other Unix with 10s caching). After a clean turn, if an `IDLE` worker exceeds `maxWorkerRssBytes` (default `1 GiB` / `1073741824` bytes, `AGY_BRIDGE_MAX_WORKER_RSS_MB` override, `0` disables), `SessionCoordinator` parks it via `shelf.park()` and closes the process so the next turn resumes via `session/resume`. Workers that cannot preserve a resume checkpoint are never recycled prematurely. |
+| **Per-Turn Event Queue Cap & SSE Backpressure** | Bounded streaming pipes with backpressure. | `AsyncEventQueue` (`src/runtime/turn-context.ts`) enforces a `16 MiB` (`DEFAULT_MAX_TURN_QUEUE_BYTES`) per-turn buffer cap on undelivered events; slow consumers overflow and fail that turn cleanly with HTTP `502` and worker teardown instead of growing unboundedly. SSE keepalive frames (`: keepalive\n\n`) only emit when `desiredSize > 0` or pull credit remains. |
+| **Disk Storage GC (48h TTL)** | `-p` defaults to `--no-session-persistence`; shelved state is deleted after resume or expiry. | `sweepStaleAccountStorage` (`src/accounts/env.ts`) runs hourly across isolated account directories (`$AGY_ACP_DATA_DIR/accounts/<uuid>/.gemini/antigravity-cli`, leaving any adopted host `agy` login's `~/.gemini` untouched) and removes unreferenced/inactive items older than `48h`: `conversations/*.db*`, `brain/*`, `log/*.log`, `annotations/*.pbtxt`, `implicit/*.pb`, `crashes/*`, and root `cli.log` (plus a `32 MiB` cap on `log/`). Also prunes orphaned summary, FTS5, and parent rows in `conversation_summaries.db` whose `conversations/<id>.db` no longer exists (and never creates `conversation_summaries.db` if absent). |
+| **Orphan Process Cleanup** | Process-group / context termination on shutdown. | Registers `SIGINT`, `SIGTERM`, and `exit` handlers in `GlobalScheduler` to terminate all active `agy` workers and remove `$TMPDIR/agy-magpie-ws-*` sandboxes, plus sweeping stale leftover workspaces on startup. |
 
-- **`tool_choice` 缓存稳定性**：与 `claude_subscription`（`TestClaudeToolChoiceNoneKeepsTheTools`）一致，`tool_choice: none / tool / any` 时保持 `tools/list` 工具目录不变以保护 Prompt Cache 前缀，在 Broker 层做调用拦截与约束提醒。
-- **工作目录透传与环境消歧**：自动对 Magpie 网关发来的百分号编码头 `X-Magpie-Work-Dir` 执行 `decodeURIComponent` 解码，仅对本机真实存在的绝对目录传递 `--add-dir`，并在系统提示词中追加与 `envElsewhereLeanNote` 对齐的工具运行环境消歧说明。
-- **子代理与标题/分类器旁路请求保护（对齐 `aside()`）**：识别 `X-Magpie-Subagent` 独立分桶；当同一会话已有带工具的主进程时，客户端发来的 `tools: []`（无论是否匹配历史前缀）或 `tool_choice: none` 旁路请求一律走无状态短会话，绝不挤占、污染或误关正在热运行的工具主会话。
-- **仅在完整终态提交会话账本与端到端取消联动**：仅当流正常收到 `finish` 终态事件时才更新 `committedMessages`，中途错误或客户端中断（含 `ReadableStream.cancel()`）会立即触发 `AbortController` 取消底层 ACP 回合并淘汰状态存疑的半截 Worker；同时为 `session/prompt` 配置 30 分钟看门狗超时。
-- **Pi / Claude Code 交互边界恢复**：支持工具执行中途 `steer` 打断（带 `promptSeq` 纪元隔离与取消超时自动重放）、`followUp` 续跑、工具后自动 `/compact` 压缩重开，以及 112 KiB 预算下保头保尾裁剪 `<conversation>`。
-- **结构化输出（`output_config.format` / `response_format`）**：支持 `json_schema` 与 `json_object` 格式约束注入（兼容 Claude Code Prompt Hooks）。
-- **超长冷会话无损衔接（`_meta.antigravity.systemPrompt.append` 溢出承载）**：`agy acp` 对单次 `session/prompt` 用户消息存在 128 KiB 截断上限，而 `session/new` 的 `_meta.antigravity.systemPrompt.append` 无此限制且享受上游 Prompt Cache（次轮缓存命中率 ~96.7%）。当冷启动历史超出 112 KiB `session/prompt` 预算时，自动将更早轮次溢出注入 `<prior_conversation_history>` 系统追加块（默认上限 `512 KiB`，`AGY_BRIDGE_MAX_SYSTEM_HISTORY_BYTES` 可覆盖；超限时按整条消息丢弃最早轮次并留下 `[... omitted N earlier messages ...]` 标记），并在 `session/resume` 冷却恢复时按原有语义保持停靠时的 seed。上限来源是 `agy 1.5.8` 线上实测：720,000 字节 append 通过，760,000 字节即报 `no messages fit within the context token budget`，780,000 字节及以上报 `maxMessageTokens must be positive, got 0`；原 `2 MiB` 预算会直接进入该失败区间。
-- **首轮动态会话 ID 切换热续接与存储过期清理**：当客户端未显式传会话头、网关合成会话 ID 在首轮 `tool_use` 与次轮 `tool_result` 之间稳定化切换时，按挂起的 96-bit `toolu_*` 调用 ID 与账本前缀精准重绑原 `AWAITING_TOOL_RESULTS` Worker，避免槽位泄漏引发 `503`；同时每小时自动清扫各账号下超过 48 小时且未活跃/未停靠的 `conversations/*.db*`、`brain/*`、`log/*.log`、`annotations/*.pbtxt`、`implicit/*.pb`、`crashes/*` 与根 `cli.log`，`log/` 目录额外保留 32 MiB 上限，并回收 `conversation_summaries.db` 中已无对应 transcript 的 summary / FTS5 / parent 行（库不存在时绝不创建）。
-- **单进程 ACP 与排队等位调度**：`agy acp` 改为 `--worker --disable-telemetry` 的单进程形态（不再用 `--process-per-session`；`agy 1.5.8` 实测 0 个子进程，回合内 `~212 MiB`、`session/resume` 后 `~175 MiB`，对比 `--process-per-session` 的 2 进程 `~350–388 MiB`）。**不能**只删 `--process-per-session`：裸 `--stdio` 前台不返回 `mcpCapabilities.http`，会把 `session/new` 的 HTTP `mcpServers` 静默丢弃，调用方工具失效。`GlobalScheduler` 在满载时有界 FIFO 等位（默认 60s，可配 `waitTimeoutMs` / `maxWaiters`，`0` 恢复立即 `503`），账号 A 满额不会阻塞账号 B；干净结束的回合若进程树 RSS 超过 `1 GiB`（`AGY_BRIDGE_MAX_WORKER_RSS_MB` 可调，`0` 关闭）则先停靠再换新进程，下轮 `session/resume` 无损续接（无法保留任何停靠检查点时不会换新）。单回合事件队列上限 16 MiB，慢消费者只会让该回合以 `502` 失败而不会无界占用内存。
-- **WAL SQLite 逐 Step 用量与缓存读取**：通过只读 URI（Checkpointed WAL 自动走 `?immutable=1`，配合落盘微退避等待）读取 `gen_metadata`，在 `tool_use` 与 `end_turn` 每一步精确上报 `input_tokens`、`output_tokens` 与 `cache_read_input_tokens`。
-- **订阅档位徽章（`plan`）自动识别**：通过 `v1internal:loadCodeAssist` 查询并缓存（1 小时 TTL）账号订阅档位（如 `Google AI Ultra`、`Google AI Pro` 及 `5x` / `20x` 倍率后缀），在 Magpie Usage 卡片与 `magpie quota` 中展示。
+---
+
+## 4. Tool Isolation & Sandbox Security
+
+Every turn guarantees that `agy` only invokes tools declared by the caller and never executes local built-in file or shell operations on the bridge host:
+
+1. **Isolated Agent Manifest (`src/runtime/worker.ts`)**: Generates `.agents/agents/magpie-bridge/agent.md` inside an empty `0700` temporary workspace with:
+   - `tools: []` to disable all built-in `agy` tools (`read_file`, `write_file`, `edit`, `run_shell_command`, `grep`, `glob`, `web_fetch`, `google_web_search`, `save_memory`, etc.), exposing caller tools strictly via session-scoped `mcpServers: [{ name: "magpie", type: "http", url }]`;
+   - `subagent: false` to block built-in subagent spawning;
+   - `inheritMcp: false` and `inheritCustomizations: false` to isolate from host-level MCP servers, skills, and hooks.
+2. **ACP Client Capabilities Disabled**: `initialize` explicitly declares `fs: { readTextFile: false, writeTextFile: false }, terminal: false`.
+3. **Structured Permission Verification (`src/runtime/worker.ts`, `src/runtime/acp-connection.ts`)**: `session/request_permission` requests are auto-approved (`allow_once`) only when structured fields confirm the target belongs to the bridge's `magpie` MCP server; any built-in tool, terminal, or unknown permission request is automatically rejected (`reject`/`deny`, or `cancelled` when no reject option is offered).
+4. **Physical Sandbox & Brain Write Prohibition**: `agy` always spawns with `cwd` locked to `$TMPDIR/agy-magpie-ws-*`, and both the agent manifest and workspace disambiguation note prohibit writing artifacts or scratch files to `<appDataDir>/brain` on the bridge host.
+
+---
+
+## 5. Protocol & Session Capabilities
+
+- **`tool_choice` Cache Stability**: Matches `claude_subscription` (`TestClaudeToolChoiceNoneKeepsTheTools`) by keeping the `tools/list` catalog unchanged for `tool_choice: none`, `tool`, and `any` to preserve the prompt-cache prefix while enforcing constraints in `SessionToolBroker`.
+- **Workspace Forwarding (`X-Magpie-Work-Dir`)**: Percent-decodes (`decodeURIComponent`) `X-Magpie-Work-Dir`, passes `--add-dir` only for existing local absolute directories, appends the `envElsewhereLeanNote`-aligned workspace instruction, and checks normalized `workDir` equality before warm reuse or shelf resume.
+- **Subagent Bucketing & `aside()` Side-Request Isolation**: Buckets `X-Magpie-Subagent` requests under separate session keys (`::sub:<id>`). When a tool-equipped primary worker already exists for the session, `tools: []` or `tool_choice: none` side requests (such as title generation or classifiers) run as stateless short turns without mutating or polluting the primary session ledger, and preferentially pin its warm worker whenever spare capacity or another eviction candidate exists (under strict single-slot saturation, an `IDLE` worker may still be parked and evicted to admit the turn).
+- **`lostMedia` Image-Stripping Prefix Tolerance (`src/sessions/ledger.ts`)**: Ports Magpie's `claude_lost_media.go` logic so warm prefix matching (`isPrefixMatch` / `matchLedgerPrefix`) and persisted digest matching (`matchPersistedPrefix`) tolerate clients stripping historical base64 images or dropping image-only turns in prior messages, keeping the live or resumed native session intact instead of forcing an expensive cold replay.
+- **Secondary Content-Hash Session Addressing & First-Turn Tool Adoption**: Supports callers that omit or rotate session headers via a secondary content-hash lookup across parked `memory` and `persisted` shelf entries (`src/sessions/shelf-store.ts`), and rebinds `AWAITING_TOOL_RESULTS` workers across first-turn synthetic session ID stabilization via 96-bit `toolu_*` ID matching (`adoptAwaitingToolWorker`).
+- **Zero-Dependency Inline Image Probing & Downscaling (`src/protocol/images.ts`)**: Probes PNG, JPEG, GIF, and WebP dimensions without external native dependencies; scales images exceeding `2000px` per side (`MAX_INLINE_IMAGE_SIDE`) or `5 MiB` base64 (`MAX_INLINE_IMAGE_BASE64_BYTES`) down to fit (preserving JPEG at quality 85 or encoding PNG, falling back to lower-quality JPEG at 75/60/40 if still over `5 MiB`). Enforces `MAX_DECODE_HOLD_BYTES` (`256 MiB` encoded payload + RGBA8 pixel estimate) to prevent decompression-bomb OOMs; already-compliant, WebP, or unparseable images pass through byte-for-byte untouched.
+- **File-Locked Incremental Shelf Store & Deferred `claimResume` (`src/sessions/shelf-store.ts`)**: Stores SHA-256 digests of conversation, system-prompt, and tool content alongside session/account/workspace routing metadata (`0600`, zero plaintext messages, tool arguments/outputs, or system prompts) in `$AGY_ACP_DATA_DIR/parked-sessions.json` using short exclusive file locks for incremental read-modify-write transactions across concurrent hosts. `shelf.claimResume()` runs synchronously only after scheduler admission and reserves the `nativeSessionId` until turn completion so concurrent forks cannot double-claim the same underlying conversation.
+- **Bounded Cold-Replay Budgets (`src/sessions/prompt-render.ts`)**: Keeps the newest `112 KiB` (`AGY_BRIDGE_MAX_PROMPT_BYTES`) in `session/prompt` (avoiding `agy`'s silent ~128 KiB prompt truncation) and overflows older turns into `_meta.antigravity.systemPrompt.append` (`<prior_conversation_history>`, capped at `512 KiB` by default, `64 KiB` for GPT-OSS models, overridable via `AGY_BRIDGE_MAX_SYSTEM_HISTORY_BYTES`), dropping whole oldest messages with `[... omitted N earlier messages ...]` markers when needed. Empirical `agy 1.5.8` probing showed 720,000-byte appends pass while 760,000 bytes fail (`no messages fit within the context token budget`) and >=780,000 bytes fail (`maxMessageTokens must be positive, got 0`).
+- **Terminal-Only Ledger Commits & End-to-End Cancellation**: Commits `committedMessages` only on a clean `finish` event; stream errors or client aborts (including `ReadableStream.cancel()` on unconsumed SSE responses) trigger `AbortController` cancellation, retire the half-written worker, and enforce a 30-minute `session/prompt` watchdog timeout.
+- **Pi / Claude Code Interaction Boundaries**: Supports mid-turn `steer` interruption (with `promptSeq` epoch isolation and `SteerReplayNeededError` fallback replay), `followUp` continuation, post-tool `/compact` reopening, and head+tail `<conversation>` clipping within the `112 KiB` prompt budget.
+- **Structured Output**: Translates `output_config.format` and `response_format` (`json_schema` / `json_object`) into prompt constraints (compatible with Claude Code prompt hooks).
+- **WAL SQLite Per-Step Usage & Cache Accounting (`src/usage/tracker.ts`, `src/usage/step-usage.ts`)**: Reads `gen_metadata` via read-only SQLite URI (`?immutable=1` for checkpointed WALs with `3×25ms` flush backoff) to report accurate per-step `input_tokens`, `output_tokens`, and `cache_read_input_tokens` on every `tool_use` and `end_turn` step.
+- **Code Assist Plan Badges (`src/usage/quota.ts`)**: Queries `v1internal:loadCodeAssist` (1h TTL cache) to surface subscription plan labels (such as `Google AI Ultra`, `Google AI Pro`, and `5x` / `20x` multipliers) in Magpie Usage cards and `magpie quota`.

@@ -1,13 +1,19 @@
 # Ships a tagged version of the plugin two ways, from GitHub Actions.
 #
-# - GitHub release: the npm tarball is attached to the tag's release, which is
-#   what `https://github.com/sidkang/agy-acp` installs from (`magpie plugin add
-#   github:sidkang/agy-acp`).
-# - npm: published when this repository is set up to. npm's OIDC Trusted
-#   Publishing needs no secret (`npm trust github agy-acp --file release.yml
-#   --repo sidkang/agy-acp --allow-publish`), and a granular `NPM_TOKEN` secret
-#   is the fallback. While neither exists the npm job says so on the run's
-#   summary and the tag's release still ships, so a tag is never half-done.
+# - GitHub repository & release: `magpie plugin add github:sidkang/agy-acp`
+#   installs directly from the repository default branch (`main`), while the
+#   GitHub Release job attaches the versioned tarball
+#   (`magpie-agy-acp-<version>.tgz`) to the tag's release.
+# - npm: publishes `magpie-agy-acp` when this repository is configured to do so
+#   (which also makes `magpie-community/plugins`'s `tagged.json` upgrade `spec`
+#   to `magpie-agy-acp` and enables listing in
+#   `magpie-community/plugins/registry.json`). npm's OIDC Trusted Publishing
+#   needs no secret (`npx npm@latest trust github magpie-agy-acp --file
+#   release.yml --repo sidkang/agy-acp --allow-publish
+#   --registry=https://registry.npmjs.org/ -y`), and a granular `NPM_TOKEN`
+#   secret is the fallback. While neither exists the npm job reports that on the
+#   run's summary and the tag's GitHub release still ships, so a tag is never
+#   half-done.
 #
 # Every check `ci` runs runs again here against the tagged commit, and the tag
 # must name the version in package.json (`scripts/check-release.mjs --tag`).
@@ -89,7 +95,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: npm-tarball
-          path: agy-acp-*.tgz
+          path: magpie-agy-acp-*.tgz
           if-no-files-found: error
 
   github-release:
@@ -111,8 +117,8 @@ jobs:
           TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
           gh release view "$TAG" >/dev/null 2>&1 \
-            && gh release upload "$TAG" agy-acp-*.tgz --clobber \
-            || gh release create "$TAG" agy-acp-*.tgz --generate-notes --title "$TAG"
+            && gh release upload "$TAG" magpie-agy-acp-*.tgz --clobber \
+            || gh release create "$TAG" magpie-agy-acp-*.tgz --generate-notes --title "$TAG"
 
   npm-publish:
     needs: verify
@@ -135,23 +141,24 @@ jobs:
         run: |
           set +e
           if [ -n "$NPM_TOKEN" ]; then
-            NODE_AUTH_TOKEN="$NPM_TOKEN" npm publish agy-acp-*.tgz --access public --provenance
+            NODE_AUTH_TOKEN="$NPM_TOKEN" npm publish magpie-agy-acp-*.tgz --access public --provenance
             status=$?
           else
-            npm publish agy-acp-*.tgz --access public --provenance
+            npm publish magpie-agy-acp-*.tgz --access public --provenance
             status=$?
           fi
           if [ $status -ne 0 ]; then
             {
               echo "### npm publish did not run"
               echo
-              echo "The tag's GitHub release shipped the tarball, which is what"
-              echo "\`magpie plugin add github:sidkang/agy-acp\` installs. To also"
-              echo "publish on npm, either name this workflow as the package's"
-              echo "Trusted Publisher:"
+              echo "The tag's GitHub release attached \`magpie-agy-acp-*.tgz\`"
+              echo "(\`magpie plugin add github:sidkang/agy-acp\` installs from the"
+              echo "repository default branch). To also publish \`magpie-agy-acp\`"
+              echo "on npm, either name this workflow as the package's Trusted"
+              echo "Publisher:"
               echo
               echo '```sh'
-              echo "npx npm@latest trust github agy-acp --file release.yml --repo sidkang/agy-acp --allow-publish -y"
+              echo "npx npm@latest trust github magpie-agy-acp --file release.yml --repo sidkang/agy-acp --allow-publish --registry=https://registry.npmjs.org/ -y"
               echo '```'
               echo
               echo "or add a granular \`NPM_TOKEN\` repository secret."

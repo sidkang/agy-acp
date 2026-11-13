@@ -1,6 +1,6 @@
 # NOTICE
 
-`agy-acp` (`https://github.com/sidkang/agy-acp`) is an independent MIT-licensed fork and strict TypeScript rewrite derived from `@magpie-community/opencode-agy-cli-auth` (`magpie-community/plugins/packages/agy-cli`), originally created from `DylanLIiii/opencode-antigravity-bridge` with contributions by `gitxm` and `yce`.
+`magpie-agy-acp` (provider ID `agy-acp`, `https://github.com/sidkang/agy-acp`) is an independent MIT-licensed fork and strict TypeScript rewrite derived from `@magpie-community/opencode-agy-cli-auth` (`magpie-community/plugins/packages/agy-cli`), originally created from `DylanLIiii/opencode-antigravity-bridge` with contributions by `gitxm` and `yce`.
 
 Upstream copyright notices are preserved verbatim in [LICENSE](./LICENSE).
 

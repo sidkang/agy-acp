@@ -2277,9 +2277,9 @@ describe("cloak.ts", () => {
         model: "agy-acp/gemini-3.8-flash",
         messages: [{ role: "user", content: "pwd" }],
       }),
-      new Headers({ "x-magpie-work-dir": "%2FUsers%2Fsid%2FMy%20Project" }),
+      new Headers({ "x-magpie-work-dir": "%2FUsers%2Fexample%2FMy%20Project" }),
       { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false },
     );
-    expect(parsed.workDir).toBe("/Users/sid/My Project");
+    expect(parsed.workDir).toBe("/Users/example/My Project");
   });
 });

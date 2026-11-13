@@ -184,7 +184,7 @@ async function AntigravityMagpiePlugin(
     config: async (cfg: Record<string, any>) => {
       cfg.provider ??= {};
       const entry = (cfg.provider[PROVIDER_ID] ??= {});
-      entry.name ??= "Antigravity ACP";
+      entry.name ??= "Antigravity (multi-account local agy CLI)";
       entry.npm ??= "@ai-sdk/anthropic";
       entry.api ??= "agy://local";
       entry.models ??= buildProviderModels(getStaticFallbackCatalog(), {
@@ -195,7 +195,7 @@ async function AntigravityMagpiePlugin(
     auth: {
       provider: PROVIDER_ID,
       single: false,
-      maxConcurrency: 36,
+      maxConcurrency: positiveInt(pkgOptions?.maxPerAccountWorkers) ?? 18,
       maxAccounts: 0,
       options: buildProviderOptionSchemas(pkgOptions),
       importFrom: IMPORT_FROM_EN,

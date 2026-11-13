@@ -1,83 +1,93 @@
-# 500 / 429 与多账号未切换排查
+# Error Classification, Turn Log Diagnostics & Multi-Account Routing
 
-排查日期：2026-11-13。修复版本：`agy-acp 0.1.1`。线上参考：`edge`，Magpie `0.1.3961`，`agy 1.5.8`。
+This document serves as a technical reference for `agy acp` failure classification, turn-scoped log inspection (`TurnLogWatch` in `src/runtime/diagnostics.ts`), empirical `systemPrompt.append` trajectory serialization budget limits on `agy 1.5.8`, strict HTTP `429` / `401` metadata filtering, and complete `STATIC_FALLBACK_MODELS` coverage (`src/usage/catalog.ts`) for multi-account failover in Magpie (`>= 0.1.3900`).
 
-## 已确认的线上证据
+---
 
-### 原生失败被插件隐藏成笼统 500
+## 1. Turn-Scoped Log Inspection (`TurnLogWatch`)
 
-请求 `1794529492309`（20:12:02，`gemini-4-carbon` / medium）的原生 worker 日志连续记录：
+### Why Base Log Reading Missed Upstream Failures
 
-```text
-agent executor error: generating and executing: serializing trajectory: maxMessageTokens must be positive, got 0
-```
+When `agy-acp` originally spawned `agy acp --process-per-session`, the frontend process wrote to `agy-acp.log`, while the spawned worker child wrote execution errors (`agent executor error: generating and executing: serializing trajectory: maxMessageTokens must be positive, got 0`) to a PID-suffixed file `agy-acp.log.<PID>`. Reading only `agy-acp.log` hid the real failure behind a generic HTTP `500` (`Agent execution terminated due to error`), causing retries on the same account.
 
-同一请求有 7 次尝试，全部落在账号 A；等待间隔为 1、2、2、4、8、16 秒。该请求约 1.96 MB 的请求体被反复发送，总上传约 13.7 MB。
+> Since `0.1.3` (Phase 2), `agy-acp` spawns `agy acp --worker --disable-telemetry` directly as a single process (preserving `mcpCapabilities.http` while eliminating the frontend wrapper process). Because `--worker` still writes execution logs to `agy-acp.log.<PID>`, `TurnLogWatch` continues to watch both `agy-acp.log` and `agy-acp.log.<PID>`.
 
-插件使用 `--process-per-session` 时，前台进程写 `agy-acp.log`，真正执行的子进程写 `agy-acp.log.<PID>`。旧诊断只读前者，漏掉了上面的真实错误。
+### Bounded Per-Turn Log & Stderr Isolation
 
-> 后续变更（`0.1.3` Phase 2）：桥接已改为直启单进程会话 worker（`agy acp --worker --disable-telemetry`，省去冗余前台进程，同时保留 `mcpCapabilities.http`）。`--worker` 仍将日志写入 `agy-acp.log.<PID>`，因此 `TurnLogWatch` 同时监听 `agy-acp.log` 与 `agy-acp.log.<PID>` 依然是必需能力。
+`TurnLogWatch` (`src/runtime/diagnostics.ts`) enforces strict per-turn boundaries so stale errors from earlier turns never poison the current turn's HTTP status:
 
-**边界：** 能确认错误发生在 `agy` 的 trajectory 序列化阶段，不能据此断言是账号额度耗尽，也不能单凭这一条日志确定是模型配置缺陷还是长系统提示/历史触发了预算问题。此次修复改善诊断，不声称修复了闭源 CLI 的零预算计算。
+1. **Snapshot at Turn Start (`markTurnStart`)**: Records the inode and byte offset of up to `8` (`DEFAULT_MAX_LOG_FILES`) log files total (`agy-acp.log` when present plus the newest `agy-acp.log.<PID>` files).
+2. **Bounded Delta Read (`readTurnEvidence`)**: Reads only bytes appended since the turn's mark (falling back to a bounded tail read when a file is new, rotated/replaced with a new inode, or truncated), capped at `64 KiB` per file (`DEFAULT_MAX_BYTES_PER_LOG`) and `256 KiB` total (`DEFAULT_MAX_TOTAL_LOG_BYTES`).
+3. **Incremental Stderr Diffing (`stderrDelta`)**: Extracts only bytes appended to the worker's `16 KiB` stderr ring buffer since the turn started (matching the longest suffix-prefix overlap if the ring wrapped), and strips `AcpConnection.handleExit` `Stderr tail:` wrappers in `normalizeRuntimeText()` before classifying RPC error strings so startup chatter cannot leak into turn diagnostics.
 
-### 零预算错误的实测触发条件（`0.1.4`）
+---
 
-在 `edge` 上用真实账号复现：`agy acp --worker --disable-telemetry`，每例新建独立会话，历史通过 `_meta.antigravity.systemPrompt.append` 注入 `_meta`，模型 `gemini-4-carbon` / `high`，用户消息固定为 `Reply with the single word OK.`。
+## 2. Empirical `systemPrompt.append` Trajectory Serialization Budget (`agy 1.5.8`)
 
-| 注入的 append 体积 | 结果 |
+### Reproducible Probes
+
+Tested with isolated `agy 1.5.8` (`agy acp --worker --disable-telemetry`), creating a fresh session per case, injecting conversation history via `_meta.antigravity.systemPrompt.append`, using `gemini-4-carbon` (`high` effort) and the fixed user prompt `Reply with the single word OK.`:
+
+| Injected `append` Payload Size | Observed Result |
 | --- | --- |
-| 200,000 字节 | 成功，`inputTokens 46,518` |
-| 500,000 字节 | 成功，`inputTokens 113,188` |
-| 720,000 字节（英文） | 成功，`inputTokens 162,071` |
-| 760,000 字节（英文） | 失败：`serializing trajectory: no messages fit within the context token budget` |
-| 780,000 / 786,000 / 790,000 / 1,000,000 / 1,200,000 字节 | 失败：`serializing trajectory: maxMessageTokens must be positive, got 0` |
-| 720,000 字节（中文，240,000 字） | 成功，`inputTokens 137,721` |
-| 760,002 字节（中文，253,334 字） | 失败 |
+| 200,000 bytes (English) | Pass (`inputTokens 46,518`) |
+| 500,000 bytes (English) | Pass (`inputTokens 113,188`) |
+| 720,000 bytes (English) | Pass (`inputTokens 162,071`) |
+| 760,000 bytes (English) | Fail: `serializing trajectory: no messages fit within the context token budget` |
+| 780,000 / 786,000 / 790,000 / 1,000,000 / 1,200,000 bytes (English) | Fail: `serializing trajectory: maxMessageTokens must be positive, got 0` |
+| 720,000 bytes (CJK, 240,000 characters) | Pass (`inputTokens 137,721`) |
+| 760,002 bytes (CJK, 253,334 characters) | Fail |
 
-结论与边界：
+### Observed Boundaries & Mitigations
 
-- 触发条件是可独立复现的**大 append 块**，不是某个模型/effort 配置、MCP 3 分钟超时（无工具探针同样复现），也不是 `--process-per-session` → `--worker` 切换（两条路径都复现）。
-- 边界随字节而不是随 token 移动：720,000 字节中文（137,721 token）通过，760,002 字节中文（约 145,000 token）失败；而 720,000 字节英文（162,071 token）通过。
-- 单次 `session/prompt` 用户消息会在约 178 KB 处被静默截断（1,800,000 字符探针只计 44,603 input token），而 `systemPrompt.append` 不会被截断，所以超限直接变成硬失败。
-- 热会话不受影响：同一会话后续回合大多命中缓存（实测 `cache 199,732 + new 3,573`），只有被迫冷重放时才需要重新注入整块历史。
-- 未证明原生预算公式。`1,048,576 − 262,144 = 786,432` 与观测到的失败边界接近，但这是数值吻合，不是已验证的推导。
-- 因此把插件的 append 历史预算降到 **512 KiB**（含系统提示词与工具说明之外的实际 append 文本），并在字节预算中扣除真实系统提示文本；这是有界缓解，不是对闭源 CLI 预算算法的修复。
+- **Independent of Effort / Timeout / Process Model**: Reproduces without tools (ruling out MCP timeouts) and identically across both `--process-per-session` and `--worker`.
+- **Byte-Tracked Boundary**: The failure threshold tracks serialized byte length rather than token count—720,000 bytes of CJK text (`137,721` tokens) succeeds while 760,002 bytes of CJK (~145,000 tokens) fails, whereas 720,000 bytes of English (`162,071` tokens) succeeds.
+- **`session/prompt` vs `systemPrompt.append`**: A single `session/prompt` user message is silently truncated around ~178 KB (a `1,800,000`-character probe reported only `44,603` input tokens), whereas `systemPrompt.append` is not truncated and triggers a hard trajectory serialization error once exceeded.
+- **Warm Sessions Unaffected**: Subsequent turns in an active session hit prompt cache (`cache 199,732 + new 3,573` measured in a follow-up turn); only cold replays re-inject full prior history.
+- **Unpublished Native Formula**: While `1,048,576 - 262,144 = 786,432` is numerically close to the observed `780,000`-byte boundary, that correspondence is an unverified coincidence rather than a proven formula.
+- **Bounded Bridge Mitigation (`src/sessions/prompt-render.ts`)**: `agy-acp` caps `<prior_conversation_history>` cold-replay appends at **`512 KiB`** by default (`64 KiB` for GPT-OSS models, overridable via `AGY_BRIDGE_MAX_SYSTEM_HISTORY_BYTES`), deducting the actual system prompt bytes so cold replays stay well below the failure threshold (replacing the original `2 MiB` ceiling that routinely hit this range).
 
-### 旧 429 分类存在误判风险
+### `context_budget` Classification (HTTP `500`)
 
-旧代码对整段日志和整个 stderr 尾部使用 `/429|RESOURCE_EXHAUSTED|exhausted your quota|quota/i`：
+`classifyAgentFailure()` maps both native phrasings (`maxMessageTokens must be positive, got 0` and `no messages fit within the context token budget`) to `"context_budget"` (HTTP `500`) before checking quota or auth patterns, returning the fixed `CONTEXT_BUDGET_FAILURE_MESSAGE`:
 
-- `quotaProject=` 是普通登录元数据，不是额度耗尽。
-- 时间、PID、源码行号、端口等字段可能出现 `429`。
-- 前一轮的限流日志、启动时临时的 “not logged in” 可能污染当前轮判断。
+> `Antigravity CLI could not serialize this conversation within its context limits. Try a shorter conversation or another model/effort setting.`
 
-线上 20:05:08 的请求记录为 429；其当时的完整执行日志已不可用，**不能追溯证明这一次是真限流还是误判**。
+This message intentionally avoids words like `quota` or `rate limit` (even negated), because Magpie's gateway `quotaWords` regex (`fallback.go`) scans error text and would wrongly park a healthy account if those words appeared. Unclassified internal failures similarly return the fixed `GENERIC_FAILURE_MESSAGE` (`Agent execution terminated due to error`) without interpolating raw stderr tails.
 
-### 第二个账号被模型列表排除
+---
 
-请求 `1794529492309` 的路由详情：
+## 3. Strict `429` / `401` Metadata Stripping & Failure Precedence
 
-- `order` 只有账号 A。
-- 账号 B 在 `left` 中，`unlisted: true`，模型为 `gemini-4-carbon`。
-- 因而不是“第二个账号执行后也失败”，而是它根本未被尝试。
+Earlier log matching ran `/429|RESOURCE_EXHAUSTED|exhausted your quota|quota/i` across raw log and stderr tails, creating false positives:
 
-Magpie 按插件给出的每账号模型表筛选候选；`FellBack` 标记不会在 `pluginLists` 中自动放开该表。插件原来的 `STATIC_FALLBACK_MODELS` 缺少 Carbon、Hydrogen 和两个 Orchestrator，首次探测超出 1500 ms 快速等待预算时会返回这份不完整列表。已补齐这条确定的排除路径；历史请求当时具体用了哪一份模型快照未保留，不能把推断写成已复现事实。
+- **`quotaProject=` Metadata**: Routine OAuth/login metadata contains `quotaProject=<id>`. `isBenignEvidence()` treats `quotaProject=` records as benign unless accompanied by a real quota/429 signal, and `normalizeRuntimeText()` strips `quotaProject=...` values.
+- **glog Prefixes**: `GLOG_PREFIX_RE` (`^([IWEF])(\d{4} \d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+.*?)\]\s?([\s\S]*)$`) strips severity, timestamps, PIDs, and source line numbers before keyword matching so numeric `429` substrings in PIDs, ports, or timestamps never trigger `429` classification.
+- **Severity & Wording Gates (`extractErrorEvidence`)**:
+  - `I` (info) glog records are discarded unconditionally.
+  - `W` (warning) records require an unambiguous signal (`STRONG_SIGNAL_RE` or `STATUS_429_RE`).
+  - `STATUS_429_RE` requires HTTP/status/gRPC context (e.g., `HTTP/1.1 429`, `status: 429`, `code=429`, `(429)`, `429 Too Many Requests`), never bare numbers.
+  - Unprefixed prose must match `FAILURE_WORDING_RE` or `hasVerdictSignal()`, and benign launcher messages (`failed to open browser`, `xdg-open`) are ignored.
+- **Auth Chatter Separation (`AUTH_RE` vs `RPC_AUTH_RE`)**: Healthy `agy` processes routinely log `You are not logged into Antigravity.` during background startup quirk polling. Logs are matched against `AUTH_RE` (which excludes that ambient chatter), while `RPC_AUTH_RE` applies only to the turn's own ACP RPC error text (`normalizeRuntimeText` having stripped any `Stderr tail:`).
+- **Classification Precedence**: `context_budget` (500) -> `auth` (401) -> `quota` (429) -> `invalid_request` (400) -> `internal` (500). A zero-budget trajectory failure is never misreported as `429` or `401`.
 
-## 本次改动
+---
 
-- 对前台和数字 PID 后缀日志做逐文件、逐轮快照，只读当前轮新增的有界尾部。
-- 对 stderr 做逐轮增量提取，避免重用旧失败。
-- 分类前剥离日志元数据，要求明确的限流/额度错误证据；不把任意 `quota`、数字 `429` 当成限流。
-- 对两种 trajectory 序列化拒绝（`maxMessageTokens must be positive, got 0` 与 `no messages fit within the context token budget`）统一归类为 `context_budget`，返回明确但固定、安全的 500 消息，保留原始错误类别，不伪造 429 或登录失效。
-- 冷重放注入的 `<prior_conversation_history>` 系统追加块默认上限从 `2 MiB` 降到 `512 KiB`（`AGY_BRIDGE_MAX_SYSTEM_HISTORY_BYTES` 可覆盖），并在预算中扣除实际系统提示文本，避免再次进入实测失败区间。
-- 静态兜底目录补齐已知 22 个原生模型条目，保持 Carbon/Hydrogen 的真实模型与 effort 路由。
-- 不合并不同账号的权威模型列表，也不在插件中绕过 Magpie 私自读取其他账号凭据或切号。
+## 4. Complete `STATIC_FALLBACK_MODELS` Coverage for Multi-Account Routing
 
-## 验证与未完成边界
+Magpie filters candidate accounts per model using each account's reported model catalog; an account missing a requested model is marked `unlisted` and skipped rather than tried during failover.
 
-- 两个线上账号分别通过现有 `spawnAgy` 隔离边界，用 `gemini-3.8-flash-low` 完成原生 ACP 提问并回答 `OK`；原生 `session/set_model` 和 family + `thought_level` 路径均有成功样本。
-- `bun x tsc --noEmit` 通过；本地 Bun `1.3.14` 与 `edge` 的 Bun `1.4.4` 均在隔离临时目录运行完整测试：**242 pass / 0 fail**（1432 个断言）。
-- 回归测试覆盖编号日志、逐轮隔离、读取上限、真实/伪 429、真实登录错误、零预算错误及静态目录完整性，并通过 worker → SSE encoder 验证真实 HTTP 401/429/500 与登录失效响应头；也覆盖进程退出包装错误携带旧 stderr 的情况。
-- 两轮交叉审查（`gpt-6.1-sol` 与 `gpt-6-astra`）提出的重复过滤与 RPC 登录错误来源混淆问题均已修复；复审未发现剩余可证明问题。
-- 本次没有在生产账号上注入故障来验证自动切号；原生 Carbon 长对话错误也未宣称解决。
-- 完整三阶段改善计划仍见 `improvement-and-fix-plan.md`；本次是优先处理的线上错误与路由问题，不代表 Phase 2/3 已完成。
+Previously, `STATIC_FALLBACK_MODELS` in `src/usage/catalog.ts` omitted Carbon, Hydrogen, and Orchestrator entries. When an account's initial `agy models` probe exceeded the fast-wait timeout and returned the static fallback catalog, Magpie excluded that account from routing for those models instead of failing over to `Account B`.
+
+`STATIC_FALLBACK_MODELS` now includes all **22 known native model entries** so fresh or slow-probing accounts keep consistent family and effort routing across all accounts:
+
+- **Gemini 4 Carbon**: `gemini-4-carbon-high`, `gemini-4-carbon-medium`, `gemini-4-carbon-low`
+- **Gemini 4 Hydrogen**: `gemini-4-hydrogen-xhigh`, `gemini-4-hydrogen-high`, `gemini-4-hydrogen-medium`, `gemini-4-hydrogen-low`
+- **Orchestrator**: `gemini-pro-orchestrator`, `gemini-pro-orchestrator-argon`
+- **Gemini 4 Argon**: `gemini-4-argon-high`, `gemini-4-argon-medium`, `gemini-4-argon-low`
+- **Gemini 3.8 Flash**: `gemini-3.8-flash-high`, `gemini-3.8-flash-medium`, `gemini-3.8-flash-low`
+- **Claude Opus 5.5**: `claude-opus-5-5-high`, `claude-opus-5-5-medium`, `claude-opus-5-5-low`
+- **Claude Sonnet 5.5**: `claude-sonnet-5-5-high`, `claude-sonnet-5-5-medium`, `claude-sonnet-5-5-low`
+- **GPT-OSS 120B**: `gpt-oss-120b-medium`
+
+In addition, `catalog.ts` caches successful real `agy models` lists for 24 hours (capped at 128 accounts) so transient probe timeouts do not downgrade an account to a narrower catalog. Account catalogs remain strictly isolated per account—the plugin never merges model lists across accounts or reads another account's credentials to bypass Magpie's router.

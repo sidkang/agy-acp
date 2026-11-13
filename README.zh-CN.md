@@ -1,19 +1,23 @@
 # agy-acp
 
+[English](./README.md) | 简体中文
+
 面向 [Magpie](https://usemagpie.ai) 与 [OpenCode](https://opencode.ai) 的多账号 **Antigravity CLI（`agy acp`）** 模型插件。
 
 通过官方 `agy acp`（Agent Client Protocol）驱动本机 `agy` CLI，在 **`agy-acp`** Provider 下提供 `agy` 开放的 Gemini、Claude 与 GPT-OSS 系列模型；客户端工具通过本地回环 HTTP MCP 原样交由调用方执行。
 
-## 与现有插件的区别
+## 如何选择 Antigravity 插件
 
-| 能力 | `agy-acp`（本插件） | `agy-cli`（`@magpie-community/opencode-agy-cli-auth`） | `antigravity`（`@magpie-community/opencode-antigravity-auth`） |
-|---|---|---|---|
-| 上游通道 | 本机 `agy acp` 进程池 | 本机 `agy acp` 进程池 | OAuth Token 直连 HTTP 接口 |
-| 多账号池 | **支持**（独立目录凭证隔离 + 复用本机登录） | 不支持（`single: true`，受限于系统单钥匙串） | 支持 |
-| 工具桥接 | 原生 Streamable-HTTP MCP（`127.0.0.1`） | 劫持 `PATH` 下 `nc` 命令转发 stdio | 协议层直接透传 |
-| 会话与缓存 | 热进程粘性复用 + `session/resume` + WAL SQLite 逐 step 缓存结算 | 热进程池 + `session/resume` | 无状态 HTTP |
+Magpie 社区共有三款 Google Antigravity 渠道插件。对于同一个 Google 账号，**三者共享完全相同的 Google Antigravity 订阅配额池**（5 小时窗口与周限额）：
 
-> 说明：同一 Google 账号在 `agy-acp`、`agy-cli` 与 `antigravity` 下共用同一份 Antigravity 订阅额度池。
+| 对比维度 | `magpie-agy-acp`（`agy-acp`，本插件） | `opencode-agy-cli-auth`（`agy-cli`） | `opencode-antigravity-auth`（`antigravity`） |
+| :--- | :--- | :--- | :--- |
+| **调用方式 / 后端** | 调用本机已安装的官方 `agy` CLI（`agy acp --worker`），零额外下载 | 调用本机已安装的官方 `agy` CLI（`agy acp`），零额外下载 | 直接请求 Google 内部 HTTP 接口（无需安装 CLI） |
+| **登录与凭据存储** | 独立隔离的 `0600` 目录（不改写系统钥匙串）：支持浏览器 OAuth、远程回调 URL 粘贴、Switcher / CLIProxyAPI JSON 批量导入，或一键接管本机现有 `agy` 登录 | 依赖在终端手动执行 `agy` 登录，凭据存于系统钥匙串 | 在 Magpie 内直接管理多账号 OAuth 令牌 |
+| **多账号与配额轮换** | 多账号池 + 配额感知自动切号（识别 5h/周限额窗口与 Google AI Pro/Ultra 等级标识） | 仅限单账号（`single: true`） | 支持多账号 |
+| **无头 / 远程服务器支持** | 原生支持粘贴回调链接与 JSON/`refresh_token` 批量导入 | 需手动完成本机 CLI 登录与钥匙串配置 | 支持内置 OAuth 流程 |
+| **客户端工具桥接** | 原生本地回环 HTTP MCP（`127.0.0.1`），不污染环境变量 | 在 `PATH` 前端注入伪造的 `nc` 脚本转发 stdio（`--ide-mcp-port`） | HTTP 请求体直接转换 |
+| **图片与长会话容错** | 自动压缩超限内联图片（`>2000px` / `>5 MiB`），并在遇到 `lostMedia` 时自动剥离过期历史图片以保留上下文 | 沿用 `agy` 默认处理 | HTTP 接口直传 |
 
 ## 环境要求
 
@@ -24,14 +28,19 @@
 
 ```sh
 magpie plugin add github:sidkang/agy-acp
+# 发布至 npm 后也可使用：
+# magpie plugin add magpie-agy-acp
+
 magpie plugin login agy-acp
 ```
+
+> npm 包名为 `magpie-agy-acp`，Magpie / OpenCode 中的 Provider ID 仍为 **`agy-acp`**。
 
 模型调用格式为 `agy-acp/<模型>`（如 `agy-acp/gemini-3.8-flash`、`agy-acp/gemini-4-hydrogen`、`agy-acp/claude-sonnet-5-5`、`agy-acp/claude-opus-5-5`）。
 
 ### 登录与导入方式（支持多账号并发池）
 
-执行 `magpie plugin login agy-acp` 或在 **Magpie › Providers › Antigravity ACP** 中添加账号：
+执行 `magpie plugin login agy-acp` 或在 **Magpie › Providers › Antigravity (multi-account local agy CLI)** 中添加账号：
 
 1. **`Sign in with Google (browser)`（默认，浏览器自动回调）**：浏览器完成授权后自动本地回调完成登录；若 Magpie 跑在远程服务器或 Docker 中，可直接把浏览器落地的完整 `Callback URL` 粘贴到回调框完成登录。凭据以 `0600` 独立写入 `$XDG_DATA_HOME/agy-acp/accounts/<uuid>`，不触碰系统 Keychain。
 2. **文件批量导入 / 粘贴 JSON 或 `refresh_token`**：点击登录面板中的 **Import from a file instead…** 选择 JSON 文件批量导入（支持 Antigravity Switcher、CLIProxyAPI、`antigravity-oauth-token`、单账号或 `accounts` 数组 JSON，以及每行一个 `refresh_token` 的文本），或在 **Other ways to sign in…** 中直接粘贴。
@@ -46,7 +55,7 @@ magpie quota agy-acp
 
 ## 配置项
 
-### Provider 开关（Magpie › Providers › Antigravity ACP）
+### Provider 开关（Magpie › Providers › Antigravity (multi-account local agy CLI)）
 
 | 开关 | 默认值 | 说明 |
 |---|---|---|
@@ -62,6 +71,7 @@ magpie quota agy-acp
   "maxGlobalWorkers": 36,
   "maxPerAccountWorkers": 18,
   "idleTimeoutMs": 3600000,
+  "awaitingToolTimeoutMs": 600000,
   "waitTimeoutMs": 60000,
   "maxWaiters": 128,
   "maxWorkerRssBytes": 1073741824

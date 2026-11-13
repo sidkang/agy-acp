@@ -1,6 +1,6 @@
 {
-  "name": "agy-acp",
-  "version": "0.1.6",
+  "name": "magpie-agy-acp",
+  "version": "0.1.7",
   "description": "Multi-account Antigravity CLI (agy acp) model provider plugin for Magpie and OpenCode",
   "type": "module",
   "main": "./opencode.mjs",
@@ -11,7 +11,7 @@
   "files": [
     "src",
     "assets",
-    "docs",
+    "docs/claude-bridge-parity.md",
     "opencode.mjs",
     "opencode2.mjs",
     "README.md",
@@ -44,18 +44,21 @@
     "typescript": "^5.7.0"
   },
   "magpie": {
-    "name": "Antigravity ACP",
+    "name": "Antigravity (multi-account local agy CLI)",
     "icon": "https://raw.githubusercontent.com/sidkang/agy-acp/main/assets/icon.svg",
-    "maxConcurrency": 36,
+    "maxConcurrency": 18,
     "options": {
       "maxGlobalWorkers": 36,
       "maxPerAccountWorkers": 18,
       "idleTimeoutMs": 3600000,
-      "awaitingToolTimeoutMs": 600000
+      "awaitingToolTimeoutMs": 600000,
+      "waitTimeoutMs": 60000,
+      "maxWaiters": 128,
+      "maxWorkerRssBytes": 1073741824
     },
     "summary": {
-      "en": "Multi-account Antigravity CLI provider over ACP (agy acp): sign in to multiple isolated Google accounts or adopt your local agy login, with native HTTP MCP tool bridging, warm session reuse, session/resume, per-step cache token accounting, and quota-aware routing. Shares each Google account's Antigravity quota pool with antigravity and agy-cli.",
-      "zh": "基于本地 agy CLI（agy acp）的多账号 Antigravity 模型插件：支持隔离登录多个 Google 账号或复用本机 agy 登录，内置原生 HTTP MCP 工具桥接、热会话复用与 session/resume 续接、逐 step 缓存/Token 精确结算及配额自动切号。同一 Google 账号与 antigravity、agy-cli 共用同一额度池。"
+      "en": "Runs your locally installed agy CLI via official `agy acp --worker` (downloads nothing) with isolated multi-account sign-in: browser OAuth, remote callback-URL paste, Switcher/CLIProxyAPI token import, or one-click adoption of your existing local agy login, without touching OS Keychain. Unlike `antigravity` (direct internal HTTP client), sessions run through the real agy binary; unlike `agy-cli` (single OS Keychain login and PATH `nc` wrapper), it adds quota-aware multi-account failover (5h/weekly windows + Pro/Ultra badges), native loopback HTTP MCP tool bridging, automatic image downscaling, and session retention when historical media expires. Shares the same Google Antigravity quota pool per account with `antigravity` and `agy-cli`.",
+      "zh": "通过官方 `agy acp --worker` 运行你本机已安装的 agy CLI（不下载任何附加服务端），提供独立隔离的多账号登录：支持浏览器 OAuth、远程回调链接粘贴、Switcher/CLIProxyAPI 令牌批量导入，或一键接管本机现有 agy 登录，不占用系统钥匙串。相比直接请求内部 HTTP 接口的 `antigravity`，它走真实官方 agy 进程；相比仅支持系统钥匙串单账号且通过 PATH 注入 `nc` 脚本桥接的 `agy-cli`，它新增了基于配额感知的多账号自动切换（5 小时/周窗口与 Pro/Ultra 标识）、原生本地 HTTP MCP 工具桥接、大图自动压缩以及历史图片过期后的会话保留能力。同一 Google 账号与 `antigravity`、`agy-cli` 共享相同的 Google Antigravity 额度池。"
     }
   }
 }
