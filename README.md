@@ -61,9 +61,14 @@ magpie quota agy-acp
 {
   "maxGlobalWorkers": 36,
   "maxPerAccountWorkers": 18,
-  "idleTimeoutMs": 3600000
+  "idleTimeoutMs": 3600000,
+  "waitTimeoutMs": 60000,
+  "maxWaiters": 128,
+  "maxWorkerRssBytes": 1073741824
 }
 ```
+
+Saturation queues instead of failing fast: `waitTimeoutMs` bounds how long a request waits for a slot (`0` restores the immediate `503`), `maxWaiters` caps the queue, and a cleanly finished worker above `maxWorkerRssBytes` is parked and replaced (`0` disables recycling, `AGY_BRIDGE_MAX_WORKER_RSS_MB` overrides in MiB).
 
 `AGY_PATH` overrides the `agy` binary location; `AGY_ACP_DATA_DIR` overrides the isolated account storage root. See [docs/claude-bridge-parity.md](./docs/claude-bridge-parity.md) for alignment notes with Magpie's official Claude Code bridge.
 

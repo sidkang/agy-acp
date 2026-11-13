@@ -56,7 +56,8 @@
   - **影响**：若 A 的旧账本长于 B，`req.messages.slice(worker.committedMessages.length)` 为空，用户最新指令被静默吞掉。
   - **修复方案**：用单一判别联合类型 `resumeSource: { kind: "memory", entry } | { kind: "persisted", entry } | null` 贯穿选择与恢复后绑定；同时当内存 `parked` 前缀已不兼容新请求时主动剔除陈旧内存条目。
 
-- [ ] **[MED-4] 下游慢消费时 Worker `AsyncEventQueue` 无上限缓冲 + SSE 心跳无视背压**（`src/runtime/worker.ts:118–135, 703–776`；`src/protocol/anthropic.ts:1313–1321`）
+- [x] **[MED-4] 下游慢消费时 Worker `AsyncEventQueue` 无上限缓冲 + SSE 心跳无视背压**（`src/runtime/worker.ts:118–135, 703–776`；`src/protocol/anthropic.ts:1313–1321`）
+  - 已在 Phase 2 修复：16 MiB 上限、超限清空并以 `502` 结束回合并关闭 Worker；心跳仅在 `desiredSize > 0` 或存在 pull credit 时写入。
   - **影响**：客户端读完首帧后卡住时，SSE 虽停止拉取，但 ACP stdout 持续 `queue.push()` 无限堆积内存，且 15s 心跳帧无视 `desiredSize` 持续写入。
   - **修复方案**：为单回合 `AsyncEventQueue` 增加字节上限（如 `16 MiB`），超限主动报错回收该回合；SSE 心跳仅在 `desiredSize > 0` 时写入。
 
@@ -124,13 +125,17 @@
 5. **验证门禁**：为上述每一条缺陷补齐针对性回归单测（未读流取消、编码器遇错退役、双恢复源竞争、3 个串行迟到工具调用、文件锁超时恢复等），全量跑通 `tsc --noEmit` 与 `bun test`。
 
 ### Phase 2：进程瘦身、排队等位调度与存储治理（对标 Magpie `claude` 核心收益）
-1. **单进程模式切换**：在 `worker.ts` 移除冗余的 `--process-per-session`，增加 `--disable-telemetry`（实测单会话内存从 ~360 MiB 降至 ~167 MiB，进程数减半），并在 `edge` 真机回归多轮工具调用与 `session/resume`。
-2. **Scheduler 有界排队（Wait-for-Room）+ RSS 超限换新**：
-   - 在 `GlobalScheduler.ensureCapacity` 实现有界 FIFO 等待队列（默认最长等待 `60s`，支持 `AbortSignal` 随时中断退出，槽位释放即时唤醒），替代瞬时硬抛 `503`；
-   - 增加 Linux `/proc/<pid>/statm` / `ps` 子进程 RSS 采样，回合结束后若单 Worker RSS 超过阈值（如 `1 GiB`），自动 `parkSession` + 关闭旧进程，下轮走 `session/resume` 无损续接。
-3. **全面存储与缓冲治理**：
-   - 修复 **MED-4**（`AsyncEventQueue` 16 MiB 缓冲上限 + 背压感知心跳）与 `worker.ts` 诊断日志尾部有界读取（最多读末尾 `256 KiB`）；
-   - 扩展 `sweepStaleAccountStorage`：清理超 48h 的 `annotations/`、`implicit/`、`crashes/`，并在安全条件下回收 `conversation_summaries.db` 中已删会话的 FTS5 索引记录；为 `quota.ts` / `catalog.ts` 内存缓存补齐过期条目惰性清理。
+1. **单进程模式切换**:worker.ts 已用 `--disable-telemetry` 替换 `--process-per-session`。可选轮询日志 `agy-acp.log.<pid>` 逻辑保持不变（单进程下无该文件，读取为空），`session/resume` 与多轮工具调用由现有回归测试覆盖。
+2. **Scheduler 有界排队（Wait-for-Room）+ RSS 超限换新**:
+   - `GlobalScheduler` 新增 `waitTimeoutMs`（默认 `60s`，`0` 恢复立即 `503`）与 `maxWaiters`（默认 `128`）;按 FIFO 排队，槽位释放/Worker 转 `IDLE`/`unpin`/`unregister`/reap 任一事件均唤醒等待者，且不跨等待持锁（账号 A 满额不阻塞账号 B）。
+   - 新增 `src/runtime/rss.ts`（Linux `/proc` 遍历、其他 Unix 单次 `ps` 快照，`/proc` 不可用回退 `statm`），`AgySessionWorker.getRssBytes()` 在非 Linux 上 10s 内复用样本。`SessionCoordinator` 在干净结束的回合后若 `IDLE` Worker 超过 `maxWorkerRssBytes`（默认 `1 GiB`，`0` 关闭，可调 `AGY_BRIDGE_MAX_WORKER_RSS_MB`）则先 `parkSession` 再退役，下轮走 `session/resume` 无损续接。
+3. **全面存储与缓冲治理**:
+   - 修复 **MED-4**：单回合 `AsyncEventQueue` 16 MiB 上限（超限清空并以 `502` 结束该回合，触发 Worker 回收），`AsyncEventQueue` 不再计入直接交给读者的条目；SSE 心跳仅在 `desiredSize > 0` 或仍有 pull credit 时写入。
+   - `sweepStaleAccountStorage` 扩展：`annotations/`、`implicit/`、`crashes/`、根 `cli.log`（超龄删除或尾部截断）、`log/` 目录字节上限（默认 32 MiB，优先删最旧），并回收 `conversation_summaries.db` 中不存在对应 `conversations/<id>.db` 的 summary / FTS5 / parent 行（`busy_timeout=50`、`BEGIN IMMEDIATE`、乐观跳过）；不存在该库时绝不创建。
+   - `quota.ts` 与 `catalog.ts` 内存缓存惰性清理：配额缓存按 TTL 清理并上限 128 条；目录缓存保留真实列表 24h（避免探测失败退回更窄的模型集而让账号被 `unlisted` 排除），上限 128 条。
+   - 验证：`bun x tsc --noEmit` 通过；隔离环境完整测试 **263 pass / 0 fail**（含 `test/runtime-phase2.test.ts`、`test/storage-gc.test.ts`），并对新增逻辑做过变异校验（去掉唤醒/上限/回收后对应测试失败）。
+   - 未覆盖：SSE 心跳背压分支与 `rs` 进程树采样只在无真实 `agy` 的沙箱中审阅，未做长时线上观测。
+
 
 ### Phase 3：模块化架构解耦与高阶协议增强
 1. **模块化重构（ARCH-1 ~ ARCH-4）**：将 `coordinator.ts` 拆分为 `ledger.ts` + `prompt-render.ts` + `shelf-store.ts`（顺带落地 **MED-10** `parked-sessions.json` 文件锁增量事务），收敛 `worker.ts` 的 `turn-context.ts` 与 `usage/tracker.ts`。

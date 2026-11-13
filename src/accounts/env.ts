@@ -636,20 +636,239 @@ export interface AccountStorageGcOptions {
   maxAgeMs?: number;
   /** Active or parked native ACP session IDs that must never be pruned. */
   protectedSessionIds?: ReadonlySet<string>;
+  /** Default: 32 MiB of retained `log/*.log` output per account. */
+  maxLogDirBytes?: number;
 }
 
 const DEFAULT_STORAGE_GC_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+const DEFAULT_LOG_DIR_MAX_BYTES = 32 * 1024 * 1024;
+/** A surviving `cli.log` is tail-truncated to at least this much context. */
+const MIN_CLI_LOG_TAIL_BYTES = 1024 * 1024;
+/** A session this fresh may legitimately have no `conversations/<id>.db` yet. */
+const SUMMARY_ORPHAN_GRACE_MS = 5 * 60 * 1000;
+
+interface SummaryDbHandle {
+  all: (sql: string, ...params: any[]) => any[];
+  run: (sql: string, ...params: any[]) => void;
+  exec: (sql: string) => void;
+  close: () => void;
+}
 
 /**
- * Prunes expired `conversations/*.db*`, `brain/<sessionId>`, and `log/cli-*.log`
- * artifacts inside isolated account directories (`$AGY_ACP_DATA_DIR/accounts/*`)
- * so long-running gateways do not accumulate unbounded SQLite / tool-output files.
+ * Opens `conversation_summaries.db` read-write *without* creating it, so a
+ * gateway that never ran the CLI cannot materialize a stray empty database.
+ * Returns null when SQLite is unavailable or the file cannot be opened.
+ */
+function openSummaryDbReadWrite(file: string): SummaryDbHandle | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Database, constants } = require("bun:sqlite");
+    if (typeof Database === "function") {
+      const flags =
+        (constants?.SQLITE_OPEN_READWRITE ?? 2) |
+        (constants?.SQLITE_OPEN_URI ?? 0x40);
+      const db = new Database(file, flags);
+      return {
+        all: (sql: string, ...params: any[]) => db.prepare(sql).all(...params),
+        run: (sql: string, ...params: any[]) => {
+          db.prepare(sql).run(...params);
+        },
+        exec: (sql: string) => {
+          db.run(sql);
+        },
+        close: () => {
+          try {
+            db.close();
+          } catch {}
+        },
+      };
+    }
+  } catch {}
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require("node:sqlite");
+    if (typeof DatabaseSync === "function") {
+      const db = new DatabaseSync(file, { readOnly: false, timeout: 0 });
+      return {
+        all: (sql: string, ...params: any[]) => db.prepare(sql).all(...params),
+        run: (sql: string, ...params: any[]) => {
+          db.prepare(sql).run(...params);
+        },
+        exec: (sql: string) => {
+          db.exec(sql);
+        },
+        close: () => {
+          try {
+            db.close();
+          } catch {}
+        },
+      };
+    }
+  } catch {}
+
+  return null;
+}
+
+/**
+ * Drops summary / full-text-index / parent rows whose `conversations/<id>.db`
+ * no longer exists, and compacts the FTS5 index afterwards.
+ *
+ * `agy 1.5.8` keeps `conversation_summaries.db` (with `conversations_fts` and
+ * `conversation_parents`) separate from `conversations/*.db`, so deleting an old
+ * transcript leaves its index rows behind. Everything here is best-effort: a
+ * locked or unexpected schema is skipped silently instead of failing the sweep.
+ */
+function reclaimConversationSummaryOrphans(
+  cliDir: string,
+  keepIds: ReadonlySet<string>,
+  now: number,
+  maxAgeMs: number,
+): number {
+  const summaryDbPath = path.join(cliDir, "conversation_summaries.db");
+  if (!fs.existsSync(summaryDbPath)) return 0;
+
+  const db = openSummaryDbReadWrite(summaryDbPath);
+  if (!db) return 0;
+
+  try {
+    try {
+      db.exec("PRAGMA busy_timeout = 50");
+    } catch {}
+
+    const tables = new Set<string>();
+    for (const row of db.all(
+      "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')",
+    )) {
+      const name = typeof row?.name === "string" ? row.name : "";
+      if (name) tables.add(name);
+    }
+    if (tables.size === 0) return 0;
+
+    const recentGraceMs = Math.min(maxAgeMs, SUMMARY_ORPHAN_GRACE_MS);
+    const recentIds = new Set<string>();
+    const orphanIds = new Set<string>();
+    const noteId = (raw: unknown): string => {
+      if (typeof raw !== "string") return "";
+      const id = raw.trim();
+      return id && !keepIds.has(id) ? id : "";
+    };
+
+    if (tables.has("conversation_summaries")) {
+      const rows = db.all(
+        "SELECT conversation_id, last_modified_time FROM conversation_summaries",
+      );
+      for (const row of rows) {
+        const id = noteId(row?.conversation_id);
+        if (!id) continue;
+        const raw = row?.last_modified_time;
+        const parsed =
+          typeof raw === "number"
+            ? raw < 1e12
+              ? raw * 1000
+              : raw
+            : typeof raw === "string"
+              ? Date.parse(raw)
+              : Number.NaN;
+        if (Number.isFinite(parsed) && now - parsed <= recentGraceMs) {
+          recentIds.add(id);
+        }
+      }
+      for (const row of rows) {
+        const id = noteId(row?.conversation_id);
+        if (id && !recentIds.has(id)) orphanIds.add(id);
+      }
+    }
+
+    if (tables.has("conversations_fts")) {
+      for (const row of db.all(
+        "SELECT DISTINCT conversation_id FROM conversations_fts",
+      )) {
+        const id = noteId(row?.conversation_id);
+        if (id && !recentIds.has(id)) orphanIds.add(id);
+      }
+    }
+
+    if (tables.has("conversation_parents")) {
+      for (const row of db.all(
+        "SELECT conversation_id, parent_id FROM conversation_parents",
+      )) {
+        for (const raw of [row?.conversation_id, row?.parent_id]) {
+          const id = noteId(raw);
+          if (id && !recentIds.has(id)) orphanIds.add(id);
+        }
+      }
+    }
+
+    if (orphanIds.size === 0) return 0;
+
+    let deleted = 0;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+    } catch {
+      return 0;
+    }
+    try {
+      for (const id of orphanIds) {
+        if (tables.has("conversations_fts")) {
+          db.run("DELETE FROM conversations_fts WHERE conversation_id = ?", id);
+        }
+        if (tables.has("conversation_parents")) {
+          db.run(
+            "DELETE FROM conversation_parents WHERE conversation_id = ? OR parent_id = ?",
+            id,
+            id,
+          );
+        }
+        if (tables.has("conversation_summaries")) {
+          db.run("DELETE FROM conversation_summaries WHERE conversation_id = ?", id);
+        }
+        deleted++;
+      }
+      db.exec("COMMIT");
+    } catch {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      return 0;
+    }
+
+    try {
+      if (tables.has("conversations_fts")) {
+        db.run("INSERT INTO conversations_fts(conversations_fts) VALUES('optimize')");
+      }
+    } catch {}
+    try {
+      db.exec("PRAGMA wal_checkpoint(PASSIVE)");
+    } catch {}
+
+    return deleted;
+  } catch {
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Prunes expired artifacts inside isolated account directories
+ * (`$AGY_ACP_DATA_DIR/accounts/*`) so long-running gateways do not accumulate
+ * unbounded SQLite / tool-output / log files:
+ *
+ * 1. `conversations/*.db` (+ `-wal` / `-shm`)
+ * 2. `brain/<sessionId>/`
+ * 3. `log/*.log` older than `maxAgeMs`, then capped to `maxLogDirBytes`
+ * 4. `annotations/<sessionId>.pbtxt` and `implicit/<sessionId>.pb`
+ * 5. `crashes/*`
+ * 6. `cli.log` (age prune or tail truncation)
+ * 7. orphaned `conversation_summaries.db` rows + FTS5 index entries
  */
 export function sweepStaleAccountStorage(
   options: AccountStorageGcOptions = {},
 ): number {
   const now = options.now ?? Date.now();
   const maxAgeMs = options.maxAgeMs ?? DEFAULT_STORAGE_GC_MAX_AGE_MS;
+  const maxLogDirBytes = options.maxLogDirBytes ?? DEFAULT_LOG_DIR_MAX_BYTES;
   const protectedIds = options.protectedSessionIds ?? new Set<string>();
   let removed = 0;
 
@@ -677,6 +896,10 @@ export function sweepStaleAccountStorage(
       "antigravity-cli",
     );
 
+    // Session IDs that still have a transcript on disk, plus whatever the
+    // caller marked active: nothing below may drop artifacts for these.
+    const keepIds = new Set<string>(protectedIds);
+
     // 1. Prune conversations/<sessionId>.db (+ -wal / -shm sidecars)
     const convDir = path.join(cliDir, "conversations");
     try {
@@ -685,7 +908,11 @@ export function sweepStaleAccountStorage(
         for (const ent of entries) {
           if (!ent.isFile() || !ent.name.endsWith(".db")) continue;
           const sessionId = ent.name.slice(0, -3);
-          if (!sessionId || protectedIds.has(sessionId)) continue;
+          if (!sessionId) continue;
+          if (protectedIds.has(sessionId)) {
+            keepIds.add(sessionId);
+            continue;
+          }
           const dbFile = path.join(convDir, ent.name);
           const walFile = `${dbFile}-wal`;
           const shmFile = `${dbFile}-shm`;
@@ -702,6 +929,8 @@ export function sweepStaleAccountStorage(
               } catch {}
             }
             removed++;
+          } else {
+            keepIds.add(sessionId);
           }
         }
       }
@@ -742,14 +971,84 @@ export function sweepStaleAccountStorage(
       }
     } catch {}
 
-    // 3. Prune log/cli-*.log files
+    // 3. Prune log/cli-*.log by age, then cap the retained byte budget
     const logDir = path.join(cliDir, "log");
     try {
       if (fs.existsSync(logDir)) {
         const entries = fs.readdirSync(logDir, { withFileTypes: true });
+        const retainedLogs: Array<{
+          filePath: string;
+          size: number;
+          mtimeMs: number;
+        }> = [];
+        let retainedBytes = 0;
         for (const ent of entries) {
           if (!ent.isFile() || !ent.name.endsWith(".log")) continue;
           const target = path.join(logDir, ent.name);
+          const st = fs.statSync(target);
+          if (now - st.mtimeMs > maxAgeMs) {
+            fs.rmSync(target, { force: true });
+            removed++;
+            continue;
+          }
+          retainedLogs.push({
+            filePath: target,
+            size: st.size,
+            mtimeMs: st.mtimeMs,
+          });
+          retainedBytes += st.size;
+        }
+        if (retainedBytes > maxLogDirBytes) {
+          retainedLogs.sort((a, b) => a.mtimeMs - b.mtimeMs);
+          for (const log of retainedLogs) {
+            if (retainedBytes <= maxLogDirBytes) break;
+            try {
+              fs.rmSync(log.filePath, { force: true });
+              retainedBytes -= log.size;
+              removed++;
+            } catch {}
+          }
+        }
+      }
+    } catch {}
+
+    // 4. Prune annotations/<sessionId>.pbtxt and implicit/<sessionId>.pb
+    for (const sub of ["annotations", "implicit"]) {
+      const dir = path.join(cliDir, sub);
+      try {
+        if (!fs.existsSync(dir)) continue;
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const ent of entries) {
+          if (!ent.isFile()) continue;
+          const stem = path.parse(ent.name).name;
+          if (protectedIds.has(stem) || protectedIds.has(ent.name)) continue;
+          if (keepIds.has(stem)) continue;
+          const target = path.join(dir, ent.name);
+          const st = fs.statSync(target);
+          if (now - st.mtimeMs > maxAgeMs) {
+            fs.rmSync(target, { force: true });
+            removed++;
+          }
+        }
+      } catch {}
+    }
+
+    // 5. Prune crashes/* (names embed one or more session/process IDs)
+    const crashDir = path.join(cliDir, "crashes");
+    try {
+      if (fs.existsSync(crashDir)) {
+        const entries = fs.readdirSync(crashDir, { withFileTypes: true });
+        for (const ent of entries) {
+          if (!ent.isFile()) continue;
+          let referenced = false;
+          for (const id of protectedIds) {
+            if (id && ent.name.includes(id)) {
+              referenced = true;
+              break;
+            }
+          }
+          if (referenced) continue;
+          const target = path.join(crashDir, ent.name);
           const st = fs.statSync(target);
           if (now - st.mtimeMs > maxAgeMs) {
             fs.rmSync(target, { force: true });
@@ -758,8 +1057,39 @@ export function sweepStaleAccountStorage(
         }
       }
     } catch {}
+
+    // 6. Age-prune or tail-truncate the root cli.log
+    const cliLogPath = path.join(cliDir, "cli.log");
+    try {
+      if (fs.existsSync(cliLogPath)) {
+        const st = fs.statSync(cliLogPath);
+        if (st.isFile()) {
+          if (now - st.mtimeMs > maxAgeMs) {
+            fs.rmSync(cliLogPath, { force: true });
+            removed++;
+          } else if (st.size > maxLogDirBytes && now - st.mtimeMs > 60_000) {
+            const keepBytes = Math.min(maxLogDirBytes, MIN_CLI_LOG_TAIL_BYTES);
+            const length = Math.min(keepBytes, st.size);
+            let tail = Buffer.alloc(0);
+            const fd = fs.openSync(cliLogPath, "r");
+            try {
+              tail = Buffer.alloc(length);
+              fs.readSync(fd, tail, 0, length, st.size - length);
+            } finally {
+              fs.closeSync(fd);
+            }
+            const tmp = `${cliLogPath}.gc-tmp`;
+            fs.writeFileSync(tmp, tail, { mode: st.mode & 0o777 });
+            fs.renameSync(tmp, cliLogPath);
+            removed++;
+          }
+        }
+      }
+    } catch {}
+
+    // 7. Reclaim orphaned summary rows and FTS5 index entries
+    removed += reclaimConversationSummaryOrphans(cliDir, keepIds, now, maxAgeMs);
   }
 
   return removed;
 }
-

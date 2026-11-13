@@ -782,6 +782,9 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const smallScheduler = new GlobalScheduler({
       maxGlobalWorkers: 2,
       maxPerAccountWorkers: 2,
+      // Phase 2 parks saturated requests for a bounded wait by default; this
+      // case asserts the historical fail-fast contract explicitly.
+      waitTimeoutMs: 0,
     });
 
     const mockWorkerIdle: any = {
@@ -1601,6 +1604,8 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     const smallScheduler = new GlobalScheduler({
       maxGlobalWorkers: 2,
       maxPerAccountWorkers: 2,
+      // Fail fast instead of parking: this asserts the hard cap itself.
+      waitTimeoutMs: 0,
     });
 
     const w1 = new AgySessionWorker(testAccount, "sess-1", mcpServer, {

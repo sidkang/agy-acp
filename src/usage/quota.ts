@@ -161,6 +161,7 @@ async function refreshAccessTokenForPlan(
   refreshToken: string,
   signal?: AbortSignal,
 ): Promise<string | undefined> {
+  pruneQuotaCaches(Date.now());
   const cached = refreshedTokenCache.get(refreshToken);
   if (cached && cached.expiresAtMs - Date.now() > 2 * 60 * 1000) {
     return cached.accessToken;
@@ -468,6 +469,84 @@ interface CacheEntry {
 const usageCache = new Map<string, CacheEntry>();
 const CACHE_TTL_MS = 30_000;
 
+/** Upper bound on retained cache entries; long-lived gateways see many slots. */
+const MAX_USAGE_CACHE_ENTRIES = 128;
+
+/**
+ * Lazily drops expired cache entries before each use so a gateway process that
+ * has seen many re-authenticated slots cannot grow these maps without bound.
+ * In-flight work is never evicted: it would strand its promise.
+ */
+function pruneQuotaCaches(now: number): void {
+  for (const [key, entry] of Array.from(usageCache)) {
+    if (entry.inFlight) continue;
+    if (!entry.data || now - entry.timestamp >= CACHE_TTL_MS) {
+      usageCache.delete(key);
+    }
+  }
+  evictOldestEntries(usageCache, (entry) => !entry.inFlight, (entry) =>
+    entry.inFlight ? Number.POSITIVE_INFINITY : entry.timestamp,
+  );
+
+  for (const [key, entry] of Array.from(planCache)) {
+    if (entry.inFlight) continue;
+    if (now - entry.timestamp >= PLAN_CACHE_TTL_MS) {
+      planCache.delete(key);
+    }
+  }
+  evictOldestEntries(planCache, (entry) => !entry.inFlight, (entry) =>
+    entry.inFlight ? Number.POSITIVE_INFINITY : entry.timestamp,
+  );
+
+  for (const [key, entry] of Array.from(refreshedTokenCache)) {
+    if (entry.expiresAtMs - now <= 2 * 60 * 1000) {
+      refreshedTokenCache.delete(key);
+    }
+  }
+  evictOldestEntries(refreshedTokenCache, () => true, (entry) =>
+    entry.expiresAtMs,
+  );
+}
+
+/**
+ * Trims `map` down to `MAX_USAGE_CACHE_ENTRIES`, always evicting the lowest
+ * ranked (oldest) entry first and never touching an entry `evictable` rejects
+ * (in-flight work). Exported for the cache-bound unit test.
+ */
+export function evictOldestEntries<T>(
+  map: Map<string, T>,
+  evictable: (entry: T) => boolean,
+  rank: (entry: T) => number,
+): void {
+  while (map.size > MAX_USAGE_CACHE_ENTRIES) {
+    let victimKey: string | undefined;
+    let victimRank = Number.POSITIVE_INFINITY;
+    for (const [key, entry] of map) {
+      if (!evictable(entry)) continue;
+      const value = rank(entry);
+      if (value < victimRank) {
+        victimRank = value;
+        victimKey = key;
+      }
+    }
+    if (victimKey === undefined) return;
+    map.delete(victimKey);
+  }
+}
+
+/** Test-only introspection: sizes are public metadata, never credential data. */
+export function __getQuotaCacheStatsForTest(): {
+  usageCacheSize: number;
+  planCacheSize: number;
+  refreshedTokenCacheSize: number;
+} {
+  return {
+    usageCacheSize: usageCache.size,
+    planCacheSize: planCache.size,
+    refreshedTokenCacheSize: refreshedTokenCache.size,
+  };
+}
+
 /**
  * Only a measured, signed-in result is worth replaying. An `expired` or
  * transient failure must be retried on the next call so a fresh sign-in (or a
@@ -507,6 +586,7 @@ export async function queryAccountUsage(
   const cacheScopeKey = `${account.accountRef}::${account.slotKey}`;
   const cacheKey = `${cacheScopeKey}:${options.quotaRouting}`;
   const now = Date.now();
+  pruneQuotaCaches(now);
   const cached = usageCache.get(cacheKey);
 
   if (cached?.data && now - cached.timestamp < CACHE_TTL_MS) {

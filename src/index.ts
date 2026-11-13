@@ -153,12 +153,22 @@ async function AntigravityMagpiePlugin(
           positiveInt(pkgOptions?.idleTimeoutMs) ??
           positiveInt(pkgOptions?.idleTtlMs),
         awaitingToolTimeoutMs: positiveInt(pkgOptions?.awaitingToolTimeoutMs),
+        // `0` is a meaningful override (fail fast), so it must survive padding.
+        waitTimeoutMs:
+          pkgOptions?.waitTimeoutMs === 0
+            ? 0
+            : positiveInt(pkgOptions?.waitTimeoutMs),
+        maxWaiters: positiveInt(pkgOptions?.maxWaiters),
         installSignalHandlers: true,
       });
       const mcpServer = getSharedMcpServer();
       coordinator = new SessionCoordinator({
         scheduler,
         mcpServer,
+        maxWorkerRssBytes:
+          pkgOptions?.maxWorkerRssBytes === 0
+            ? 0
+            : positiveInt(pkgOptions?.maxWorkerRssBytes),
       });
     }
     return coordinator;

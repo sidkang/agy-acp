@@ -504,6 +504,9 @@ export function getStaticFallbackCatalog(): AccountCatalog {
 
 export const CATALOG_TTL_MS = 5 * 60 * 1000;
 export const CATALOG_FAST_WAIT_MS = 1500;
+/** Retain a real catalog for a day so a failed probe still answers from it. */
+const CATALOG_MAX_STALE_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_CATALOG_CACHE_ENTRIES = 128;
 
 interface CatalogLookup {
   catalog: AccountCatalog;
@@ -517,6 +520,39 @@ interface CatalogLookup {
 export class CatalogService {
   private cache = new Map<string, { catalog: AccountCatalog; fetchedAt: number }>();
   private inFlight = new Map<string, Promise<CatalogLookup>>();
+
+  /**
+   * Drops long-dead catalogs before each lookup. The TTL is deliberately far
+   * longer than `CATALOG_TTL_MS`: a stale-but-real list is what keeps a
+   * transiently failing probe from advertising a narrower model set (and thus
+   * hiding the account from Magpie's per-account routing).
+   */
+  private pruneStaleCache(now: number): void {
+    for (const [key, entry] of Array.from(this.cache)) {
+      if (this.inFlight.has(key)) continue;
+      if (now - entry.fetchedAt >= CATALOG_MAX_STALE_AGE_MS) {
+        this.cache.delete(key);
+      }
+    }
+    while (this.cache.size > MAX_CATALOG_CACHE_ENTRIES) {
+      let victimKey: string | undefined;
+      let victimAge = Number.POSITIVE_INFINITY;
+      for (const [key, entry] of this.cache) {
+        if (this.inFlight.has(key)) continue;
+        if (entry.fetchedAt < victimAge) {
+          victimAge = entry.fetchedAt;
+          victimKey = key;
+        }
+      }
+      if (victimKey === undefined) return;
+      this.cache.delete(victimKey);
+    }
+  }
+
+  /** Test-only introspection: number of retained per-account catalogs. */
+  getCacheSize(): number {
+    return this.cache.size;
+  }
 
   /**
    * Caches and single-flight slots are scoped by both descriptors: a slot can be
@@ -573,6 +609,7 @@ export class CatalogService {
   ): Promise<CatalogLookup> {
     const cacheScopeKey = CatalogService.cacheScopeKey(account);
     const now = Date.now();
+    this.pruneStaleCache(now);
     const cached = this.cache.get(cacheScopeKey);
 
     if (!options?.forceRefresh && cached && !cached.catalog.isFallback && now - cached.fetchedAt < CATALOG_TTL_MS) {

@@ -61,9 +61,14 @@ magpie quota agy-acp
 {
   "maxGlobalWorkers": 36,
   "maxPerAccountWorkers": 18,
-  "idleTimeoutMs": 3600000
+  "idleTimeoutMs": 3600000,
+  "waitTimeoutMs": 60000,
+  "maxWaiters": 128,
+  "maxWorkerRssBytes": 1073741824
 }
 ```
+
+满载时排队而非立即失败：`waitTimeoutMs` 控制等待槽位的最长时间（`0` 恢复立即 `503`），`maxWaiters` 限制等待队列长度；干净结束且进程树 RSS 超过 `maxWorkerRssBytes` 的 Worker 会先停靠再换新进程（`0` 关闭该策略，`AGY_BRIDGE_MAX_WORKER_RSS_MB` 以 MiB 覆盖）。
 
 可通过环境变量 `AGY_PATH` 指定 `agy` 可执行文件路径，`AGY_ACP_DATA_DIR` 指定隔离账号存储根目录。与 Magpie 官方 Claude 桥接的设计对齐说明见 [docs/claude-bridge-parity.md](./docs/claude-bridge-parity.md)。
 

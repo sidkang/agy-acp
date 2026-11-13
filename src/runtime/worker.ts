@@ -16,6 +16,7 @@ import {
   type TurnStreamEvent,
 } from "../types";
 import { AcpConnection } from "./acp-connection";
+import { measureProcessTreeRssBytes } from "./rss";
 import {
   CONTEXT_BUDGET_FAILURE_MESSAGE,
   GENERIC_FAILURE_MESSAGE,
@@ -90,6 +91,10 @@ export interface WorkerOptions {
   workspaceDir?: string;
   steerCancelTimeoutMs?: number;
   steerToolCommitTimeoutMs?: number;
+  /** Max bytes buffered for one turn before a slow consumer fails the turn. */
+  maxTurnBufferBytes?: number;
+  /** Test hook: overrides process-tree RSS sampling for this worker. */
+  measureRssBytes?: () => number;
   onStateChange?: (
     worker: AgySessionWorker,
     oldState: WorkerState,
@@ -99,6 +104,9 @@ export interface WorkerOptions {
 }
 
 const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n";
+
+/** `ps`-based RSS sampling is throttled to this window on non-Linux hosts. */
+const RSS_SAMPLE_COOLDOWN_MS = 10_000;
 const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim();
 
 function flattenOptions(opts: any[]): any[] {
@@ -124,29 +132,113 @@ export function createSyntheticThinkingSignature(
   return `agy1.${hmac}`;
 }
 
+/** 16 MiB is far above any legitimate single-turn event burst for this bridge. */
+export const DEFAULT_MAX_TURN_QUEUE_BYTES = 16 * 1024 * 1024;
+
+const DEFAULT_EVENT_OVERHEAD_BYTES = 128;
+
+function defaultEstimateEventBytes(item: any): number {
+  switch (item?.type) {
+    case "text_delta":
+      return 64 + Buffer.byteLength(String(item.text ?? ""));
+    case "thinking_delta":
+      return 64 + Buffer.byteLength(String(item.thinking ?? ""));
+    case "thinking_signature":
+      return 64 + Buffer.byteLength(String(item.signature ?? ""));
+    case "tool_use": {
+      let json = "{}";
+      try {
+        json = JSON.stringify(item.input ?? {});
+      } catch {
+        json = "{}";
+      }
+      return 128 + Buffer.byteLength(json);
+    }
+    default:
+      return DEFAULT_EVENT_OVERHEAD_BYTES;
+  }
+}
+
+export interface AsyncEventQueueOptions<T> {
+  /** Buffered-byte ceiling for undelivered items. Default 16 MiB. */
+  maxBufferedBytes?: number;
+  estimateBytes?: (item: T) => number;
+  /** Called once after the queue overflows and closes itself with an error. */
+  onOverflow?: (err: BridgeHttpError) => void;
+}
+
 export class AsyncEventQueue<T> implements AsyncIterable<T> {
   private queue: T[] = [];
+  private bufferedBytes = 0;
   private waiters: Array<{
     resolve: (item: IteratorResult<T>) => void;
     reject: (err: any) => void;
   }> = [];
   private closed = false;
   private error: any = null;
+  private readonly maxBufferedBytes: number;
+  private readonly estimateBytes: (item: T) => number;
+  private readonly onOverflow?: (err: BridgeHttpError) => void;
+
+  constructor(options?: AsyncEventQueueOptions<T>) {
+    this.maxBufferedBytes =
+      options?.maxBufferedBytes ?? DEFAULT_MAX_TURN_QUEUE_BYTES;
+    this.estimateBytes =
+      options?.estimateBytes ??
+      (defaultEstimateEventBytes as (item: T) => number);
+    this.onOverflow = options?.onOverflow;
+  }
+
+  /** Bytes currently buffered (items already handed to a waiter are not). */
+  get pendingBytes(): number {
+    return this.bufferedBytes;
+  }
+
+  private measure(item: T): number {
+    try {
+      const bytes = this.estimateBytes(item);
+      return Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+    } catch {
+      return 0;
+    }
+  }
 
   push(item: T): void {
     if (this.closed) return;
     if (this.waiters.length > 0) {
       const waiter = this.waiters.shift()!;
       waiter.resolve({ value: item, done: false });
-    } else {
-      this.queue.push(item);
+      return;
     }
+
+    const itemBytes = this.measure(item);
+    if (this.bufferedBytes + itemBytes > this.maxBufferedBytes) {
+      // A consumer that stopped reading must not let ACP stdout grow this queue
+      // without bound. Drop what is buffered and fail the turn instead.
+      this.queue = [];
+      this.bufferedBytes = 0;
+      const err = new BridgeHttpError(
+        502,
+        "api_error",
+        "Agent stream buffer exceeded maximum capacity due to slow consumer",
+      );
+      this.errorAndClose(err);
+      try {
+        this.onOverflow?.(err);
+      } catch {}
+      return;
+    }
+
+    this.queue.push(item);
+    this.bufferedBytes += itemBytes;
   }
 
   errorAndClose(err: any): void {
     if (this.closed) return;
     this.closed = true;
     this.error = err;
+    this.queue = [];
+    this.bufferedBytes = 0;
     while (this.waiters.length > 0) {
       const waiter = this.waiters.shift()!;
       waiter.reject(err);
@@ -165,6 +257,7 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
   async next(): Promise<IteratorResult<T>> {
     if (this.queue.length > 0) {
       const value = this.queue.shift()!;
+      this.bufferedBytes = Math.max(0, this.bufferedBytes - this.measure(value));
       return { value, done: false };
     }
     if (this.closed) {
@@ -291,9 +384,52 @@ export class AgySessionWorker {
   appliedSystemHistorySeed?: string;
 
   readonly activeAcpToolCallIds = new Set<string>();
-  pinned: boolean = false;
   steerCancelTimeoutMs?: number;
   steerToolCommitTimeoutMs?: number;
+
+  private _pinned: boolean = false;
+  private capacityListener?: () => void;
+  private lastRssSampleAt: number = 0;
+  private lastRssBytes: number = 0;
+
+  get pinned(): boolean {
+    return this._pinned;
+  }
+
+  /**
+   * Unpinning makes this worker evictable, so it is a capacity event: waiters
+   * parked in the scheduler must be woken instead of polling.
+   */
+  set pinned(value: boolean) {
+    const next = Boolean(value);
+    if (this._pinned === next) return;
+    this._pinned = next;
+    if (!next) this.notifyCapacityChange();
+  }
+
+  setSchedulerCapacityListener(listener: (() => void) | undefined): void {
+    this.capacityListener = listener;
+  }
+
+  /**
+   * One bounded queue per turn. A consumer that stops reading fails the turn
+   * instead of letting ACP stdout buffer without limit, and the overflow tears
+   * the worker down so its native session state is never reused half-written.
+   */
+  private createTurnQueue(): AsyncEventQueue<TurnStreamEvent> {
+    return new AsyncEventQueue<TurnStreamEvent>({
+      maxBufferedBytes: this.options.maxTurnBufferBytes,
+      onOverflow: () => {
+        void this.close("turn_buffer_overflow");
+      },
+    });
+  }
+
+  private notifyCapacityChange(): void {
+    try {
+      this.capacityListener?.();
+    } catch {}
+  }
 
   private promptSeq = 0;
   private activePromptSeq = 0;
@@ -366,6 +502,11 @@ export class AgySessionWorker {
     return this._state;
   }
 
+  /** True once `closeSync` has run and the process tree is being torn down. */
+  get closed(): boolean {
+    return this.isClosed;
+  }
+
   setExposeThinking(enabled: boolean): void {
     this.options.exposeThinking = enabled;
     if (!enabled) {
@@ -380,6 +521,39 @@ export class AgySessionWorker {
     this._state = newState;
     this.lastActivityAt = Date.now();
     this.options.onStateChange?.(this, oldState, newState);
+    if (newState === "IDLE" || newState === "CLOSED") {
+      this.notifyCapacityChange();
+    }
+  }
+
+  /**
+   * Resident-set size of this worker's process tree, in bytes. Returns `0` when
+   * the tree is gone or the platform cannot be sampled.
+   */
+  getRssBytes(now = Date.now()): number {
+    if (this.options.measureRssBytes) {
+      try {
+        return this.options.measureRssBytes();
+      } catch {
+        return 0;
+      }
+    }
+
+    const pid = this.child?.pid;
+    if (!pid || this.isClosed || this.child.exitCode !== null) return 0;
+
+    // `/proc` is cheap to read on every turn; `ps` is not, so a session that
+    // makes several quick turns must reuse one sample for a short window.
+    if (process.platform === "linux") {
+      return measureProcessTreeRssBytes(pid);
+    }
+    if (now - this.lastRssSampleAt < RSS_SAMPLE_COOLDOWN_MS) {
+      return this.lastRssBytes;
+    }
+    const bytes = measureProcessTreeRssBytes(pid);
+    this.lastRssSampleAt = now;
+    this.lastRssBytes = bytes;
+    return bytes;
   }
 
   async start(signal?: AbortSignal): Promise<void> {
@@ -466,12 +640,15 @@ export class AgySessionWorker {
 
       // 4. Spawn agy ACP
       const logFile = path.join(this.workspaceDir, "agy-acp.log");
+      // Single process per session: `--process-per-session` added a second Go
+      // process (~54% more RSS) with no capability this bridge needs, while
+      // splitting the real failure log into `agy-acp.log.<pid>`.
       const args = [
         "acp",
         "--agent",
         "magpie-bridge",
         "--stdio",
-        "--process-per-session",
+        "--disable-telemetry",
         "--log-file",
         logFile,
       ];
@@ -1179,7 +1356,7 @@ export class AgySessionWorker {
     this.currentThinkingAccumulator = "";
     this.heldText = "";
     this.markTurnDiagnosticsStart();
-    const queue = new AsyncEventQueue<TurnStreamEvent>();
+    const queue = this.createTurnQueue();
     this.activeTurnQueue = queue;
 
     let abortHandler: (() => void) | null = null;
@@ -1573,7 +1750,7 @@ export class AgySessionWorker {
       }
 
       this.setState("GENERATING");
-      const queue = new AsyncEventQueue<TurnStreamEvent>();
+      const queue = this.createTurnQueue();
       this.activeTurnQueue = queue;
 
       let abortHandler: (() => void) | null = null;

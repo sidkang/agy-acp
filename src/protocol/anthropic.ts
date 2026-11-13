@@ -1342,6 +1342,13 @@ function createSseChannel(): SseChannel {
       if (heartbeat !== null || closed) return;
       const timer = setInterval(() => {
         if (closed) return;
+        if (controller === null) return;
+        // A ping must share the same downstream budget as a pump frame: with
+        // `highWaterMark: 0` a pull is the only proof the reader is keeping up,
+        // so a stalled reader stops receiving pings instead of accumulating them.
+        const desired = controller.desiredSize;
+        if (desired === null) return;
+        if (pullCredits <= 0 && desired <= 0) return;
         writeFrame("ping", { type: "ping" });
       }, intervalMs);
       (timer as unknown as { unref?: () => void }).unref?.();

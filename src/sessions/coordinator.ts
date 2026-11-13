@@ -23,6 +23,7 @@ import {
   type WorkerOptions,
 } from "../runtime/worker";
 import type { GlobalScheduler } from "../runtime/scheduler";
+import { DEFAULT_MAX_WORKER_RSS_BYTES } from "../runtime/rss";
 import type { LoopbackMcpServer } from "../mcp/http-server";
 import {
   getPluginDataRoot,
@@ -41,6 +42,8 @@ export interface TurnExecutionOptions {
   providerOptions?: ProviderOptionsState;
   steerCancelTimeoutMs?: number;
   steerToolCommitTimeoutMs?: number;
+  /** Test hook: overrides process-tree RSS sampling for the turn's worker. */
+  measureRssBytes?: () => number;
 }
 
 export interface SessionCoordinatorOptions {
@@ -54,6 +57,29 @@ export interface SessionCoordinatorOptions {
   providerOptions?: ProviderOptionsState;
   steerCancelTimeoutMs?: number;
   steerToolCommitTimeoutMs?: number;
+  /** Post-turn RSS ceiling; `0` disables recycling. */
+  maxWorkerRssBytes?: number;
+}
+
+/**
+ * Resolves the post-turn RSS ceiling: explicit option, then
+ * `AGY_BRIDGE_MAX_WORKER_RSS_MB` (megabytes), then the 1 GiB default.
+ * `0` disables RSS recycling entirely.
+ */
+function resolveMaxWorkerRssBytes(explicit?: number): number {
+  if (
+    typeof explicit === "number" &&
+    Number.isFinite(explicit) &&
+    explicit >= 0
+  ) {
+    return explicit;
+  }
+  const rawMb = process.env.AGY_BRIDGE_MAX_WORKER_RSS_MB?.trim();
+  if (rawMb) {
+    const mb = Number(rawMb);
+    if (Number.isFinite(mb) && mb >= 0) return Math.floor(mb * 1024 * 1024);
+  }
+  return DEFAULT_MAX_WORKER_RSS_BYTES;
 }
 
 function stableJson(val: any): string {
@@ -1071,6 +1097,12 @@ export class SessionCoordinator {
     opts?: SpawnAgyOptions,
   ) => ChildProcessWithoutNullStreams;
   private readonly providerOptions?: ProviderOptionsState;
+  /**
+   * Post-turn RSS ceiling for one worker tree. A worker that finishes a clean
+   * turn above this limit is parked and closed so the next turn resumes through
+   * `session/resume` instead of pinning a gigabyte-scale Go process forever.
+   */
+  private readonly maxWorkerRssBytes: number;
 
   private readonly sessionLocks = new Map<string, Promise<void>>();
   private readonly activeWorkers = new Map<string, AgySessionWorker>();
@@ -1085,6 +1117,7 @@ export class SessionCoordinator {
     this.mcpServer = options.mcpServer;
     this.defaultSpawnFn = options.spawnFn;
     this.providerOptions = options.providerOptions;
+    this.maxWorkerRssBytes = resolveMaxWorkerRssBytes(options.maxWorkerRssBytes);
 
     const prevEvict = this.scheduler.onBeforeEvictIdle;
     (this.scheduler as any).onBeforeEvictIdle = (worker: AgySessionWorker) => {
@@ -1319,6 +1352,21 @@ export class SessionCoordinator {
     this.removeActiveWorker(worker);
     this.scheduler.unregisterWorker(worker);
     await worker.close(reason);
+  }
+
+  /**
+   * True when a cleanly finished worker should be swapped out for memory rather
+   * than reused. Only IDLE (never AWAITING_TOOL_RESULTS) sessions qualify, and
+   * only when the native session can be resumed, so recycling never costs
+   * conversation state.
+   */
+  private shouldRecycleForRss(worker: AgySessionWorker): boolean {
+    if (this.maxWorkerRssBytes <= 0) return false;
+    if (worker.closed) return false;
+    if (worker.state !== "IDLE") return false;
+    if (!worker.resumeSupported) return false;
+    if (!worker.nativeSessionId) return false;
+    return worker.getRssBytes() > this.maxWorkerRssBytes;
   }
 
   pruneParkedSessions(now = Date.now()): void {
@@ -1872,6 +1920,7 @@ export class SessionCoordinator {
       steerToolCommitTimeoutMs:
         options?.steerToolCommitTimeoutMs ??
         this.options?.steerToolCommitTimeoutMs,
+      measureRssBytes: options?.measureRssBytes,
       onStateChange: (_worker, _oldState, newState) => {
         if (newState === "CLOSED") {
           this.removeActiveWorker(_worker);
@@ -1898,7 +1947,7 @@ export class SessionCoordinator {
 
     try {
       try {
-        await this.scheduler.reserveAndRegister(worker);
+        await this.scheduler.reserveAndRegister(worker, signal);
       } catch (err) {
         await worker.close("admission_or_start_failed");
         throw err;
@@ -2036,7 +2085,14 @@ export class SessionCoordinator {
         const why = sawError
           ? "turn_error"
           : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-        if (why) await this.retireWorker(worker, why);
+        if (why) {
+          await this.retireWorker(worker, why);
+        } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
+          // Park first, while the session key is still registered, so the next
+          // turn resumes this exact conversation in a fresh process.
+          this.parkSession(worker);
+          await this.retireWorker(worker, "rss_limit_exceeded");
+        }
       }
     }
   }
@@ -2111,7 +2167,12 @@ export class SessionCoordinator {
         const why = sawError
           ? "turn_error"
           : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-        if (why) await this.retireWorker(worker, why);
+        if (why) {
+          await this.retireWorker(worker, why);
+        } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
+          this.parkSession(worker);
+          await this.retireWorker(worker, "rss_limit_exceeded");
+        }
       }
     }
   }
@@ -2320,7 +2381,12 @@ export class SessionCoordinator {
         const why = sawError
           ? "turn_error"
           : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-        if (why) await this.retireWorker(worker, why);
+        if (why) {
+          await this.retireWorker(worker, why);
+        } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
+          this.parkSession(worker);
+          await this.retireWorker(worker, "rss_limit_exceeded");
+        }
       }
     }
   }
@@ -2362,13 +2428,14 @@ export class SessionCoordinator {
         systemHistorySeed: coldPlan.systemHistorySeed,
         tools: req.tools,
         toolChoice: req.toolChoice,
+        measureRssBytes: options?.measureRssBytes,
       },
     );
     worker.pinned = true;
 
     try {
       try {
-        await this.scheduler.reserveAndRegister(worker);
+        await this.scheduler.reserveAndRegister(worker, signal);
       } catch (err) {
         await worker.close("admission_or_start_failed");
         throw err;
