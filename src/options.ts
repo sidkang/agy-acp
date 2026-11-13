@@ -102,7 +102,7 @@ export function buildProviderOptionSchemas(
         "expose_thinking",
         "AGY_MAGPIE_EXPOSE_THINKING",
         pkgOptions,
-        false,
+        true,
       ),
       labels: {
         zh: "输出思考摘要块",
@@ -138,6 +138,6 @@ export function readProviderOptions(
     quotaRouting: opt("quota_routing", "AGY_MAGPIE_QUOTA_ROUTING", false),
     cloakPrompts: opt("cloak_prompts", "AGY_MAGPIE_CLOAK_PROMPTS", true),
     minimalAgent: opt("minimal_agent", "AGY_MAGPIE_MINIMAL_AGENT", false),
-    exposeThinking: opt("expose_thinking", "AGY_MAGPIE_EXPOSE_THINKING", false),
+    exposeThinking: opt("expose_thinking", "AGY_MAGPIE_EXPOSE_THINKING", true),
   };
 }
