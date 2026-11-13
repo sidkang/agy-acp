@@ -122,6 +122,7 @@ async function AntigravityMagpiePlugin(
         idleTimeoutMs:
           positiveInt(pkgOptions?.idleTimeoutMs) ??
           positiveInt(pkgOptions?.idleTtlMs),
+        awaitingToolTimeoutMs: positiveInt(pkgOptions?.awaitingToolTimeoutMs),
         installSignalHandlers: true,
       });
       const mcpServer = getSharedMcpServer();

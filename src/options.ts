@@ -50,7 +50,6 @@ export function buildProviderOptionSchemas(
         pkgOptions,
         false,
       ),
-      placement: "top",
       labels: {
         zh: "按配额自动多账号路由",
       },
@@ -69,7 +68,6 @@ export function buildProviderOptionSchemas(
         pkgOptions,
         true,
       ),
-      placement: "top",
       labels: {
         zh: "自动脱敏第三方客户端提示词",
       },
@@ -81,19 +79,18 @@ export function buildProviderOptionSchemas(
       key: "minimal_agent",
       label: "Minimal agent system prompt",
       description:
-        "Set excludeDefaultComponents on the isolated bridge agent to reduce native system-prompt token overhead.",
+        "Set excludeDefaultComponents on the bridge agent to save ~7-8K native prompt tokens; requests look less like default agy CLI.",
       default: initialDefault(
         "minimal_agent",
         "AGY_MAGPIE_MINIMAL_AGENT",
         pkgOptions,
         false,
       ),
-      placement: "top",
       labels: {
         zh: "精简内置系统提示词",
       },
       descriptions: {
-        zh: "在隔离桥接 Agent 中开启 excludeDefaultComponents，减少每次调用的内置提示词 Token 开销。",
+        zh: "开启 excludeDefaultComponents 可省去约 7-8K 内置提示词 Token，但上游看到的请求形态不再与默认 agy 完全一致。",
       },
     },
     {
@@ -107,7 +104,6 @@ export function buildProviderOptionSchemas(
         pkgOptions,
         false,
       ),
-      placement: "top",
       labels: {
         zh: "输出思考摘要块",
       },

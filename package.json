@@ -48,7 +48,8 @@
     "options": {
       "maxGlobalWorkers": 16,
       "maxPerAccountWorkers": 6,
-      "idleTimeoutMs": 3600000
+      "idleTimeoutMs": 3600000,
+      "awaitingToolTimeoutMs": 600000
     },
     "summary": {
       "en": "Multi-account Antigravity CLI provider over ACP (agy acp): sign in to multiple isolated Google accounts or adopt your local agy login, with native HTTP MCP tool bridging, warm session reuse, session/resume, per-step cache token accounting, and quota-aware routing. Shares each Google account's Antigravity quota pool with antigravity and agy-cli.",
