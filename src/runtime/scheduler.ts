@@ -146,7 +146,7 @@ export class GlobalScheduler {
 
     if (accountWorkers.length >= this.maxPerAccountWorkers) {
       const evictableAccountWorkers = accountWorkers
-        .filter((w) => w.state === "IDLE" || isAwaitingToolExpired(w))
+        .filter((w) => !w.pinned && (w.state === "IDLE" || isAwaitingToolExpired(w)))
         .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
 
       if (evictableAccountWorkers.length === 0) {
@@ -170,7 +170,7 @@ export class GlobalScheduler {
 
     if (allActiveWorkers.length >= this.maxGlobalWorkers) {
       const evictableWorkers = allActiveWorkers
-        .filter((w) => w.state === "IDLE" || isAwaitingToolExpired(w))
+        .filter((w) => !w.pinned && (w.state === "IDLE" || isAwaitingToolExpired(w)))
         .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
 
       if (evictableWorkers.length === 0) {
@@ -190,7 +190,7 @@ export class GlobalScheduler {
 
   async evictIdleLRU(): Promise<AgySessionWorker | null> {
     const idleWorkers = Array.from(this.workers)
-      .filter((w) => w.state === "IDLE")
+      .filter((w) => !w.pinned && w.state === "IDLE")
       .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
 
     if (idleWorkers.length === 0) {
@@ -208,6 +208,9 @@ export class GlobalScheduler {
     const now = Date.now();
     let count = 0;
     for (const worker of Array.from(this.workers)) {
+      if (worker.pinned) {
+        continue;
+      }
       if (
         worker.state === "IDLE" &&
         now - worker.lastActivityAt >= this.idleTimeoutMs

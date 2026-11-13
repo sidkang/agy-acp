@@ -379,6 +379,9 @@ function extractSystemTextFromMessage(content: unknown, index: number): string {
       throw invalidRequest(`messages[${index}] system content blocks must be objects`);
     }
     const type = block.type;
+    if (type === "tool_addition" || type === "tool_removal") {
+      continue;
+    }
     if (type !== undefined && type !== "text") {
       throw invalidRequest(
         `Unsupported system message content type "${String(type)}"; only text is supported`,

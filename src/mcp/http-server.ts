@@ -94,7 +94,15 @@ export class LoopbackMcpServer {
       idleTimeout: 255,
       maxRequestBodySize: MAX_BODY_BYTES,
       // `server.port` is authoritative even before the field is assigned.
-      fetch: (request, server) => this.handleRequest(request, server.port ?? this.server?.port ?? 0),
+      fetch: (request, server) => {
+        const path = new URL(request.url).pathname
+        if (request.method === "POST" && TOKEN_PATH_RE.test(path)) {
+          if (typeof (server as any)?.timeout === "function") {
+            (server as any).timeout(request, 0)
+          }
+        }
+        return this.handleRequest(request, server.port ?? this.server?.port ?? 0, server)
+      },
     })
   }
 
@@ -112,7 +120,7 @@ export class LoopbackMcpServer {
     return found
   }
 
-  private async handleRequest(request: Request, port: number): Promise<Response> {
+  private async handleRequest(request: Request, port: number, server?: any): Promise<Response> {
     const url = new URL(request.url)
     const match = TOKEN_PATH_RE.exec(url.pathname)
     if (!match) return new Response("Not Found", { status: 404 })
@@ -134,6 +142,10 @@ export class LoopbackMcpServer {
 
     const broker = this.findSession(token)
     if (!broker) return new Response("Unauthorized", { status: 401 })
+
+    if (server && typeof server.timeout === "function") {
+      server.timeout(request, 0)
+    }
 
     const declaredLength = request.headers.get("content-length")
     if (declaredLength !== null && Number(declaredLength) > MAX_BODY_BYTES) {

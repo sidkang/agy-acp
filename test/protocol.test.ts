@@ -592,6 +592,27 @@ describe("parseAnthropicRequest: system prompt", () => {
     ]);
   });
 
+  test("skips tool_addition and tool_removal blocks in system messages cleanly", () => {
+    const parsed = parse(
+      requestBody({
+        system: "base instructions",
+        messages: [
+          {
+            role: "system",
+            content: [
+              { type: "text", text: "dynamic instruction" },
+              { type: "tool_addition", tool: { name: "new_tool" } },
+              { type: "tool_removal", tool_name: "old_tool" },
+            ],
+          },
+          { role: "user", content: "hi" },
+        ],
+      }),
+    );
+    expect(parsed.system).toBe("base instructions\n\ndynamic instruction");
+    expect(parsed.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hi" }] }]);
+  });
+
   test("reminders are not double-wrapped and queued user messages are unwrapped", () => {
     const wrapped = "<system-reminder>\nUse tabs.\n</system-reminder>";
     const parsed = parse(

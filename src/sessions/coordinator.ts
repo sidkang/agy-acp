@@ -16,6 +16,7 @@ import {
 } from "../protocol/cloak";
 import {
   AgySessionWorker,
+  SteerReplayNeededError,
   type ModelSelection,
   type WorkerOptions,
 } from "../runtime/worker";
@@ -31,6 +32,7 @@ export interface TurnExecutionOptions {
     opts?: SpawnAgyOptions,
   ) => ChildProcessWithoutNullStreams;
   providerOptions?: ProviderOptionsState;
+  steerCancelTimeoutMs?: number;
 }
 
 export interface SessionCoordinatorOptions {
@@ -42,6 +44,7 @@ export interface SessionCoordinatorOptions {
     opts?: SpawnAgyOptions,
   ) => ChildProcessWithoutNullStreams;
   providerOptions?: ProviderOptionsState;
+  steerCancelTimeoutMs?: number;
 }
 
 function stableJson(val: any): string {
@@ -175,6 +178,7 @@ function isToolSetCompatible(
     inputSchema: Record<string, unknown>;
   }>,
 ): boolean {
+  if (registered.length !== incoming.length) return false;
   const regMap = new Map(
     registered.map((t) => [t.name, stableJson(t.inputSchema)]),
   );
@@ -185,6 +189,96 @@ function isToolSetCompatible(
     }
   }
   return true;
+}
+
+function hasNoOrphanToolResults(messages: NormalizedMessage[]): boolean {
+  const toolUseIds = new Set<string>();
+  for (const msg of messages) {
+    if (msg.role === "assistant") {
+      for (const part of msg.content) {
+        if (part.type === "tool_use") {
+          toolUseIds.add(part.id);
+        }
+      }
+    } else if (msg.role === "user") {
+      for (const part of msg.content) {
+        if (part.type === "tool_result") {
+          if (!toolUseIds.has(part.toolUseId)) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
+
+function endsWithMatchingToolPair(
+  messages: NormalizedMessage[],
+  pendingIds: string[],
+): boolean {
+  if (messages.length < 2) return false;
+  const assistantMsg = messages[messages.length - 2]!;
+  const userMsg = messages[messages.length - 1]!;
+  if (assistantMsg.role !== "assistant" || userMsg.role !== "user") return false;
+
+  const toolUseIds: string[] = [];
+  for (const p of assistantMsg.content) {
+    if (p.type === "tool_use") toolUseIds.push(p.id);
+  }
+  const toolResultIds: string[] = [];
+  for (const p of userMsg.content) {
+    if (p.type === "tool_result") toolResultIds.push(p.toolUseId);
+  }
+
+  if (toolUseIds.length === 0 || toolResultIds.length === 0) return false;
+
+  const toolUseSet = new Set(toolUseIds);
+  if (!toolResultIds.every((id) => toolUseSet.has(id))) return false;
+
+  if (pendingIds.length > 0) {
+    const pendingSet = new Set(pendingIds);
+    if (!toolResultIds.some((id) => pendingSet.has(id))) return false;
+  }
+
+  return true;
+}
+
+function isCompactedRequest(
+  incomingMessages: NormalizedMessage[],
+  committedMessages: NormalizedMessage[],
+  worker: AgySessionWorker,
+): boolean {
+  if (incomingMessages.length === 0) return false;
+  if (!hasNoOrphanToolResults(incomingMessages)) return false;
+
+  const pendingIds = worker.broker.getExposedPendingIds();
+  const hasMatchingPair = endsWithMatchingToolPair(
+    incomingMessages,
+    pendingIds,
+  );
+  if (!hasMatchingPair) return false;
+
+  const firstMsg = incomingMessages[0]!;
+  const hasMarker = firstMsg.content.some(
+    (p) =>
+      p.type === "text" &&
+      (/<summary[\s>]/i.test(p.text) ||
+        /<\/summary>/i.test(p.text) ||
+        p.text
+          .toLowerCase()
+          .includes(
+            "conversation history before this point was compacted",
+          )),
+  );
+
+  if (hasMarker) return true;
+
+  if (incomingMessages.length < committedMessages.length) {
+    return true;
+  }
+
+  return false;
 }
 
 function canonicalPartsForLedger(
@@ -211,7 +305,7 @@ function canonicalPartsForLedger(
   }
 
   return merged.filter((p) => {
-    if (p.type === "text" && p.text === "" && merged.length > 1) return false;
+    if (p.type === "text" && p.text.trim() === "" && merged.length > 1) return false;
     return true;
   });
 }
@@ -405,7 +499,39 @@ function renderMessagesToPrompt(
   const currentBytes = utf8Bytes(turnText + prefillText);
   let historyText = "";
 
-  if (priorMessages.length > 0) {
+  if (priorMessages.length === 0 && currentBytes > MAX_PROMPT_BYTES) {
+    const truncateMarker = "\n...[truncated middle for prompt budget]...\n";
+    const openMatch = /<conversation[^>]*>/i.exec(turnText);
+    const closeMatch = /<\/conversation>/i.exec(turnText);
+
+    if (openMatch && closeMatch && closeMatch.index > openMatch.index) {
+      const openIdx = openMatch.index;
+      const openLen = openMatch[0].length;
+      const closeIdx = closeMatch.index;
+      const prefix = turnText.slice(0, openIdx + openLen);
+      const suffix = turnText.slice(closeIdx);
+      const body = turnText.slice(openIdx + openLen, closeIdx);
+      const fixedBytes =
+        utf8Bytes(prefix) +
+        utf8Bytes(suffix) +
+        utf8Bytes(truncateMarker) +
+        utf8Bytes(prefillText);
+      const availableForBody = Math.max(0, MAX_PROMPT_BYTES - fixedBytes);
+      const half = Math.floor(availableForBody / 2);
+      const bodyHead = utf8Prefix(body, half);
+      const bodyTail = utf8Suffix(body, half);
+      turnText = `${prefix}${bodyHead}${truncateMarker}${bodyTail}${suffix}`;
+    } else {
+      const available = Math.max(
+        0,
+        MAX_PROMPT_BYTES - utf8Bytes(truncateMarker) - utf8Bytes(prefillText),
+      );
+      const half = Math.floor(available / 2);
+      const head = utf8Prefix(turnText, half);
+      const tail = utf8Suffix(turnText, half);
+      turnText = `${head}${truncateMarker}${tail}`;
+    }
+  } else if (priorMessages.length > 0) {
     const historyHeader = "<conversation_history>\n";
     const historyFooter = HISTORY_RECORD_NOTE + "</conversation_history>\n\n";
     const frameBytes = utf8Bytes(historyHeader + historyFooter);
@@ -502,6 +628,7 @@ interface ParkedSession {
 export class SessionCoordinator {
   readonly scheduler: GlobalScheduler;
   readonly mcpServer: LoopbackMcpServer;
+  private readonly options?: SessionCoordinatorOptions;
   private readonly defaultSpawnFn?: (
     account: AccountDescriptor,
     args: string[],
@@ -514,6 +641,7 @@ export class SessionCoordinator {
   private readonly parkedSessions = new Map<string, ParkedSession>();
 
   constructor(options: SessionCoordinatorOptions) {
+    this.options = options;
     this.scheduler = options.scheduler;
     this.mcpServer = options.mcpServer;
     this.defaultSpawnFn = options.spawnFn;
@@ -748,6 +876,8 @@ export class SessionCoordinator {
         req,
         sessionKey,
         signal,
+        modelSelection,
+        options,
       );
       return;
     }
@@ -828,6 +958,9 @@ export class SessionCoordinator {
       systemPrompt: req.system,
       tools: req.tools,
       toolChoice: req.toolChoice,
+      steerCancelTimeoutMs:
+        options?.steerCancelTimeoutMs ??
+        this.options?.steerCancelTimeoutMs,
       onStateChange: (_worker, _oldState, newState) => {
         if (newState === "CLOSED") {
           this.activeWorkers.delete(sessionKey);
@@ -842,103 +975,113 @@ export class SessionCoordinator {
       this.mcpServer,
       workerOptions,
     );
-
-    await this.scheduler.reserveAndRegister(worker);
-    this.activeWorkers.set(sessionKey, worker);
+    worker.pinned = true;
 
     try {
-      await worker.start(signal);
-    } catch (err) {
-      this.activeWorkers.delete(sessionKey);
-      this.scheduler.unregisterWorker(worker);
-      await worker.close("start_failed");
-      throw err;
-    }
+      try {
+        await this.scheduler.reserveAndRegister(worker);
+      } catch (err) {
+        await worker.close("admission_or_start_failed");
+        throw err;
+      }
+      this.activeWorkers.set(sessionKey, worker);
 
-    if (worker.resumedFromShelf && parked) {
-      worker.committedMessages = [...parked.committedMessages];
-      this.parkedSessions.delete(sessionKey);
-      yield* this.executeWarmIdleTurn(
-        worker,
-        req,
-        modelSelection,
-        signal,
-      );
-      return;
-    }
+      try {
+        await worker.start(signal);
+      } catch (err) {
+        this.activeWorkers.delete(sessionKey);
+        this.scheduler.unregisterWorker(worker);
+        await worker.close("admission_or_start_failed");
+        throw err;
+      }
 
-    if (requestHasImages(req.messages) && !worker.imageSupported) {
-      await worker.close("image_not_supported");
-      throw new BridgeHttpError(
-        400,
-        "invalid_request_error",
-        "Images are not supported by the underlying agent",
-      );
-    }
+      if (worker.resumedFromShelf && parked) {
+        worker.committedMessages = [...parked.committedMessages];
+        this.parkedSessions.delete(sessionKey);
+        yield* this.executeWarmIdleTurn(
+          worker,
+          req,
+          modelSelection,
+          signal,
+        );
+        return;
+      }
 
-    await worker.applyModelSelection(modelSelection, signal);
+      if (requestHasImages(req.messages) && !worker.imageSupported) {
+        await worker.close("image_not_supported");
+        throw new BridgeHttpError(
+          400,
+          "invalid_request_error",
+          "Images are not supported by the underlying agent",
+        );
+      }
 
-    // Determine prior messages vs current turn
-    let priorMessages: NormalizedMessage[] = [];
-    let currentMessages: NormalizedMessage[] = [];
+      await worker.applyModelSelection(modelSelection, signal);
 
-    const hasPrefill =
-      req.messages.length > 0 &&
-      req.messages[req.messages.length - 1]!.role === "assistant";
+      // Determine prior messages vs current turn
+      let priorMessages: NormalizedMessage[] = [];
+      let currentMessages: NormalizedMessage[] = [];
 
-    if (hasPrefill) {
-      priorMessages = req.messages.slice(0, -2);
-      currentMessages = req.messages.slice(-2);
-    } else {
-      priorMessages = req.messages.slice(0, -1);
-      currentMessages = req.messages.slice(-1);
-    }
+      const hasPrefill =
+        req.messages.length > 0 &&
+        req.messages[req.messages.length - 1]!.role === "assistant";
 
-    const promptParts = renderMessagesToPrompt(priorMessages, currentMessages);
-    const tcReminder = getToolChoiceReminder(req.toolChoice);
-    if (tcReminder) {
-      if (
-        promptParts.length > 0 &&
-        promptParts[promptParts.length - 1]!.type === "text"
-      ) {
-        (promptParts[promptParts.length - 1] as any).text += `\n\n${tcReminder}`;
+      if (hasPrefill) {
+        priorMessages = req.messages.slice(0, -2);
+        currentMessages = req.messages.slice(-2);
       } else {
-        promptParts.push({ type: "text", text: tcReminder });
+        priorMessages = req.messages.slice(0, -1);
+        currentMessages = req.messages.slice(-1);
       }
-    }
 
-    if (req.system && !worker.appendSystemSupported) {
-      const sysPrompt = `<system_instructions>\n${req.system}\n</system_instructions>\n\n`;
-      if (promptParts.length > 0 && promptParts[0]!.type === "text") {
-        promptParts[0] = {
-          type: "text",
-          text: `${sysPrompt}${promptParts[0]!.text}`,
-        };
-      } else {
-        promptParts.unshift({ type: "text", text: sysPrompt });
+      const promptParts = renderMessagesToPrompt(priorMessages, currentMessages);
+      const tcReminder = getToolChoiceReminder(req.toolChoice);
+      if (tcReminder) {
+        if (
+          promptParts.length > 0 &&
+          promptParts[promptParts.length - 1]!.type === "text"
+        ) {
+          (promptParts[promptParts.length - 1] as any).text += `\n\n${tcReminder}`;
+        } else {
+          promptParts.push({ type: "text", text: tcReminder });
+        }
       }
-    }
 
-    const generatedToolCalls: Array<{
-      type: "tool_use";
-      id: string;
-      name: string;
-      input: Record<string, unknown>;
-    }> = [];
-    let fullAnswerText = "";
-
-    for await (const event of worker.startPromptTurn(promptParts, signal)) {
-      if (event.type === "tool_use") {
-        generatedToolCalls.push(event);
-      } else if (event.type === "text_delta") {
-        fullAnswerText += event.text;
-      } else if (event.type === "finish") {
-        commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+      if (req.system && !worker.appendSystemSupported) {
+        const sysPrompt = `<system_instructions>\n${req.system}\n</system_instructions>\n\n`;
+        if (promptParts.length > 0 && promptParts[0]!.type === "text") {
+          promptParts[0] = {
+            type: "text",
+            text: `${sysPrompt}${promptParts[0]!.text}`,
+          };
+        } else {
+          promptParts.unshift({ type: "text", text: sysPrompt });
+        }
       }
-      yield event;
-    }
 
-    commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+      const generatedToolCalls: Array<{
+        type: "tool_use";
+        id: string;
+        name: string;
+        input: Record<string, unknown>;
+      }> = [];
+      let fullAnswerText = "";
+
+      for await (const event of worker.startPromptTurn(promptParts, signal)) {
+        if (event.type === "tool_use") {
+          generatedToolCalls.push(event);
+        } else if (event.type === "text_delta") {
+          fullAnswerText += event.text;
+        } else if (event.type === "finish") {
+          commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+        }
+        yield event;
+      }
+
+      commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+    } finally {
+      worker.pinned = false;
+    }
   }
 
   private async *executeWarmIdleTurn(
@@ -947,52 +1090,57 @@ export class SessionCoordinator {
     modelSelection: ModelSelection,
     signal?: AbortSignal,
   ): AsyncGenerator<TurnStreamEvent> {
-    if (requestHasImages(req.messages) && !worker.imageSupported) {
-      throw new BridgeHttpError(
-        400,
-        "invalid_request_error",
-        "Images are not supported by the underlying agent",
-      );
-    }
-
-    worker.setExposeThinking(req.thinkingEnabled);
-    await worker.applyModelSelection(modelSelection, signal);
-    worker.broker.setToolChoice(req.toolChoice);
-
-    const deltaMessages = req.messages.slice(worker.committedMessages.length);
-    const promptParts = renderMessagesToPrompt([], deltaMessages);
-    const tcReminder = getToolChoiceReminder(req.toolChoice);
-    if (tcReminder) {
-      if (
-        promptParts.length > 0 &&
-        promptParts[promptParts.length - 1]!.type === "text"
-      ) {
-        (promptParts[promptParts.length - 1] as any).text += `\n\n${tcReminder}`;
-      } else {
-        promptParts.push({ type: "text", text: tcReminder });
+    worker.pinned = true;
+    try {
+      if (requestHasImages(req.messages) && !worker.imageSupported) {
+        throw new BridgeHttpError(
+          400,
+          "invalid_request_error",
+          "Images are not supported by the underlying agent",
+        );
       }
-    }
 
-    const generatedToolCalls: Array<{
-      type: "tool_use";
-      id: string;
-      name: string;
-      input: Record<string, unknown>;
-    }> = [];
-    let fullAnswerText = "";
+      worker.setExposeThinking(req.thinkingEnabled);
+      await worker.applyModelSelection(modelSelection, signal);
+      worker.broker.setToolChoice(req.toolChoice);
 
-    for await (const event of worker.startPromptTurn(promptParts, signal)) {
-      if (event.type === "tool_use") {
-        generatedToolCalls.push(event);
-      } else if (event.type === "text_delta") {
-        fullAnswerText += event.text;
-      } else if (event.type === "finish") {
-        commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+      const deltaMessages = req.messages.slice(worker.committedMessages.length);
+      const promptParts = renderMessagesToPrompt([], deltaMessages);
+      const tcReminder = getToolChoiceReminder(req.toolChoice);
+      if (tcReminder) {
+        if (
+          promptParts.length > 0 &&
+          promptParts[promptParts.length - 1]!.type === "text"
+        ) {
+          (promptParts[promptParts.length - 1] as any).text += `\n\n${tcReminder}`;
+        } else {
+          promptParts.push({ type: "text", text: tcReminder });
+        }
       }
-      yield event;
-    }
 
-    commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+      const generatedToolCalls: Array<{
+        type: "tool_use";
+        id: string;
+        name: string;
+        input: Record<string, unknown>;
+      }> = [];
+      let fullAnswerText = "";
+
+      for await (const event of worker.startPromptTurn(promptParts, signal)) {
+        if (event.type === "tool_use") {
+          generatedToolCalls.push(event);
+        } else if (event.type === "text_delta") {
+          fullAnswerText += event.text;
+        } else if (event.type === "finish") {
+          commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+        }
+        yield event;
+      }
+
+      commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+    } finally {
+      worker.pinned = false;
+    }
   }
 
   private async *executeAwaitingToolsTurn(
@@ -1000,138 +1148,187 @@ export class SessionCoordinator {
     req: NormalizedAnthropicRequest,
     sessionKey: string,
     signal?: AbortSignal,
+    modelSelection?: ModelSelection,
+    options?: TurnExecutionOptions,
   ): AsyncGenerator<TurnStreamEvent> {
-    // Verify prefix matches committed ledger
-    const prefixLen = worker.committedMessages.length;
-    if (
-      req.messages.length < prefixLen ||
-      !isPrefixMatch(worker.committedMessages, req.messages.slice(0, prefixLen))
-    ) {
-      // Branching while tool calls are pending!
-      throw new BridgeHttpError(
-        409,
-        "invalid_request_error",
-        "Cannot branch session while tool calls are pending",
-      );
+    worker.pinned = true;
+    if (options?.steerCancelTimeoutMs !== undefined) {
+      worker.steerCancelTimeoutMs = options.steerCancelTimeoutMs;
     }
+    try {
+      // Verify prefix matches committed ledger
+      const prefixLen = worker.committedMessages.length;
+      if (
+        req.messages.length < prefixLen ||
+        !isPrefixMatch(worker.committedMessages, req.messages.slice(0, prefixLen))
+      ) {
+        if (isCompactedRequest(req.messages, worker.committedMessages, worker)) {
+          this.activeWorkers.delete(sessionKey);
+          this.scheduler.unregisterWorker(worker);
+          await worker.close("compacted_during_tool_turn");
+          yield* this.executeFreshSessionTurn(
+            worker.account,
+            req,
+            modelSelection ?? { rawModelId: req.model, configModelValue: req.model },
+            options,
+            sessionKey,
+            signal,
+          );
+          return;
+        }
 
-    // Delta messages after committed ledger
-    const deltaMessages = req.messages.slice(prefixLen);
-    const lastMsg = deltaMessages[deltaMessages.length - 1];
-    if (!lastMsg || lastMsg.role !== "user") {
-      throw new BridgeHttpError(
-        400,
-        "invalid_request_error",
-        "Expected user message containing tool results",
-      );
-    }
+        // Branching while tool calls are pending!
+        throw new BridgeHttpError(
+          409,
+          "invalid_request_error",
+          "Cannot branch session while tool calls are pending",
+        );
+      }
 
-    const toolResults: ToolResultDelivery[] = [];
-    const steeringParts: NormalizedContentPart[] = [];
+      // Delta messages after committed ledger
+      const deltaMessages = req.messages.slice(prefixLen);
+      const lastMsg = deltaMessages[deltaMessages.length - 1];
+      if (!lastMsg || lastMsg.role !== "user") {
+        throw new BridgeHttpError(
+          400,
+          "invalid_request_error",
+          "Expected user message containing tool results",
+        );
+      }
 
-    for (const part of lastMsg.content) {
-      if (part.type === "tool_result") {
-        toolResults.push({
-          toolUseId: part.toolUseId,
-          isError: part.isError,
-          content: [...part.content],
+      const toolResults: ToolResultDelivery[] = [];
+      const steeringParts: NormalizedContentPart[] = [];
+
+      for (const part of lastMsg.content) {
+        if (part.type === "tool_result") {
+          toolResults.push({
+            toolUseId: part.toolUseId,
+            isError: part.isError,
+            content: [...part.content],
+          });
+        }
+      }
+
+      const TELEMETRY_NOISE_RE =
+        /^\s*<system-reminder>\s*(?:Token usage:|USD budget:|<total_tokens>|Output tokens \u2014 turn:)[\s\S]*?<\/system-reminder>\s*$/i;
+      const QUEUED_USER_RE =
+        /The user sent (?:a new message while you were working|the following message):\s*([\s\S]*?)(?:<\/system-reminder>|$)/i;
+      const COMPANION_RE =
+        /^(?:<system-reminder\b|<task-notification\b|Tools? loaded\b|Base directory for this skill:|ARGUMENTS:|Skill arguments:)/i;
+
+      for (const part of lastMsg.content) {
+        if (part.type === "tool_result") continue;
+
+        if (part.type === "image") {
+          steeringParts.push(part);
+          continue;
+        }
+
+        if (part.type === "text") {
+          const text = part.text.trim();
+          if (!text) continue;
+
+          if (TELEMETRY_NOISE_RE.test(part.text)) {
+            continue;
+          }
+
+          const queuedMatch = QUEUED_USER_RE.exec(part.text);
+          if (queuedMatch) {
+            const inner = queuedMatch[1]!
+              .replace(
+                /\n\n(?:This is how Claude Code surfaces[\s\S]*|IMPORTANT:[\s\S]*|Please address this message[\s\S]*)$/i,
+                "",
+              )
+              .trim();
+            steeringParts.push({ type: "text", text: inner });
+            continue;
+          }
+
+          if (
+            COMPANION_RE.test(text) ||
+            /^\[MESSAGE FROM NON-USER SOURCE/i.test(text) ||
+            /hook (?:additional context|success|blocking error|feedback)/i.test(
+              text,
+            )
+          ) {
+            if (toolResults.length > 0) {
+              toolResults[toolResults.length - 1]!.content.push({
+                type: "text",
+                text: part.text,
+              });
+            }
+            continue;
+          }
+
+          steeringParts.push(part);
+        }
+      }
+
+      const toolsChanged = !isToolSetCompatible(worker.registeredTools, req.tools);
+      if (toolsChanged) {
+        const regNames = new Set(worker.registeredTools.map((t) => t.name));
+        const hasNewTools = req.tools.some((t) => !regNames.has(t.name));
+        worker.broker.setTools(req.tools);
+        worker.registeredTools = [...req.tools];
+        steeringParts.push({
+          type: "text",
+          text: hasNewTools
+            ? "Continue with the newly loaded tools."
+            : "Continue with the updated tools.",
         });
       }
-    }
 
-    const TELEMETRY_NOISE_RE =
-      /^\s*<system-reminder>\s*(?:Token usage:|USD budget:|<total_tokens>|Output tokens \u2014 turn:)[\s\S]*?<\/system-reminder>\s*$/i;
-    const QUEUED_USER_RE =
-      /The user sent (?:a new message while you were working|the following message):\s*([\s\S]*?)(?:<\/system-reminder>|$)/i;
-    const COMPANION_RE =
-      /^(?:<system-reminder\b|<task-notification\b|Tools? loaded\b|Base directory for this skill:|ARGUMENTS:|Skill arguments:)/i;
+      worker.setExposeThinking(req.thinkingEnabled);
+      worker.broker.setToolChoice(req.toolChoice);
 
-    for (const part of lastMsg.content) {
-      if (part.type === "tool_result") continue;
+      const generatedToolCalls: Array<{
+        type: "tool_use";
+        id: string;
+        name: string;
+        input: Record<string, unknown>;
+      }> = [];
+      let fullAnswerText = "";
 
-      if (part.type === "image") {
-        steeringParts.push(part);
-        continue;
-      }
-
-      if (part.type === "text") {
-        const text = part.text.trim();
-        if (!text) continue;
-
-        if (TELEMETRY_NOISE_RE.test(part.text)) {
-          continue;
-        }
-
-        const queuedMatch = QUEUED_USER_RE.exec(part.text);
-        if (queuedMatch) {
-          const inner = queuedMatch[1]!
-            .replace(
-              /\n\n(?:This is how Claude Code surfaces[\s\S]*|IMPORTANT:[\s\S]*|Please address this message[\s\S]*)$/i,
-              "",
-            )
-            .trim();
-          steeringParts.push({ type: "text", text: inner });
-          continue;
-        }
-
-        if (
-          COMPANION_RE.test(text) ||
-          /^\[MESSAGE FROM NON-USER SOURCE/i.test(text) ||
-          /hook (?:additional context|success|blocking error|feedback)/i.test(
-            text,
-          )
-        ) {
-          if (toolResults.length > 0) {
-            toolResults[toolResults.length - 1]!.content.push({
-              type: "text",
-              text: part.text,
-            });
+      let yieldedAny = false;
+      try {
+        for await (const event of worker.continueWithToolResults(
+          toolResults,
+          steeringParts,
+          signal,
+          modelSelection,
+        )) {
+          yieldedAny = true;
+          if (event.type === "tool_use") {
+            generatedToolCalls.push(event);
+          } else if (event.type === "text_delta") {
+            fullAnswerText += event.text;
+          } else if (event.type === "finish") {
+            commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
           }
-          continue;
+          yield event;
         }
-
-        steeringParts.push(part);
+      } catch (err) {
+        if (err instanceof SteerReplayNeededError && !yieldedAny) {
+          this.activeWorkers.delete(sessionKey);
+          this.scheduler.unregisterWorker(worker);
+          await worker.close("steer_replay_needed");
+          yield* this.executeFreshSessionTurn(
+            worker.account,
+            req,
+            modelSelection ?? { rawModelId: req.model, configModelValue: req.model },
+            options,
+            sessionKey,
+            signal,
+          );
+          return;
+        }
+        throw err;
       }
+
+      commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+    } finally {
+      worker.pinned = false;
     }
-
-    const regNames = new Set(worker.registeredTools.map((t) => t.name));
-    const hasNewTools = req.tools.some((t) => !regNames.has(t.name));
-    if (hasNewTools) {
-      worker.broker.setTools(req.tools);
-      worker.registeredTools = [...req.tools];
-      steeringParts.push({
-        type: "text",
-        text: "Continue with the newly loaded tools.",
-      });
-    }
-
-    worker.setExposeThinking(req.thinkingEnabled);
-    worker.broker.setToolChoice(req.toolChoice);
-
-    const generatedToolCalls: Array<{
-      type: "tool_use";
-      id: string;
-      name: string;
-      input: Record<string, unknown>;
-    }> = [];
-    let fullAnswerText = "";
-
-    for await (const event of worker.continueWithToolResults(
-      toolResults,
-      steeringParts,
-      signal,
-    )) {
-      if (event.type === "tool_use") {
-        generatedToolCalls.push(event);
-      } else if (event.type === "text_delta") {
-        fullAnswerText += event.text;
-      } else if (event.type === "finish") {
-        commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
-      }
-      yield event;
-    }
-
-    commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
   }
 
   private async *executeStatelessTurn(
@@ -1161,18 +1358,24 @@ export class SessionCoordinator {
         toolChoice: req.toolChoice,
       },
     );
-
-    await this.scheduler.reserveAndRegister(worker);
-
-    try {
-      await worker.start(signal);
-    } catch (err) {
-      this.scheduler.unregisterWorker(worker);
-      await worker.close("start_failed");
-      throw err;
-    }
+    worker.pinned = true;
 
     try {
+      try {
+        await this.scheduler.reserveAndRegister(worker);
+      } catch (err) {
+        await worker.close("admission_or_start_failed");
+        throw err;
+      }
+
+      try {
+        await worker.start(signal);
+      } catch (err) {
+        this.scheduler.unregisterWorker(worker);
+        await worker.close("admission_or_start_failed");
+        throw err;
+      }
+
       if (requestHasImages(req.messages) && !worker.imageSupported) {
         throw new BridgeHttpError(
           400,
@@ -1217,6 +1420,7 @@ export class SessionCoordinator {
         yield event;
       }
     } finally {
+      worker.pinned = false;
       this.scheduler.unregisterWorker(worker);
       await worker.close("stateless_turn_finished");
     }

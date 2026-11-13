@@ -135,6 +135,12 @@ export class AcpConnection {
     this.child.on("error", (err: Error) => {
       handleExit(null, err.message);
     });
+    this.child.stdin.on("error", (err: Error) => {
+      this.stderrBuffer.push(
+        `\n[AcpConnection stdin error]: ${err?.message ?? String(err)}\n`,
+      );
+      handleExit(null, `stdin: ${err?.message ?? String(err)}`);
+    });
   }
 
   private handleIncomingLine(line: string): void {

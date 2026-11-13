@@ -293,6 +293,24 @@ export class SessionToolBroker {
     }
   }
 
+  /**
+   * Cancel and resolve unexposed parked calls (e.g. late parallel siblings)
+   * so they do not block or intercept a user steering message.
+   */
+  cancelUnexposed(reason?: string): void {
+    const text = reason || "Skipped due to user steering message"
+    const unexposed = [...this.currentBatch, ...this.queuedUnexposed, ...this.exposedPending.values()]
+    this.currentBatch = []
+    this.queuedUnexposed = []
+    this.exposedPending.clear()
+    this.clearBatchTimer()
+    this.turnOutputOpen = false
+    for (const call of unexposed) {
+      this.clearDeadline(call)
+      call.resolve(errorResult(text))
+    }
+  }
+
   async handleJsonRpc(msg: unknown): Promise<JsonRpcResponse> {
     if (!isObject(msg)) {
       return { status: 400, body: { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } } }

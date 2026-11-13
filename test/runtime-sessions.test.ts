@@ -1,5 +1,6 @@
 import { describe, expect, test, afterAll } from "bun:test";
 import { spawn } from "node:child_process";
+import { PassThrough } from "node:stream";
 import path from "node:path";
 import {
   BridgeHttpError,
@@ -1631,5 +1632,506 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(u3.outputTokens).toBe(25);
     expect(u3.cacheReadInputTokens).toBe(15);
     expect(u3.cacheCreationInputTokens).toBe(5);
+  });
+
+  test("25. Delayed session/cancel settlement during steer -> retires hung worker via SteerReplayNeededError and replays cleanly on fresh worker", async () => {
+    const sessionId = `test-steer-delayed-cancel-${Date.now()}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object" },
+      },
+    ];
+
+    let workerCount = 0;
+    const spawnDelayedCancel = (
+      account: AccountDescriptor,
+      args: string[],
+      opts?: any,
+    ) => {
+      workerCount++;
+      const currentWorkerNum = workerCount;
+      const child = spawn("bun", ["run", fakeAcpPath], {
+        cwd: opts?.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      if (currentWorkerNum === 1) {
+        const origStdout = child.stdout;
+        const origStdin = child.stdin;
+        let promptId: any = null;
+        let cancelSeen = false;
+
+        const origWrite = origStdin.write.bind(origStdin);
+        (origStdin as any).write = (chunk: any, ...writeArgs: any[]) => {
+          const str = chunk.toString();
+          try {
+            const parsed = JSON.parse(str.trim());
+            if (parsed.method === "session/prompt") promptId = parsed.id;
+            if (parsed.method === "session/cancel") cancelSeen = true;
+          } catch {}
+          return (origWrite as any)(chunk, ...writeArgs);
+        };
+
+        const interceptedStdout = new PassThrough();
+        let remainder = "";
+        origStdout.on("data", (chunk: Buffer) => {
+          remainder += chunk.toString("utf-8");
+          const lines = remainder.split("\n");
+          remainder = lines.pop() ?? "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const msg = JSON.parse(trimmed);
+              if (cancelSeen && msg.id !== undefined && msg.id === promptId) {
+                setTimeout(() => {
+                  interceptedStdout.write(line + "\n");
+                }, 500);
+                continue;
+              }
+            } catch {}
+            interceptedStdout.write(line + "\n");
+          }
+        });
+        (child as any).stdout = interceptedStdout;
+      }
+      return child;
+    };
+
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Steer cancel delay test",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    // Turn 1 leaves worker in AWAITING_TOOL_RESULTS with call_weather_1
+    const events1: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req1, sel, {
+      spawnFn: spawnDelayedCancel,
+    })) {
+      events1.push(ev);
+    }
+    const toolUse = events1.find((e) => e.type === "tool_use");
+    expect(toolUse).toBeDefined();
+    const worker1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(worker1?.state).toBe("AWAITING_TOOL_RESULTS");
+
+    // Turn 2: Provide tool_result AND a steering message with steerCancelTimeoutMs: 50
+    // Because worker 1 delays response on cancel, oldPromptPromise will not settle within 50ms.
+    // Worker 1 should be retired via SteerReplayNeededError and the request replayed on fresh Worker 2!
+    const req2: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Steer cancel delay test",
+      messages: [
+        ...req1.messages,
+        {
+          role: "assistant",
+          content: [toolUse as any],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: (toolUse as any).id,
+              isError: false,
+              content: [{ type: "text", text: "72F and sunny" }],
+            },
+            {
+              type: "text",
+              text: "Steer: ignore weather and say REPLAY_OK",
+            },
+          ],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const events2: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req2, sel, {
+      spawnFn: spawnDelayedCancel,
+      steerCancelTimeoutMs: 50,
+    })) {
+      events2.push(ev);
+    }
+
+    const finish2 = events2.find((e) => e.type === "finish");
+    expect(finish2).toBeDefined();
+
+    // Verify worker 1 was closed with steer_cancel_unsettled
+    expect(worker1?.state).toBe("CLOSED");
+
+    // And active worker is a new fresh worker (worker 2)
+    const worker2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(worker2).toBeDefined();
+    expect(worker2).not.toBe(worker1);
+
+    await worker2?.close("test_done");
+  });
+
+  test("26. Late sibling call_3 queued when user sends steer -> call_3 is cancelled and user's steer executes", async () => {
+    const sessionId = `test-steer-late-sibling-${Date.now()}`;
+    const tools = [
+      {
+        name: "tool_a",
+        description: "Tool A",
+        inputSchema: { type: "object" },
+      },
+      {
+        name: "tool_b",
+        description: "Tool B",
+        inputSchema: { type: "object" },
+      },
+    ];
+
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Late sibling steer test",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Please TRIGGER_LATE_SIBLING" }],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    // Turn 1
+    const events1: TurnStreamEvent[] = [];
+    for await (const event of coordinator.executeTurn(testAccount, req1, sel)) {
+      events1.push(event);
+    }
+
+    const toolUse1 = events1.filter((e) => e.type === "tool_use");
+    expect(toolUse1.length).toBe(1);
+    expect(toolUse1[0]!.type === "tool_use" && toolUse1[0]!.name).toBe("tool_a");
+    const call1Id = (toolUse1[0] as any).id;
+
+    // Wait slightly so late sibling call_late_2 arrives in broker
+    await new Promise((r) => setTimeout(r, 120));
+
+    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(worker?.broker.hasPendingWork()).toBe(true);
+
+    // Turn 2: User provides tool_result for call 1 AND a steering message
+    const req2: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Late sibling steer test",
+      messages: [
+        ...req1.messages,
+        {
+          role: "assistant",
+          content: [toolUse1[0] as any],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: call1Id,
+              isError: false,
+              content: [{ type: "text", text: "Result A" }],
+            },
+            {
+              type: "text",
+              text: "Steer: skip tool_b and tell me a story",
+            },
+          ],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const events2: TurnStreamEvent[] = [];
+    for await (const event of coordinator.executeTurn(testAccount, req2, sel)) {
+      events2.push(event);
+    }
+
+    // Unexposed late sibling call_b was cancelled, so user's steer executed!
+    const finish2 = events2.find((e) => e.type === "finish");
+    expect(finish2).toBeDefined();
+    // The finish event is NOT stopReason: "tool_use" for call_b
+    expect((finish2 as any).stopReason).not.toBe("tool_use");
+
+    const textDeltas = events2
+      .filter((e) => e.type === "text_delta")
+      .map((e: any) => e.text)
+      .join("");
+    expect(textDeltas).toContain("Answer: Steer: skip tool_b and tell me a story");
+
+    await worker?.close("test_done");
+  });
+
+  test("27. Post-tool auto-compaction (<summary>...</summary> shorter transcript arriving while worker is in AWAITING_TOOL_RESULTS) -> retires parked worker and succeeds 200 OK on fresh worker", async () => {
+    const sessionId = `test-post-tool-compact-${Date.now()}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object" },
+      },
+    ];
+
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    // Turn 1 with 3 messages so worker has 4 committed messages
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Compaction test",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "What is your name?" }] },
+        { role: "assistant", content: [{ type: "text", text: "I am Magpie." }] },
+        { role: "user", content: [{ type: "text", text: "Please TRIGGER_TOOL_CALL" }] },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const events1: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req1, sel)) {
+      events1.push(ev);
+    }
+    const toolUse = events1.find((e) => e.type === "tool_use");
+    expect(toolUse).toBeDefined();
+
+    const worker1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(worker1?.state).toBe("AWAITING_TOOL_RESULTS");
+    expect(worker1?.committedMessages.length).toBe(4);
+
+    // Turn 2: Pi auto-compacted transcript arriving while worker is AWAITING_TOOL_RESULTS!
+    // Shorter transcript (3 messages < 4 committed) with <summary>
+    const reqCompacted: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Compaction test",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "<summary>\nThe user asked name and then triggered weather tool.\n</summary>",
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [toolUse as any],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: (toolUse as any).id,
+              isError: false,
+              content: [{ type: "text", text: "72F sunny" }],
+            },
+          ],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const events2: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, reqCompacted, sel)) {
+      events2.push(ev);
+    }
+
+    const finish2 = events2.find((e) => e.type === "finish");
+    expect(finish2).toBeDefined();
+
+    // worker1 was closed with "compacted_during_tool_turn"
+    expect(worker1?.state).toBe("CLOSED");
+
+    // A fresh worker was spawned and is active
+    const worker2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(worker2).toBeDefined();
+    expect(worker2).not.toBe(worker1);
+
+    await worker2?.close("test_done");
+  });
+
+  test("28. Whitespace-only text '\\n\\n' before tool_use stripped by Pi on tool_result continuation -> matches ledger cleanly without 409", async () => {
+    const sessionId = `test-whitespace-strip-${Date.now()}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object" },
+      },
+    ];
+
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Whitespace strip test",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const events1: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req1, sel)) {
+      events1.push(ev);
+    }
+    const toolUse = events1.find((e) => e.type === "tool_use");
+    expect(toolUse).toBeDefined();
+
+    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(worker?.state).toBe("AWAITING_TOOL_RESULTS");
+
+    // Simulate that Turn 1 assistant message committed whitespace-only block before tool_use
+    worker!.committedMessages = [
+      { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "\n\n" },
+          toolUse as any,
+        ],
+      },
+    ];
+
+    // Pi's anthropic-messages.js stripped the whitespace block "\n\n", sending ONLY tool_use:
+    const req2: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Whitespace strip test",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
+        {
+          role: "assistant",
+          content: [toolUse as any],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: (toolUse as any).id,
+              isError: false,
+              content: [{ type: "text", text: "72F" }],
+            },
+          ],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    // Should NOT throw 409!
+    const events2: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req2, sel)) {
+      events2.push(ev);
+    }
+
+    const finish2 = events2.find((e) => e.type === "finish");
+    expect(finish2).toBeDefined();
+    expect(worker?.state).toBe("IDLE");
+
+    await worker?.close("test_done");
+  });
+
+  test("29. Standalone <conversation>200KB...</conversation>\\nSummarize the above. compaction prompt -> clips inside <conversation> while keeping Summarize the above. intact under 112 KiB", async () => {
+    const sessionId = `test-standalone-compaction-${Date.now()}`;
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    const bigBody = "Conversation text line. ".repeat(8 * 1024); // ~200 KiB
+    const fullText = `<conversation>\n${bigBody}\n</conversation>\nSummarize the above.`;
+    expect(Buffer.byteLength(fullText, "utf-8")).toBeGreaterThan(150 * 1024);
+
+    const req: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Compaction prompt test",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: fullText }],
+        },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const events: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req, sel)) {
+      events.push(ev);
+    }
+
+    const finish = events.find((e) => e.type === "finish");
+    expect(finish).toBeDefined();
+
+    const textDeltas = events
+      .filter((e) => e.type === "text_delta")
+      .map((e: any) => e.text)
+      .join("");
+    // Fake ACP answers: Answer: <clipped prompt> [model=..., effort=...]
+    expect(textDeltas).toContain("<conversation>");
+    expect(textDeltas).toContain("...[truncated middle for prompt budget]...");
+    expect(textDeltas).toContain("</conversation>\nSummarize the above.");
+
+    const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    await worker?.close("test_done");
   });
 });

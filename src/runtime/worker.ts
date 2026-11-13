@@ -45,6 +45,13 @@ export type WorkerState =
   | "AWAITING_TOOL_RESULTS"
   | "CLOSED";
 
+export class SteerReplayNeededError extends Error {
+  constructor(message = "Steer replay needed") {
+    super(message);
+    this.name = "SteerReplayNeededError";
+  }
+}
+
 export interface ModelSelection {
   rawModelId: string;
   configModelValue: string;
@@ -70,6 +77,7 @@ export interface WorkerOptions {
   }>;
   toolChoice?: ToolChoiceSpec;
   workspaceDir?: string;
+  steerCancelTimeoutMs?: number;
   onStateChange?: (
     worker: AgySessionWorker,
     oldState: WorkerState,
@@ -198,7 +206,12 @@ export class AgySessionWorker {
   systemPrompt?: string;
 
   readonly activeAcpToolCallIds = new Set<string>();
+  pinned: boolean = false;
+  steerCancelTimeoutMs?: number;
 
+  private promptSeq = 0;
+  private activePromptSeq = 0;
+  private suppressingSteerCancel = false;
   private activeTurnQueue: AsyncEventQueue<TurnStreamEvent> | null = null;
   private pendingPromptPromise: Promise<any> | null = null;
   private currentThinkingAccumulator: string = "";
@@ -228,6 +241,7 @@ export class AgySessionWorker {
     this.options = options ?? {};
     this.workDir = this.options.workDir;
     this.onEvict = this.options.onEvict;
+    this.steerCancelTimeoutMs = this.options.steerCancelTimeoutMs;
 
     if (this.options.workspaceDir) {
       this.workspaceDir = this.options.workspaceDir;
@@ -551,6 +565,19 @@ export class AgySessionWorker {
 
   private handleSessionUpdate(rawParams: any): void {
     if (!rawParams) return;
+    if (this.suppressingSteerCancel) {
+      const update = rawParams?.update ?? rawParams;
+      if (update?.sessionUpdate === "tool_call_update") {
+        const callId = update.toolCallId ?? update.id;
+        if (update.status === "completed" || update.status === "failed") {
+          if (callId) {
+            this.activeAcpToolCallIds.delete(callId);
+          }
+          this.notifyToolCallUpdated();
+        }
+      }
+      return;
+    }
     if (
       rawParams?.sessionId &&
       this.nativeSessionId &&
@@ -642,7 +669,7 @@ export class AgySessionWorker {
     }
   }
 
-  private diagnoseTerminationError(): TurnStreamEvent {
+  private diagnoseTerminationError(rawErr?: unknown): TurnStreamEvent {
     let logContent = "";
     try {
       const logPath = path.join(this.workspaceDir, "agy-acp.log");
@@ -664,8 +691,16 @@ export class AgySessionWorker {
       }
     } catch {}
 
-    const stderrTail = this.conn.getStderrTail();
-    const combined = `${logContent}\n${stderrTail}`;
+    const rawErrMsg =
+      rawErr instanceof Error
+        ? rawErr.message
+        : rawErr !== undefined && rawErr !== null
+          ? String(rawErr)
+          : "";
+    const redactedRawErr = redactSecrets(rawErrMsg);
+
+    const stderrTail = this.conn?.getStderrTail() ?? "";
+    const combined = `${logContent}\n${stderrTail}\n${redactedRawErr}`;
 
     if (
       /please sign in|not (?:logged|signed) in|authentication expired|login required|unauthenticated/i.test(
@@ -707,11 +742,14 @@ export class AgySessionWorker {
         message: "Invalid request to agent",
       };
     }
+    const fallbackMsg = redactedRawErr
+      ? `Agent execution terminated due to error: ${redactedRawErr}`
+      : "Agent execution terminated due to error";
     return {
       type: "error",
       status: 500,
       errorType: "api_error",
-      message: "Agent execution terminated due to error",
+      message: fallbackMsg,
     };
   }
 
@@ -937,6 +975,9 @@ export class AgySessionWorker {
       }
     }
 
+    const seq = ++this.promptSeq;
+    this.activePromptSeq = seq;
+
     this.pendingPromptPromise = this.conn.request(
       "session/prompt",
       {
@@ -948,10 +989,10 @@ export class AgySessionWorker {
 
     this.pendingPromptPromise
       .then((result) => {
-        this.handlePromptSuccess(result);
+        this.handlePromptSuccess(result, seq);
       })
       .catch((err) => {
-        this.handlePromptError(err);
+        this.handlePromptError(err, seq);
       });
 
     try {
@@ -965,7 +1006,31 @@ export class AgySessionWorker {
     }
   }
 
-  private handlePromptSuccess(result: any): void {
+  private handlePromptSuccess(result: any, seq?: number): void {
+    if (
+      this.suppressingSteerCancel ||
+      (seq !== undefined && seq !== this.activePromptSeq)
+    ) {
+      try {
+        const stepUsages = readConversationStepUsages(
+          this.account,
+          this.nativeSessionId,
+        );
+        const settledUsage = settleStepUsage(
+          result?.usage,
+          this.promptStepCount,
+          stepUsages.length > 0 ? stepUsages : undefined,
+        );
+        this.unreportedUsage.inputTokens += settledUsage.inputTokens;
+        this.unreportedUsage.outputTokens += settledUsage.outputTokens;
+        this.unreportedUsage.cacheReadInputTokens +=
+          settledUsage.cacheReadInputTokens;
+        this.unreportedUsage.cacheCreationInputTokens +=
+          settledUsage.cacheCreationInputTokens;
+      } catch {}
+      return;
+    }
+
     if (this.heldText.includes(AGENT_ERROR_CORE)) {
       this.heldText = "";
       const errorEvent = this.diagnoseTerminationError();
@@ -1082,10 +1147,16 @@ export class AgySessionWorker {
     this.pendingPromptPromise = null;
   }
 
-  private handlePromptError(err: any): void {
+  private handlePromptError(err: any, seq?: number): void {
+    if (
+      this.suppressingSteerCancel ||
+      (seq !== undefined && seq !== this.activePromptSeq)
+    ) {
+      return;
+    }
     this.broker.markHttpTurnClosed();
     if (this._state === "GENERATING") {
-      const errorEvent = this.diagnoseTerminationError();
+      const errorEvent = this.diagnoseTerminationError(err);
       const eventToSend: TurnStreamEvent =
         errorEvent.type === "error"
           ? errorEvent
@@ -1093,7 +1164,7 @@ export class AgySessionWorker {
               type: "error",
               status: 500,
               errorType: "api_error",
-              message: err?.message || "ACP prompt failed",
+              message: redactSecrets(err?.message || "ACP prompt failed"),
             };
 
       if (this.activeTurnQueue) {
@@ -1155,6 +1226,7 @@ export class AgySessionWorker {
     toolResults: ToolResultDelivery[],
     steeringPromptParts: NormalizedContentPart[],
     signal?: AbortSignal,
+    modelSelection?: ModelSelection,
   ): AsyncGenerator<TurnStreamEvent> {
     if (signal?.aborted) {
       throw new BridgeHttpError(
@@ -1189,29 +1261,33 @@ export class AgySessionWorker {
 
     if (!delivery.allPendingResolved) {
       if (delivery.newlyExposedCalls.length > 0) {
-        for (const call of delivery.newlyExposedCalls) {
+        if (steeringPromptParts.length > 0) {
+          this.broker.cancelUnexposed("Skipped due to user steering message");
+        } else {
+          for (const call of delivery.newlyExposedCalls) {
+            yield {
+              type: "tool_use",
+              id: call.id,
+              name: call.name,
+              input: call.input,
+            };
+          }
           yield {
-            type: "tool_use",
-            id: call.id,
-            name: call.name,
-            input: call.input,
+            type: "finish",
+            stopReason: "tool_use",
+            usage: {
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+            },
           };
+          // Remain in AWAITING_TOOL_RESULTS
+          return;
         }
-        yield {
-          type: "finish",
-          stopReason: "tool_use",
-          usage: {
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-          },
-        };
-        // Remain in AWAITING_TOOL_RESULTS
-        return;
       }
 
-      if (delivery.remainingExposedIds.length > 0) {
+      if (steeringPromptParts.length === 0 && delivery.remainingExposedIds.length > 0) {
         throw new BridgeHttpError(
           400,
           "invalid_request_error",
@@ -1220,9 +1296,48 @@ export class AgySessionWorker {
       }
     }
 
+    if (steeringPromptParts.length > 0 && this.broker.hasPendingWork()) {
+      this.broker.cancelUnexposed("Skipped due to user steering message");
+    }
+
     // 3. All pending resolved:
     // Case A: No steering prompt parts
     if (steeringPromptParts.length === 0) {
+      if (!this.pendingPromptPromise) {
+        if (!this.conn || this.isClosed) {
+          throw new SteerReplayNeededError(
+            "Worker closed while awaiting tool results",
+          );
+        }
+        const resultTexts = toolResults.map((tr) => {
+          const contentText = tr.content
+            .filter((c) => c.type === "text")
+            .map((c) => (c as any).text)
+            .join("\n");
+          return `[Tool Result: ${tr.toolUseId}${tr.isError ? " (error)" : ""}]:\n${contentText}\n[end of tool result]`;
+        });
+        const promptText =
+          resultTexts.join("\n\n") +
+          "\n\nContinue based on the completed tool result(s) above.";
+        const lateContinuationParts: NormalizedContentPart[] = [
+          { type: "text", text: promptText },
+        ];
+        for (const tr of toolResults) {
+          for (const item of tr.content) {
+            if (item.type === "image") {
+              lateContinuationParts.push({
+                type: "image",
+                data: item.data,
+                mimeType: item.mediaType,
+              } as any);
+            }
+          }
+        }
+        this.setState("IDLE");
+        yield* this.startPromptTurn(lateContinuationParts, signal);
+        return;
+      }
+
       this.setState("GENERATING");
       const queue = new AsyncEventQueue<TurnStreamEvent>();
       this.activeTurnQueue = queue;
@@ -1254,24 +1369,61 @@ export class AgySessionWorker {
     }
 
     // Case B: Steering prompt parts present
-    // Wait up to 5_000ms for activeAcpToolCallIds to all report completed/failed
-    await this.waitForActiveToolCallsCommit(5_000);
+    this.suppressingSteerCancel = true;
+    this.activePromptSeq = ++this.promptSeq;
 
-    // Cancel existing prompt turn
-    this.conn.notify("session/cancel", { sessionId: this.nativeSessionId });
+    try {
+      await this.waitForActiveToolCallsCommit(5_000);
+    } catch {}
 
-    if (this.pendingPromptPromise) {
+    const oldPromptPromise = this.pendingPromptPromise;
+    this.pendingPromptPromise = null;
+
+    if (this.conn) {
       try {
-        await Promise.race([
-          this.pendingPromptPromise,
-          new Promise((r) => setTimeout(r, 1000)),
-        ]);
+        this.conn.notify("session/cancel", {
+          sessionId: this.nativeSessionId,
+        });
       } catch {}
-      this.pendingPromptPromise = null;
     }
 
-    // Transition to IDLE and start prompt turn with steeringPromptParts
+    let settled = false;
+    const cancelTimeoutMs =
+      this.steerCancelTimeoutMs ??
+      this.options.steerCancelTimeoutMs ??
+      5_000;
+    if (oldPromptPromise) {
+      try {
+        await Promise.race([
+          oldPromptPromise.then(
+            () => {
+              settled = true;
+            },
+            () => {
+              settled = true;
+            },
+          ),
+          new Promise((r) => setTimeout(r, cancelTimeoutMs)),
+        ]);
+      } catch {}
+    } else {
+      settled = true;
+    }
+
+    if (!settled) {
+      await this.close("steer_cancel_unsettled");
+      throw new SteerReplayNeededError(
+        "Prompt cancel timed out during steer; worker retired",
+      );
+    }
+
+    this.suppressingSteerCancel = false;
     this.setState("IDLE");
+
+    if (modelSelection) {
+      await this.applyModelSelection(modelSelection, signal);
+    }
+
     const acpSteeringParts = steeringPromptParts.map((p: any) => {
       if (p.type === "image") {
         return {
@@ -1282,6 +1434,7 @@ export class AgySessionWorker {
       }
       return p;
     });
+
     yield* this.startPromptTurn(acpSteeringParts, signal);
   }
 
