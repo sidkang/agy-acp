@@ -49,6 +49,25 @@ const ORIGINAL_AGY_PATH = process.env.AGY_PATH;
 const VALID_UUID = "e2b65597-96a9-46be-8f3e-52ebc689b7b9";
 const OTHER_UUID = "0f6d9d0a-0c4f-4f52-9a3f-2f0b4c1d2e3a";
 
+/**
+ * `buildAgyEnvAndArgs` resolves the real `agy` binary before doing anything
+ * else, so it throws on a machine where it is not installed (CI). These tests
+ * point `AGY_PATH` at a throwaway no-op executable inside TEST_DIR instead.
+ */
+const MOCK_AGY_BIN = path.join(
+  TEST_DIR,
+  process.platform === "win32" ? "mock-agy.cmd" : "mock-agy"
+);
+
+function ensureMockAgyBin(): string {
+  const content = process.platform === "win32" ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n";
+  fs.writeFileSync(MOCK_AGY_BIN, content, { mode: 0o755 });
+  try {
+    fs.chmodSync(MOCK_AGY_BIN, 0o755);
+  } catch {}
+  return MOCK_AGY_BIN;
+}
+
 const REAL_AGY_MODELS_OUTPUT = `Fetching available models...
 gemini-4-carbon-medium\tGemini 4 Carbon (Medium)
 gemini-4-carbon-high\tGemini 4 Carbon (High)
@@ -223,6 +242,10 @@ describe("src/accounts/env.ts", () => {
       isolatedHomeDir: resolveIsolatedHomeDir(VALID_UUID),
     };
 
+    // Point `agy` resolution at a throwaway executable: CI has no `agy` install.
+    const prevAgyPath = process.env.AGY_PATH;
+    process.env.AGY_PATH = ensureMockAgyBin();
+
     // Set cross-contaminating env vars to check that they get purged
     process.env.GEMINI_API_KEY = "polluted-gemini";
     process.env.GOOGLE_API_KEY = "polluted-google";
@@ -230,46 +253,54 @@ describe("src/accounts/env.ts", () => {
     process.env.ANTIGRAVITY_APP_DATA_DIR = "polluted-app-data";
     process.env.ANTIGRAVITY_CONFIG_REL_DIR = "polluted-config-rel";
 
-    const acpResult = buildAgyEnvAndArgs(isolatedAccount, ["acp", "--login"]);
-    const shimDir = getBrowserShimDir();
+    try {
+      const acpResult = buildAgyEnvAndArgs(isolatedAccount, ["acp", "--login"]);
+      const shimDir = getBrowserShimDir();
 
-    // Verify sanitization
-    expect(acpResult.env.GEMINI_API_KEY).toBeUndefined();
-    expect(acpResult.env.GOOGLE_API_KEY).toBeUndefined();
-    expect(acpResult.env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
-    expect(acpResult.env.ANTIGRAVITY_APP_DATA_DIR).toBeUndefined();
-    expect(acpResult.env.ANTIGRAVITY_CONFIG_REL_DIR).toBeUndefined();
+      // Verify sanitization
+      expect(acpResult.env.GEMINI_API_KEY).toBeUndefined();
+      expect(acpResult.env.GOOGLE_API_KEY).toBeUndefined();
+      expect(acpResult.env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
+      expect(acpResult.env.ANTIGRAVITY_APP_DATA_DIR).toBeUndefined();
+      expect(acpResult.env.ANTIGRAVITY_CONFIG_REL_DIR).toBeUndefined();
 
-    // Verify browser suppression
-    expect(acpResult.env.BROWSER).toBe("/usr/bin/false");
-    expect(acpResult.env.PATH?.startsWith(shimDir)).toBe(true);
-    expect(acpResult.env.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
+      // Verify browser suppression
+      expect(acpResult.env.BROWSER).toBe("/usr/bin/false");
+      expect(acpResult.env.PATH?.startsWith(shimDir)).toBe(true);
+      expect(acpResult.env.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
 
-    // Verify isolated tokens & directories
-    expect(acpResult.env.HOME).toBe(isolatedAccount.isolatedHomeDir!);
-    expect(acpResult.env.SSH_CONNECTION).toBe("127.0.0.1 0 127.0.0.1 22");
-    expect(acpResult.env.XDG_CONFIG_HOME).toBe(path.join(isolatedAccount.isolatedHomeDir!, ".config"));
+      // Verify isolated tokens & directories
+      expect(acpResult.env.HOME).toBe(isolatedAccount.isolatedHomeDir!);
+      expect(acpResult.env.SSH_CONNECTION).toBe("127.0.0.1 0 127.0.0.1 22");
+      expect(acpResult.env.XDG_CONFIG_HOME).toBe(
+        path.join(isolatedAccount.isolatedHomeDir!, ".config")
+      );
 
-    // Verify args for `acp` have absolute --gemini-dir and relative --app-data-dir
-    expect(acpResult.finalArgs[0]).toBe("acp");
-    const geminiIdx = acpResult.finalArgs.indexOf("--gemini-dir");
-    expect(geminiIdx).toBeGreaterThan(0);
-    expect(acpResult.finalArgs[geminiIdx + 1]).toBe(path.join(isolatedAccount.isolatedHomeDir!, ".gemini"));
-    const appDataIdx = acpResult.finalArgs.indexOf("--app-data-dir");
-    expect(appDataIdx).toBeGreaterThan(0);
-    expect(acpResult.finalArgs[appDataIdx + 1]).toBe("antigravity-cli");
-    expect(path.isAbsolute(acpResult.finalArgs[appDataIdx + 1]!)).toBe(false);
+      // Verify args for `acp` have absolute --gemini-dir and relative --app-data-dir
+      expect(acpResult.finalArgs[0]).toBe("acp");
+      const geminiIdx = acpResult.finalArgs.indexOf("--gemini-dir");
+      expect(geminiIdx).toBeGreaterThan(0);
+      expect(acpResult.finalArgs[geminiIdx + 1]).toBe(
+        path.join(isolatedAccount.isolatedHomeDir!, ".gemini")
+      );
+      const appDataIdx = acpResult.finalArgs.indexOf("--app-data-dir");
+      expect(appDataIdx).toBeGreaterThan(0);
+      expect(acpResult.finalArgs[appDataIdx + 1]).toBe("antigravity-cli");
+      expect(path.isAbsolute(acpResult.finalArgs[appDataIdx + 1]!)).toBe(false);
 
-    // Verify args for `models` do NOT append --gemini-dir
-    const modelsResult = buildAgyEnvAndArgs(isolatedAccount, ["models"]);
-    expect(modelsResult.finalArgs).toEqual(["models"]);
-
-    // Clean up test pollution
-    delete process.env.GEMINI_API_KEY;
-    delete process.env.GOOGLE_API_KEY;
-    delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
-    delete process.env.ANTIGRAVITY_APP_DATA_DIR;
-    delete process.env.ANTIGRAVITY_CONFIG_REL_DIR;
+      // Verify args for `models` do NOT append --gemini-dir
+      const modelsResult = buildAgyEnvAndArgs(isolatedAccount, ["models"]);
+      expect(modelsResult.finalArgs).toEqual(["models"]);
+    } finally {
+      // Clean up test pollution
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.GOOGLE_API_KEY;
+      delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+      delete process.env.ANTIGRAVITY_APP_DATA_DIR;
+      delete process.env.ANTIGRAVITY_CONFIG_REL_DIR;
+      if (prevAgyPath === undefined) delete process.env.AGY_PATH;
+      else process.env.AGY_PATH = prevAgyPath;
+    }
   });
 
   test("buildAgyEnvAndArgs keeps loopback out of proxies and applies Magpie proxy fallbacks", () => {
@@ -282,6 +313,7 @@ describe("src/accounts/env.ts", () => {
     };
 
     const prev = {
+      AGY_PATH: process.env.AGY_PATH,
       NO_PROXY: process.env.NO_PROXY,
       no_proxy: process.env.no_proxy,
       HTTPS_PROXY: process.env.HTTPS_PROXY,
@@ -306,6 +338,8 @@ describe("src/accounts/env.ts", () => {
       process.env.MAGPIE_HTTPS_PROXY = "http://proxy.example:8443";
       process.env.MAGPIE_HTTP_PROXY = "http://proxy.example:8080";
       process.env.MAGPIE_ALL_PROXY = "socks5://proxy.example:1080";
+      // Point `agy` resolution at a throwaway executable: CI has no `agy` install.
+      process.env.AGY_PATH = ensureMockAgyBin();
 
       const result = buildAgyEnvAndArgs(isolatedAccount, ["models"]);
 
@@ -332,10 +366,18 @@ describe("src/accounts/env.ts", () => {
       isolatedHomeDir: null,
     };
 
-    const result = buildAgyEnvAndArgs(hostAccount, ["models"]);
-    expect(result.env.SSH_CONNECTION).toBe(process.env.SSH_CONNECTION);
-    expect(result.finalArgs).toEqual(["models"]);
-    expect(result.env.BROWSER).toBe("/usr/bin/false");
+    // Point `agy` resolution at a throwaway executable: CI has no `agy` install.
+    const prevAgyPath = process.env.AGY_PATH;
+    process.env.AGY_PATH = ensureMockAgyBin();
+    try {
+      const result = buildAgyEnvAndArgs(hostAccount, ["models"]);
+      expect(result.env.SSH_CONNECTION).toBe(process.env.SSH_CONNECTION);
+      expect(result.finalArgs).toEqual(["models"]);
+      expect(result.env.BROWSER).toBe("/usr/bin/false");
+    } finally {
+      if (prevAgyPath === undefined) delete process.env.AGY_PATH;
+      else process.env.AGY_PATH = prevAgyPath;
+    }
   });
 
   test("redactSecrets sanitizes OAuth codes, tokens, Bearer auth, and loopback mcp tokens", () => {

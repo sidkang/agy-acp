@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   BridgeHttpError,
@@ -23,9 +25,11 @@ import {
 import type { GlobalScheduler } from "../runtime/scheduler";
 import type { LoopbackMcpServer } from "../mcp/http-server";
 import {
+  getPluginDataRoot,
   sweepStaleAccountStorage,
   type SpawnAgyOptions,
 } from "../accounts/env";
+import { resolveConversationDbPath } from "../usage/step-usage";
 import type { ToolResultDelivery } from "../mcp/broker";
 
 export interface TurnExecutionOptions {
@@ -819,6 +823,197 @@ function estimateParkedBytes(
   return bytes;
 }
 
+/**
+ * Zero-plaintext, digest-only description of a resumable session. Persisted to
+ * `parked-sessions.json` inside the plugin data root so a restarted plugin host
+ * can issue `session/resume` without ever writing message text, tool arguments,
+ * tool outputs, system prompt text, or the system history seed to disk.
+ */
+interface PersistedParkedMessageDigest {
+  role: "user" | "assistant";
+  fullDigest: string;
+  toolIdentities?: Array<{ id: string; name: string }>;
+  nonToolDigest?: string;
+}
+
+interface PersistedParkedSession {
+  nativeSessionId: string;
+  accountRef: string;
+  minimalAgent: boolean;
+  workDir?: string;
+  parkedAt: number;
+  systemPromptDigest: string;
+  toolsDigests: Array<{ name: string; schemaDigest: string }>;
+  messageDigests: PersistedParkedMessageDigest[];
+}
+
+function sha256Hex(value: string): string {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function digestToolsForPersistence(
+  tools: Array<{
+    name: string;
+    description?: string;
+    inputSchema: Record<string, unknown>;
+  }>,
+): Array<{ name: string; schemaDigest: string }> {
+  return tools.map((t) => ({
+    name: t.name,
+    schemaDigest: sha256Hex(stableJson(t.inputSchema)),
+  }));
+}
+
+function toolsMatchPersistedDigests(
+  digests: Array<{ name: string; schemaDigest: string }>,
+  tools: Array<{
+    name: string;
+    description?: string;
+    inputSchema: Record<string, unknown>;
+  }>,
+): boolean {
+  if (digests.length !== tools.length) return false;
+  const byName = new Map(digests.map((d) => [d.name, d.schemaDigest]));
+  for (const t of tools) {
+    const existing = byName.get(t.name);
+    if (!existing || existing !== sha256Hex(stableJson(t.inputSchema))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function digestMessagesForPersistence(
+  messages: NormalizedMessage[],
+): PersistedParkedMessageDigest[] {
+  return messages.map((msg) => {
+    const pParts = canonicalPartsForLedger(msg.content);
+    const fullDigest = sha256Hex(stableJson(pParts));
+    if (msg.role !== "assistant") {
+      return { role: "user" as const, fullDigest };
+    }
+    const toolIdentities = pParts
+      .filter(
+        (
+          p,
+        ): p is {
+          type: "tool_use";
+          id: string;
+          name: string;
+          input: Record<string, unknown>;
+        } => p.type === "tool_use",
+      )
+      .map((p) => ({ id: p.id, name: p.name }));
+    const nonToolDigest = sha256Hex(
+      stableJson(pParts.filter((p) => p.type !== "tool_use")),
+    );
+    return {
+      role: "assistant" as const,
+      fullDigest,
+      toolIdentities,
+      nonToolDigest,
+    };
+  });
+}
+
+/**
+ * Mirrors `isPrefixMatch` exactly, but against the on-disk digest index:
+ * tolerates reordered `tool_use` JSON keys / client-added default fields by
+ * comparing tool identities + a digest of the remaining parts.
+ */
+function persistedPrefixMatches(
+  digests: PersistedParkedMessageDigest[],
+  messages: NormalizedMessage[],
+): boolean {
+  if (digests.length === 0) return false;
+  if (messages.length < digests.length) return false;
+  for (let i = 0; i < digests.length; i++) {
+    const digest = digests[i]!;
+    const msg = messages[i]!;
+    if (msg.role !== digest.role) return false;
+    const pParts = canonicalPartsForLedger(msg.content);
+    if (sha256Hex(stableJson(pParts)) === digest.fullDigest) continue;
+    if (msg.role === "assistant" && digest.nonToolDigest !== undefined) {
+      const toolIdentities = pParts
+        .filter(
+          (
+            p,
+          ): p is {
+            type: "tool_use";
+            id: string;
+            name: string;
+            input: Record<string, unknown>;
+          } => p.type === "tool_use",
+        )
+        .map((p) => ({ id: p.id, name: p.name }));
+      if (
+        stableJson(toolIdentities) ===
+          stableJson(digest.toolIdentities ?? []) &&
+        sha256Hex(stableJson(pParts.filter((p) => p.type !== "tool_use"))) ===
+          digest.nonToolDigest
+      ) {
+        continue;
+      }
+    }
+    return false;
+  }
+  return true;
+}
+
+function normalizePersistedEntry(raw: unknown): PersistedParkedSession | null {
+  if (!raw || typeof raw !== "object") return null;
+  const e = raw as Record<string, any>;
+  if (typeof e.nativeSessionId !== "string" || !e.nativeSessionId) return null;
+  if (typeof e.accountRef !== "string" || !e.accountRef) return null;
+  if (typeof e.minimalAgent !== "boolean") return null;
+  if (typeof e.parkedAt !== "number" || !Number.isFinite(e.parkedAt)) {
+    return null;
+  }
+  if (typeof e.systemPromptDigest !== "string") return null;
+  if (!Array.isArray(e.toolsDigests) || !Array.isArray(e.messageDigests)) {
+    return null;
+  }
+  const toolsDigests: Array<{ name: string; schemaDigest: string }> = [];
+  for (const t of e.toolsDigests) {
+    if (!t || typeof t.name !== "string" || typeof t.schemaDigest !== "string") {
+      return null;
+    }
+    toolsDigests.push({ name: t.name, schemaDigest: t.schemaDigest });
+  }
+  const messageDigests: PersistedParkedMessageDigest[] = [];
+  for (const m of e.messageDigests) {
+    if (!m || (m.role !== "user" && m.role !== "assistant")) return null;
+    if (typeof m.fullDigest !== "string") return null;
+    const digest: PersistedParkedMessageDigest = {
+      role: m.role,
+      fullDigest: m.fullDigest,
+    };
+    if (m.role === "assistant") {
+      if (Array.isArray(m.toolIdentities)) {
+        digest.toolIdentities = m.toolIdentities
+          .filter(
+            (t: any) => t && typeof t.id === "string" && typeof t.name === "string",
+          )
+          .map((t: any) => ({ id: t.id, name: t.name }));
+      }
+      if (typeof m.nonToolDigest === "string") {
+        digest.nonToolDigest = m.nonToolDigest;
+      }
+    }
+    messageDigests.push(digest);
+  }
+  return {
+    nativeSessionId: e.nativeSessionId,
+    accountRef: e.accountRef,
+    minimalAgent: e.minimalAgent,
+    workDir: typeof e.workDir === "string" ? e.workDir : undefined,
+    parkedAt: e.parkedAt,
+    systemPromptDigest: e.systemPromptDigest,
+    toolsDigests,
+    messageDigests,
+  };
+}
+
 const STORAGE_GC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
 export class SessionCoordinator {
@@ -835,6 +1030,8 @@ export class SessionCoordinator {
   private readonly sessionLocks = new Map<string, Promise<void>>();
   private readonly activeWorkers = new Map<string, AgySessionWorker>();
   private readonly parkedSessions = new Map<string, ParkedSession>();
+  private persistedSessions = new Map<string, PersistedParkedSession>();
+  private persistedSessionsFile: string | null = null;
   private lastStorageGcAt = 0;
 
   constructor(options: SessionCoordinatorOptions) {
@@ -875,8 +1072,184 @@ export class SessionCoordinator {
       if (entry.nativeSessionId) protectedSessionIds.add(entry.nativeSessionId);
     }
     try {
+      this.ensurePersistedSessionsLoaded(now);
+    } catch {}
+    for (const entry of this.persistedSessions.values()) {
+      if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) continue;
+      if (entry.nativeSessionId) protectedSessionIds.add(entry.nativeSessionId);
+    }
+    try {
       sweepStaleAccountStorage({ now, protectedSessionIds });
     } catch {}
+  }
+
+  /**
+   * Loads the on-disk digest index lazily and reloads it whenever the active
+   * plugin data root changes (tests switch `AGY_ACP_DATA_DIR` between cases).
+   */
+  private ensurePersistedSessionsLoaded(now = Date.now()): void {
+    let file: string;
+    try {
+      file = path.join(getPluginDataRoot(), "parked-sessions.json");
+    } catch {
+      return;
+    }
+    if (this.persistedSessionsFile === file) return;
+    this.persistedSessionsFile = file;
+    this.persistedSessions = new Map<string, PersistedParkedSession>();
+    try {
+      const parsed: any = JSON.parse(fs.readFileSync(file, "utf8"));
+      const sessions = parsed?.sessions;
+      if (sessions && typeof sessions === "object") {
+        for (const [key, raw] of Object.entries(
+          sessions as Record<string, unknown>,
+        )) {
+          const entry = normalizePersistedEntry(raw);
+          if (entry) this.persistedSessions.set(key, entry);
+        }
+      }
+    } catch {}
+    this.prunePersistedSessions(now);
+  }
+
+  private prunePersistedSessions(now = Date.now()): void {
+    for (const [key, entry] of this.persistedSessions) {
+      if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) {
+        this.persistedSessions.delete(key);
+      }
+    }
+    while (this.persistedSessions.size > MAX_PARKED_SESSIONS) {
+      let oldestKey: string | null = null;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [key, entry] of this.persistedSessions) {
+        if (entry.parkedAt < oldestAt) {
+          oldestAt = entry.parkedAt;
+          oldestKey = key;
+        }
+      }
+      if (!oldestKey) break;
+      this.persistedSessions.delete(oldestKey);
+    }
+  }
+
+  /**
+   * Atomically writes the digest index (mode 0o600). Never throws: disk errors
+   * must not break a turn.
+   */
+  private flushPersistedSessions(now = Date.now()): void {
+    try {
+      this.ensurePersistedSessionsLoaded(now);
+      const file = this.persistedSessionsFile;
+      if (!file) return;
+      this.prunePersistedSessions(now);
+      const payload = JSON.stringify(
+        { version: 1, sessions: Object.fromEntries(this.persistedSessions) },
+        null,
+        2,
+      );
+      const tmpFile = `${file}.${process.pid}.${crypto
+        .randomBytes(6)
+        .toString("hex")}.tmp`;
+      try {
+        fs.writeFileSync(tmpFile, payload, { mode: 0o600 });
+        try {
+          fs.chmodSync(tmpFile, 0o600);
+        } catch {}
+        fs.renameSync(tmpFile, file);
+      } catch (err) {
+        try {
+          fs.rmSync(tmpFile, { force: true });
+        } catch {}
+        throw err;
+      }
+      try {
+        fs.chmodSync(file, 0o600);
+      } catch {}
+    } catch {}
+  }
+
+  private invalidatePersistedSession(
+    sessionKey: string,
+    nativeSessionId?: string,
+    now = Date.now(),
+  ): void {
+    try {
+      this.ensurePersistedSessionsLoaded(now);
+      let removed = this.persistedSessions.delete(sessionKey);
+      if (nativeSessionId) {
+        for (const [k, entry] of this.persistedSessions) {
+          if (entry.nativeSessionId === nativeSessionId) {
+            this.persistedSessions.delete(k);
+            removed = true;
+          }
+        }
+      }
+      if (removed) {
+        this.flushPersistedSessions(now);
+      }
+    } catch {}
+  }
+
+  /**
+   * Records a digest-only index entry for a stateful session that can be woken
+   * with `session/resume`. Never stores message text, tool args/results, system
+   * prompt text, or the system history seed.
+   */
+  private recordPersistedSession(
+    worker: AgySessionWorker,
+    sessionKey: string,
+    now = Date.now(),
+  ): void {
+    try {
+      if (worker.appliedSystemHistorySeed) return;
+      if (!worker.resumeSupported) return;
+      if (!worker.nativeSessionId) return;
+      if (worker.sessionId.startsWith("ephemeral-")) return;
+      this.ensurePersistedSessionsLoaded(now);
+      this.persistedSessions.set(sessionKey, {
+        nativeSessionId: worker.nativeSessionId,
+        accountRef: worker.account.accountRef,
+        minimalAgent: worker.minimalAgent,
+        workDir: worker.workDir,
+        parkedAt: now,
+        systemPromptDigest: sha256Hex(
+          stripVolatileSystem(worker.systemPrompt ?? ""),
+        ),
+        toolsDigests: digestToolsForPersistence(worker.registeredTools),
+        messageDigests: digestMessagesForPersistence(worker.committedMessages),
+      });
+      this.flushPersistedSessions(now);
+    } catch {}
+  }
+
+  private resolvePersistedResume(
+    account: AccountDescriptor,
+    req: NormalizedAnthropicRequest,
+    sessionKey: string,
+    requestedMinimalAgent: boolean,
+    now: number,
+    spawnFn: TurnExecutionOptions["spawnFn"],
+  ): PersistedParkedSession | null {
+    try {
+      this.ensurePersistedSessionsLoaded(now);
+    } catch {
+      return null;
+    }
+    const entry = this.persistedSessions.get(sessionKey);
+    if (!entry) return null;
+    if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) return null;
+    if (entry.accountRef !== account.accountRef) return null;
+    if (entry.minimalAgent !== requestedMinimalAgent) return null;
+    if (entry.systemPromptDigest !== sha256Hex(stripVolatileSystem(req.system))) {
+      return null;
+    }
+    if (!toolsMatchPersistedDigests(entry.toolsDigests, req.tools)) return null;
+    if (!persistedPrefixMatches(entry.messageDigests, req.messages)) return null;
+    if (!spawnFn) {
+      const dbPath = resolveConversationDbPath(account, entry.nativeSessionId);
+      if (!dbPath || !fs.existsSync(dbPath)) return null;
+    }
+    return entry;
   }
 
   private removeActiveWorker(worker: AgySessionWorker): void {
@@ -923,6 +1296,9 @@ export class SessionCoordinator {
     }
     const now = Date.now();
     this.pruneParkedSessions(now);
+    if (worker.resumeSupported && !worker.appliedSystemHistorySeed) {
+      this.recordPersistedSession(worker, foundKey, now);
+    }
     if (worker.nativeSessionId) {
       const estimatedBytes = estimateParkedBytes(
         worker.committedMessages,
@@ -1209,6 +1585,7 @@ export class SessionCoordinator {
         existingWorker,
         req,
         modelSelection,
+        sessionKey,
         signal,
       );
       return;
@@ -1329,6 +1706,22 @@ export class SessionCoordinator {
       resumeSessionId = parked.nativeSessionId;
     }
 
+    const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
+    // Cross-restart resume: fall back to the digest-only on-disk index when the
+    // in-memory shelf is empty (fresh plugin host / SIGKILLed host / update).
+    let persisted: PersistedParkedSession | null = null;
+    if (!resumeSessionId) {
+      persisted = this.resolvePersistedResume(
+        account,
+        req,
+        sessionKey,
+        requestedMinimalAgent,
+        now,
+        spawnFn,
+      );
+      if (persisted) resumeSessionId = persisted.nativeSessionId;
+    }
+
     const { priorMessages, currentMessages } = splitPriorAndCurrent(
       req.messages,
     );
@@ -1337,8 +1730,6 @@ export class SessionCoordinator {
       currentMessages,
       modelSelection.rawModelId,
     );
-
-    const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
     const workerOptions: WorkerOptions = {
       spawnFn,
       minimalAgent:
@@ -1403,9 +1794,34 @@ export class SessionCoordinator {
           worker,
           req,
           modelSelection,
+          sessionKey,
           signal,
         );
         return;
+      }
+
+      if (worker.resumedFromShelf && persisted) {
+        // Rebuild the ledger from the persisted digest length only; the digests
+        // prove this prefix is byte-identical to the pre-restart conversation.
+        worker.committedMessages = req.messages.slice(
+          0,
+          persisted.messageDigests.length,
+        );
+        yield* this.executeWarmIdleTurn(
+          worker,
+          req,
+          modelSelection,
+          sessionKey,
+          signal,
+        );
+        return;
+      }
+
+      if (persisted && !worker.resumedFromShelf) {
+        // Resume was rejected by the agent (or its .db vanished): drop the stale
+        // index entry and continue with a normal cold start.
+        this.persistedSessions.delete(sessionKey);
+        this.flushPersistedSessions();
       }
 
       if (requestHasImages(req.messages) && !worker.imageSupported) {
@@ -1458,6 +1874,7 @@ export class SessionCoordinator {
       let fullAnswerText = "";
 
       let sawError = false;
+      this.invalidatePersistedSession(sessionKey, worker.nativeSessionId);
       for await (const event of worker.startPromptTurn(promptParts, signal)) {
         if (event.type === "tool_use") {
           generatedToolCalls.push(event);
@@ -1467,6 +1884,9 @@ export class SessionCoordinator {
           sawError = true;
         } else if (event.type === "finish") {
           commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+          if (generatedToolCalls.length === 0) {
+            this.recordPersistedSession(worker, sessionKey);
+          }
         }
         yield event;
       }
@@ -1485,6 +1905,7 @@ export class SessionCoordinator {
     worker: AgySessionWorker,
     req: NormalizedAnthropicRequest,
     modelSelection: ModelSelection,
+    sessionKey: string,
     signal?: AbortSignal,
   ): AsyncGenerator<TurnStreamEvent> {
     worker.pinned = true;
@@ -1524,6 +1945,7 @@ export class SessionCoordinator {
       let fullAnswerText = "";
 
       let sawError = false;
+      this.invalidatePersistedSession(sessionKey, worker.nativeSessionId);
       for await (const event of worker.startPromptTurn(promptParts, signal)) {
         if (event.type === "tool_use") {
           generatedToolCalls.push(event);
@@ -1533,6 +1955,9 @@ export class SessionCoordinator {
           sawError = true;
         } else if (event.type === "finish") {
           commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+          if (generatedToolCalls.length === 0) {
+            this.recordPersistedSession(worker, sessionKey);
+          }
         }
         yield event;
       }
@@ -1697,6 +2122,7 @@ export class SessionCoordinator {
 
       let yieldedAny = false;
       let sawError = false;
+      this.invalidatePersistedSession(sessionKey, worker.nativeSessionId);
       try {
         for await (const event of worker.continueWithToolResults(
           toolResults,
@@ -1713,6 +2139,9 @@ export class SessionCoordinator {
             sawError = true;
           } else if (event.type === "finish") {
             commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+            if (generatedToolCalls.length === 0) {
+              this.recordPersistedSession(worker, sessionKey);
+            }
           }
           yield event;
         }

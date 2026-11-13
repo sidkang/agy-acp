@@ -2674,4 +2674,164 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(Buffer.byteLength(reply, "utf-8")).toBeLessThan(120 * 1024);
     await worker.close("test_done");
   });
+
+  test("35. Cross-restart resume: zero-plaintext parked-sessions.json index wakes Turn 2 via session/resume without history replay", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-magpie-park-"));
+    const prevDataDir = process.env.AGY_ACP_DATA_DIR;
+    process.env.AGY_ACP_DATA_DIR = dataDir;
+
+    const SECRET_ONLY_IN_TURN_1 = "nebula-99";
+    const SYSTEM_PROMPT_TEXT = "PERSISTED_SYSTEM_PROMPT_SECRET_LINE";
+    const sessionId = `test-persist-resume-${Date.now()}`;
+    const sessionKey = `${testAccount.slotKey}::${sessionId}`;
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    const schedA = new GlobalScheduler({
+      maxGlobalWorkers: 2,
+      maxPerAccountWorkers: 2,
+      idleTimeoutMs: 60_000,
+    });
+    let schedB: GlobalScheduler | undefined;
+
+    try {
+      const coordA = new SessionCoordinator({
+        scheduler: schedA,
+        mcpServer,
+        spawnFn: spawnFakeAcp,
+      });
+
+      const turn1User: NormalizedAnthropicRequest["messages"][number] = {
+        role: "user",
+        content: [{ type: "text", text: `Turn 1 secret ${SECRET_ONLY_IN_TURN_1}` }],
+      };
+      const turn1Req: NormalizedAnthropicRequest = {
+        model: "gemini-3.8-flash",
+        system: `You are a helpful agent.\n${SYSTEM_PROMPT_TEXT}`,
+        messages: [turn1User],
+        tools: [],
+        toolChoice: { type: "auto" },
+        stream: true,
+        thinkingEnabled: false,
+        sessionId,
+      };
+
+      let turn1Answer = "";
+      for await (const ev of coordA.executeTurn(testAccount, turn1Req, sel)) {
+        if (ev.type === "text_delta") turn1Answer += ev.text;
+      }
+      expect(turn1Answer).toContain(SECRET_ONLY_IN_TURN_1);
+
+      const workerA = coordA.getActiveWorker(sessionKey)!;
+      expect(workerA).toBeDefined();
+      expect(workerA.state).toBe("IDLE");
+      expect(workerA.resumeSupported).toBe(true);
+      const turn1NativeSessionId = workerA.nativeSessionId;
+      expect(turn1NativeSessionId).toBeTruthy();
+
+      // 2. On-disk index exists, is private, and holds digests only.
+      const indexFile = path.join(dataDir, "parked-sessions.json");
+      expect(fs.existsSync(indexFile)).toBe(true);
+      if (process.platform !== "win32") {
+        expect(fs.statSync(indexFile).mode & 0o777).toBe(0o600);
+      }
+      const rawIndex = fs.readFileSync(indexFile, "utf8");
+      expect(rawIndex).toContain(turn1NativeSessionId);
+      expect(rawIndex).toContain(sessionId);
+      expect(rawIndex).not.toContain(SECRET_ONLY_IN_TURN_1);
+      expect(rawIndex).not.toContain(SYSTEM_PROMPT_TEXT);
+      expect(rawIndex).not.toContain("Turn 1 secret");
+      expect(rawIndex).not.toContain("Answer:");
+
+      // 3. Host killed without running onBeforeEvictIdle (magpie plugin update -> exit).
+      schedA.closeAllSync("plugin_update_exit");
+      schedA.destroy();
+
+      // Brand-new coordinator: empty in-memory maps, same data dir.
+      schedB = new GlobalScheduler({
+        maxGlobalWorkers: 2,
+        maxPerAccountWorkers: 2,
+        idleTimeoutMs: 60_000,
+      });
+      const coordB = new SessionCoordinator({
+        scheduler: schedB,
+        mcpServer,
+        spawnFn: spawnFakeAcp,
+      });
+      expect((coordB as any).parkedSessions.size).toBe(0);
+
+      // 4. Turn 2 resumes the exact native session and only sends the delta.
+      const turn2Req: NormalizedAnthropicRequest = {
+        ...turn1Req,
+        messages: [
+          turn1User,
+          { role: "assistant", content: [{ type: "text", text: turn1Answer }] },
+          {
+            role: "user",
+            content: [{ type: "text", text: "INSPECT_RESUME follow up" }],
+          },
+        ],
+      };
+
+      let turn2Answer = "";
+      for await (const ev of coordB.executeTurn(testAccount, turn2Req, sel)) {
+        if (ev.type === "text_delta") turn2Answer += ev.text;
+      }
+
+      expect(turn2Answer).toContain(
+        `[resumedSessionId=${turn1NativeSessionId}]`,
+      );
+      // Delta-only prompt: no cold <conversation_history> replay of Turn 1.
+      expect(turn2Answer).not.toContain("<conversation_history>");
+      expect(turn2Answer).not.toContain(SECRET_ONLY_IN_TURN_1);
+      expect(turn2Answer).not.toContain("<prior_conversation_history>");
+
+      const workerB = coordB.getActiveWorker(sessionKey)!;
+      expect(workerB).toBeDefined();
+      expect(workerB.resumedFromShelf).toBe(true);
+      expect(workerB.nativeSessionId).toBe(turn1NativeSessionId);
+      expect(workerB.state).toBe("IDLE");
+      // Turn 2 ledger = [turn1User, turn1Assistant, turn2User] + committed answer
+      expect(workerB.committedMessages.length).toBe(4);
+
+      // Lazy reload: pointing at a different data root must never reuse entries
+      // written for the previous root (keeps tests overriding AGY_ACP_DATA_DIR isolated).
+      const otherDataDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "agy-magpie-park-other-"),
+      );
+      try {
+        process.env.AGY_ACP_DATA_DIR = otherDataDir;
+        (coordB as any).ensurePersistedSessionsLoaded();
+        expect(
+          (coordB as any).persistedSessionsFile,
+        ).toBe(path.join(otherDataDir, "parked-sessions.json"));
+        expect((coordB as any).persistedSessions.size).toBe(0);
+      } finally {
+        process.env.AGY_ACP_DATA_DIR = dataDir;
+        fs.rmSync(otherDataDir, { recursive: true, force: true });
+      }
+    } finally {
+      if (prevDataDir === undefined) {
+        delete process.env.AGY_ACP_DATA_DIR;
+      } else {
+        process.env.AGY_ACP_DATA_DIR = prevDataDir;
+      }
+      try {
+        schedA.closeAllSync("test_cleanup");
+      } catch {}
+      schedA.destroy();
+      if (schedB) {
+        try {
+          await schedB.closeAll("test_cleanup");
+        } catch {}
+        schedB.destroy();
+      }
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });

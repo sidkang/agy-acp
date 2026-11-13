@@ -1423,6 +1423,10 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
     const body = await payload;
     expect(body).not.toContain("message_stop");
     expect(tracker.listenerCount()).toBe(0);
+    // The abort listener released the source synchronously, but the queued
+    // `iterator.return()` can only run once the in-flight `next()` settles; on
+    // Bun 1.4.4 that lands one microtask turn after `response.text()` resolves.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(state.finalized).toBe(1);
   });
 

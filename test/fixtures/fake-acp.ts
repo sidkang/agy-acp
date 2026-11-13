@@ -121,6 +121,10 @@ rl.on("line", async (line) => {
       result: {
         protocolVersion: 1,
         agentCapabilities: {
+          loadSession: true,
+          sessionCapabilities: {
+            resume: {},
+          },
           promptCapabilities: {
             image: true,
           },
@@ -147,6 +151,33 @@ rl.on("line", async (line) => {
       id,
       result: {
         sessionId,
+        configOptions: [
+          {
+            id: "model",
+            options: [
+              { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+              { id: "gemini-4-hydrogen", label: "Gemini 4 Hydrogen" },
+            ],
+          },
+          {
+            id: "thought_level",
+            options: ["minimal", "low", "medium", "high", "max"],
+          },
+        ],
+      },
+    });
+    return;
+  }
+
+  if (method === "session/resume") {
+    mcpUrl = params?.mcpServers?.[0]?.url ?? null;
+    appendedSystemPrompt = params?._meta?.antigravity?.systemPrompt?.append ?? "";
+    currentSessionId = params?.sessionId ?? "resumed-session";
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        sessionId: currentSessionId,
         configOptions: [
           {
             id: "model",
@@ -436,10 +467,13 @@ rl.on("line", async (line) => {
     const sysProbe = promptText.includes("INSPECT_SYSTEM_APPEND")
       ? ` [sysAppendBytes=${Buffer.byteLength(appendedSystemPrompt, "utf-8")}, hasPriorTag=${appendedSystemPrompt.includes("<prior_conversation_history>")}, hasFirst=${appendedSystemPrompt.includes("SEED_HEAD_MARKER_0")}]`
       : "";
+    const resumeProbe = promptText.includes("INSPECT_RESUME")
+      ? ` [resumedSessionId=${currentSessionId}]`
+      : "";
     notify("session/update", {
       sessionUpdate: "agent_message_chunk",
       content: {
-        text: `Answer: ${promptText} [model=${currentModel}, effort=${currentThoughtLevel}]${sysProbe}`,
+        text: `Answer: ${promptText} [model=${currentModel}, effort=${currentThoughtLevel}]${sysProbe}${resumeProbe}`,
       },
     });
 

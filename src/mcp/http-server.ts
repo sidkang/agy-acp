@@ -85,6 +85,11 @@ export class LoopbackMcpServer {
     server?.stop(true)
   }
 
+  /** (Re)starts a stopped server; a no-op while one is already listening. */
+  start(): void {
+    this.ensureStarted()
+  }
+
   private ensureStarted(): void {
     if (this.server) return
     this.server = Bun.serve({
@@ -192,5 +197,8 @@ let sharedServer: LoopbackMcpServer | null = null
 
 export function getSharedMcpServer(): LoopbackMcpServer {
   if (!sharedServer) sharedServer = new LoopbackMcpServer()
+  // A previous owner may have called `stop()` on the singleton (test teardown
+  // does), which leaves it with port 0; restart it while keeping identity.
+  sharedServer.start()
   return sharedServer
 }
