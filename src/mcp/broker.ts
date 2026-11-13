@@ -253,8 +253,12 @@ export class SessionToolBroker {
     }
 
     if (this.exposedPending.size === 0 && this.queuedUnexposed.length > 0) {
-      const late = this.queuedUnexposed
-      this.queuedUnexposed = []
+      // With parallel tool use disabled the caller may only ever see one tool_use
+      // per turn, so release a single late sibling and leave the rest parked for
+      // the following round instead of exposing them together.
+      const singleAtATime = this.disablesParallelToolUse()
+      const late = singleAtATime ? [this.queuedUnexposed.shift()!] : this.queuedUnexposed
+      if (!singleAtATime) this.queuedUnexposed = []
       for (const call of late) this.exposedPending.set(call.id, call)
       return {
         allPendingResolved: false,

@@ -1389,6 +1389,107 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
     expect(tracker.listenerCount()).toBe(0);
   });
 
+  test("an awaited response cancelled before its first read releases the upstream", async () => {
+    const tracker = trackingSignal();
+    const state = { finalized: 0 };
+    let bodyCancels = 0;
+    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
+      try {
+        yield { type: "text_delta", text: "never read" };
+        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
+      } finally {
+        state.finalized += 1;
+      }
+    }
+
+    // The host records the body of an unconsumed response and cancels it when
+    // downstream disconnects, so an unread response must still release the turn
+    // (an unreleased generator holds its session lock forever).
+    const response = await encodeAnthropicSseResponse(
+      MODEL,
+      lockedTurn(),
+      tracker.signal,
+      () => {
+        bodyCancels += 1;
+      },
+    );
+    await response.body?.cancel();
+
+    for (let tick = 0; tick < 50 && state.finalized === 0; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(state.finalized).toBe(1);
+    expect(bodyCancels).toBe(1);
+    expect(tracker.listenerCount()).toBe(0);
+  });
+
+  test("an awaited response aborted before its first read releases the upstream", async () => {
+    const tracker = trackingSignal();
+    const state = { finalized: 0 };
+    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
+      try {
+        yield { type: "text_delta", text: "never read" };
+        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
+      } finally {
+        state.finalized += 1;
+      }
+    }
+
+    const response = await encodeAnthropicSseResponse(MODEL, lockedTurn(), tracker.signal);
+    expect(tracker.listenerCount()).toBe(1);
+    tracker.abort();
+
+    for (let tick = 0; tick < 50 && state.finalized === 0; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(state.finalized).toBe(1);
+    expect(tracker.listenerCount()).toBe(0);
+  });
+
+  test("a synchronously returned response cancelled before its first read releases the upstream", async () => {
+    const state = { finalized: 0 };
+    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
+      try {
+        yield { type: "text_delta", text: "never read" };
+        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
+      } finally {
+        state.finalized += 1;
+      }
+    }
+
+    // Sync style means `.then` is never called, so the placeholder body owns the
+    // turn and must release it rather than wait for a `pull()` that never comes.
+    const response = encodeAnthropicSseResponse(MODEL, lockedTurn());
+    await response.body?.cancel();
+
+    for (let tick = 0; tick < 50 && state.finalized === 0; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(state.finalized).toBe(1);
+  });
+
+  test("a sync-style response read after a delay still streams the whole turn", async () => {
+    const state = { finalized: 0 };
+    async function* lockedTurn(): AsyncGenerator<TurnStreamEvent> {
+      try {
+        yield { type: "text_delta", text: "kept" };
+        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
+      } finally {
+        state.finalized += 1;
+      }
+    }
+
+    // The awaited twin settles long before a synchronous caller gets round to
+    // reading; it must not steal the turn from the body the caller holds.
+    const response = encodeAnthropicSseResponse(MODEL, lockedTurn());
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const frames = parseSseFrames(await response.text());
+
+    expect(frames[0]?.event).toBe("message_start");
+    expect(frames[frames.length - 1]?.event).toBe("message_stop");
+    expect(state.finalized).toBe(1);
+  });
+
   test("aborting mid-stream releases the upstream exactly once", async () => {
     const tracker = trackingSignal();
     let entered = false;
@@ -1474,6 +1575,43 @@ describe("encodeAnthropicSseResponse: upstream teardown", () => {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
     expect(finalized).toBe(true);
+  });
+
+  test("aborting a synchronous unread response releases the upstream generator", async () => {
+    const tracker = trackingSignal();
+    const state = { peeked: false, finalized: 0, cancels: 0 };
+
+    async function* unreadSyncTurn(): AsyncGenerator<TurnStreamEvent> {
+      try {
+        state.peeked = true;
+        yield { type: "text_delta", text: "unread" };
+        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
+      } finally {
+        state.finalized += 1;
+      }
+    }
+
+    const _response = encodeAnthropicSseResponse(
+      MODEL,
+      unreadSyncTurn(),
+      tracker.signal,
+      () => {
+        state.cancels += 1;
+      },
+    );
+
+    for (let i = 0; i < 50 && !state.peeked; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(state.peeked).toBe(true);
+
+    tracker.abort();
+    for (let i = 0; i < 50 && state.finalized === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(state.finalized).toBe(1);
+    expect(state.cancels).toBe(1);
+    expect(tracker.listenerCount()).toBe(0);
   });
 });
 

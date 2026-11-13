@@ -1105,16 +1105,46 @@ class PeekedTurnSource {
   private closed = false;
   private drainedAfterFinish = false;
   private drainTimedOut = false;
+  private detachPreClaimAbort: (() => void) | null = null;
 
-  constructor(events: AsyncIterable<TurnStreamEvent>, signal?: AbortSignal) {
+  constructor(
+    events: AsyncIterable<TurnStreamEvent>,
+    signal?: AbortSignal,
+    onUnclaimedAbort?: () => void,
+  ) {
     this.iterator = events[Symbol.asyncIterator]();
+    if (signal) {
+      const onAbort = (): void => {
+        this.clearPreClaimAbort();
+        if (this.claimed || this.closed) return;
+        try {
+          onUnclaimedAbort?.();
+        } catch {}
+        void this.close();
+      };
+      if (signal.aborted) {
+        queueMicrotask(onAbort);
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.detachPreClaimAbort = () => {
+          signal.removeEventListener("abort", onAbort);
+        };
+      }
+    }
     this.ready = this.peek(signal);
+  }
+
+  private clearPreClaimAbort(): void {
+    const detach = this.detachPreClaimAbort;
+    this.detachPreClaimAbort = null;
+    detach?.();
   }
 
   /** Exactly one response body may drive the iterator. */
   claim(): boolean {
     if (this.claimed) return false;
     this.claimed = true;
+    this.clearPreClaimAbort();
     return true;
   }
 
@@ -1146,6 +1176,7 @@ class PeekedTurnSource {
 
   /** Releases the upstream turn exactly once. */
   async close(): Promise<void> {
+    this.clearPreClaimAbort();
     if (this.closed) return;
     this.closed = true;
     try {
@@ -1584,24 +1615,64 @@ async function pumpTurnEvents(
   }
 }
 
+interface SseTwin {
+  response: Response;
+  /** Takes the turn for this body (and wires abort) unless the twin drives it. */
+  claim(): void;
+}
+
+/**
+ * Tracks which of the two bodies produced by `encodeAnthropicSseResponse` the
+ * caller actually holds: `await`ing the call hands back the *finalized* twin,
+ * while a purely synchronous caller keeps the placeholder. Only the body the
+ * caller holds may claim (and therefore release) the upstream turn.
+ */
+interface TwinBinding {
+  /** The caller invoked `.then`, so it awaits and uses the finalized twin. */
+  awaited: boolean;
+  /** Claims the finalized twin; set once that twin exists. */
+  claimAwaited: (() => void) | null;
+}
+
 function createSseResponse(
   model: string,
   source: PeekedTurnSource,
   signal: AbortSignal | undefined,
+  mayClaim: () => boolean,
   onBodyCancel?: () => void,
-): Response {
+): SseTwin {
   const channel = createSseChannel();
   let pumping = false;
   let ownsSource = false;
+  let released = false;
 
   // Only a body that claimed the turn may release it: an unclaimed twin must
   // never cancel a source another body is driving.
   const releaseSource = (): void => {
-    if (!ownsSource) return;
+    if (!ownsSource || released) return;
+    released = true;
     try {
       onBodyCancel?.();
     } catch {}
+    // Fire and forget: `cancel()` must never hang on a stuck upstream `next()`.
     void source.close();
+  };
+
+  /** Claims the turn for this body. False when the twin already drives it. */
+  const claimSource = (): boolean => {
+    if (ownsSource) return true;
+    if (!source.claim()) return false;
+    ownsSource = true;
+    // Abort wiring happens here, after the claim: an unclaimed body therefore
+    // registers zero AbortSignal listeners and can never cancel the live one.
+    channel.bindAbort(signal, releaseSource);
+    return true;
+  };
+
+  /** Claims eagerly: a body may be cancelled or aborted before its first pull. */
+  const claim = (): void => {
+    if (!claimSource()) return;
+    if (channel.isClosed || signal?.aborted === true) releaseSource();
   };
 
   const body = new ReadableStream<Uint8Array>(
@@ -1614,15 +1685,11 @@ function createSseResponse(
         channel.wakeDrain();
         if (pumping) return;
         pumping = true;
-        if (!source.claim()) {
-          // Another body already drives this turn (the placeholder twin).
+        if (!claimSource()) {
+          // The other body already drives this turn.
           channel.finish();
           return;
         }
-        ownsSource = true;
-        // Abort wiring happens here, after the claim: an unconsumed placeholder
-        // Response therefore registers zero AbortSignal listeners.
-        channel.bindAbort(signal, releaseSource);
         if (channel.isClosed || signal?.aborted === true) {
           releaseSource();
           return;
@@ -1631,6 +1698,11 @@ function createSseResponse(
       },
       cancel() {
         channel.finish();
+        // A body cancelled before its first `pull()` never claimed the turn, so
+        // an unread response would leak the upstream generator (and the session
+        // lock it holds). Claiming here releases it; `mayClaim` keeps the twin
+        // the caller is not holding from cancelling the live one.
+        if (mayClaim()) claim();
         releaseSource();
       },
     },
@@ -1639,7 +1711,7 @@ function createSseResponse(
     { highWaterMark: 0 },
   );
 
-  return new Response(body, { status: 200, headers: { ...SSE_HEADERS } });
+  return { response: new Response(body, { status: 200, headers: { ...SSE_HEADERS } }), claim };
 }
 
 type ResponseThen = (
@@ -1654,14 +1726,24 @@ type ResponseThen = (
  * Both usage styles are supported:
  *   const res = await encodeAnthropicSseResponse(...); // exact status
  *   const res = encodeAnthropicSseResponse(...);       // 200 SSE immediately
+ *
+ * `onAwait` runs on the first `.then`, which is how the two styles are told
+ * apart (`await` calls `.then`; a synchronous caller never does).
  */
-function asAwaitableResponse(response: Response, finalized: Promise<Response>): Response {
+function asAwaitableResponse(
+  response: Response,
+  finalized: Promise<Response>,
+  onAwait: () => void,
+): Response {
   try {
     Object.defineProperty(response, "then", {
       configurable: true,
       enumerable: false,
       writable: true,
-      value: ((onFulfilled, onRejected) => finalized.then(onFulfilled, onRejected)) as ResponseThen,
+      value: ((onFulfilled, onRejected) => {
+        onAwait();
+        return finalized.then(onFulfilled, onRejected);
+      }) as ResponseThen,
     });
   } catch {
     // A non-extensible Response still streams correctly, it just cannot be awaited.
@@ -1677,10 +1759,29 @@ export function encodeAnthropicSseResponse(
 ): Response {
   let source: PeekedTurnSource;
   try {
-    source = new PeekedTurnSource(events, signal);
+    source = new PeekedTurnSource(events, signal, onBodyCancel);
   } catch (err) {
     return jsonErrorResponse(err);
   }
+
+  const binding: TwinBinding = { awaited: false, claimAwaited: null };
+  const claimAwaited = (): void => {
+    if (binding.awaited) binding.claimAwaited?.();
+  };
+  const onAwait = (): void => {
+    binding.awaited = true;
+    claimAwaited();
+  };
+
+  // The placeholder is returned synchronously, so it must not claim the turn on
+  // behalf of a caller that is only going to `await` and use the twin below.
+  const placeholder = createSseResponse(
+    model,
+    source,
+    signal,
+    () => !binding.awaited,
+    onBodyCancel,
+  );
 
   const finalized = source.ready
     .then(async (outcome) => {
@@ -1692,17 +1793,19 @@ export function encodeAnthropicSseResponse(
         await source.close();
         return jsonErrorResponse(outcome.error);
       }
-      return createSseResponse(model, source, signal, onBodyCancel);
+      const twin = createSseResponse(model, source, signal, () => true, onBodyCancel);
+      // Claim before `finalized` resolves: an awaited response that is cancelled
+      // or aborted before its first `pull()` must still release the turn.
+      binding.claimAwaited = twin.claim;
+      claimAwaited();
+      return twin.response;
     })
     .catch(async (err: unknown) => {
       await source.close();
       return jsonErrorResponse(err);
     });
 
-  return asAwaitableResponse(
-    createSseResponse(model, source, signal, onBodyCancel),
-    finalized,
-  );
+  return asAwaitableResponse(placeholder.response, finalized, onAwait);
 }
 
 // ---------------------------------------------------------------------------

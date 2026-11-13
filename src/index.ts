@@ -37,6 +37,36 @@ export interface MagpiePluginInput {
   [key: string]: unknown;
 }
 
+/**
+ * Runs `onDone` as soon as the wrapped turn's events finish, fail or are closed.
+ *
+ * A caller signal (Magpie/OpenCode reuse one per session) outlives a single
+ * turn, so the abort listener linking it to this turn must be dropped as soon
+ * as the turn ends, including when the SSE body is cancelled early.
+ */
+async function* detachWhenDone<T>(
+  events: AsyncIterable<T>,
+  onDone: () => void,
+): AsyncGenerator<T> {
+  const iterator = events[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const result = await iterator.next();
+      if (result.done === true) return;
+      yield result.value;
+    }
+  } finally {
+    try {
+      // Forward the teardown so a coordinator generator stopped mid-turn still
+      // runs its `finally` (and releases its session lock).
+      await iterator.return?.();
+    } catch {
+      // Upstream teardown failures are not actionable for the caller.
+    }
+    onDone();
+  }
+}
+
 async function readRequestBody(
   fetchInput: RequestInfo | URL,
   init?: RequestInit,
@@ -236,6 +266,14 @@ async function AntigravityMagpiePlugin(
                   : undefined);
               const turnAbort = new AbortController();
               const onCallerAbort = () => turnAbort.abort();
+              let callerAbortDetached = false;
+              // `callerSignal` is long-lived, so this listener is detached on
+              // every completion path, not only when the turn is aborted.
+              const detachCallerAbort = (): void => {
+                if (callerAbortDetached) return;
+                callerAbortDetached = true;
+                callerSignal?.removeEventListener("abort", onCallerAbort);
+              };
               if (callerSignal) {
                 if (callerSignal.aborted) {
                   turnAbort.abort();
@@ -246,6 +284,9 @@ async function AntigravityMagpiePlugin(
                 }
               }
               const signal = turnAbort.signal;
+              // A returned SSE body keeps the listener until it stops streaming;
+              // JSON responses and pre-return throws drop it in `finally`.
+              let handedOffToStream = false;
 
               try {
                 const req = parseAnthropicRequest(
@@ -268,21 +309,26 @@ async function AntigravityMagpiePlugin(
                   );
                 }
 
-                const events = getCoordinator().executeTurn(
-                  account,
-                  req,
-                  modelSelection,
-                  { providerOptions },
-                  signal,
+                const events = detachWhenDone(
+                  getCoordinator().executeTurn(
+                    account,
+                    req,
+                    modelSelection,
+                    { providerOptions },
+                    signal,
+                  ),
+                  detachCallerAbort,
                 );
 
                 if (req.stream) {
-                  return await encodeAnthropicSseResponse(
+                  const response = await encodeAnthropicSseResponse(
                     req.model,
                     events,
                     signal,
                     () => turnAbort.abort(),
                   );
+                  handedOffToStream = true;
+                  return response;
                 }
                 return await collectAnthropicJsonResponse(
                   req.model,
@@ -290,8 +336,10 @@ async function AntigravityMagpiePlugin(
                   signal,
                 );
               } finally {
-                if (callerSignal && turnAbort.signal.aborted) {
-                  callerSignal.removeEventListener("abort", onCallerAbort);
+                // The response body detaches on its own once it stops streaming;
+                // detaching here would orphan a live stream from the caller signal.
+                if (!handedOffToStream || turnAbort.signal.aborted) {
+                  detachCallerAbort();
                 }
               }
             } catch (err) {

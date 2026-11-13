@@ -40,6 +40,7 @@ export interface TurnExecutionOptions {
   ) => ChildProcessWithoutNullStreams;
   providerOptions?: ProviderOptionsState;
   steerCancelTimeoutMs?: number;
+  steerToolCommitTimeoutMs?: number;
 }
 
 export interface SessionCoordinatorOptions {
@@ -52,6 +53,7 @@ export interface SessionCoordinatorOptions {
   ) => ChildProcessWithoutNullStreams;
   providerOptions?: ProviderOptionsState;
   steerCancelTimeoutMs?: number;
+  steerToolCommitTimeoutMs?: number;
 }
 
 function stableJson(val: any): string {
@@ -173,6 +175,18 @@ function requestHasImages(messages: NormalizedMessage[]): boolean {
   return false;
 }
 
+/**
+ * Normalizes a caller workspace for comparison. `worker.workDir` feeds both
+ * `--add-dir` and the workDir disambiguation note at startup, so two requests
+ * with different workDir must never share a native session.
+ */
+function normalizeWorkDir(dir?: string): string | undefined {
+  if (typeof dir !== "string") return undefined;
+  if (/[\r\n\0]/.test(dir)) return undefined;
+  const trimmed = dir.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function isToolSetCompatible(
   registered: Array<{
     name: string;
@@ -186,12 +200,14 @@ function isToolSetCompatible(
   }>,
 ): boolean {
   if (registered.length !== incoming.length) return false;
-  const regMap = new Map(
-    registered.map((t) => [t.name, stableJson(t.inputSchema)]),
-  );
+  const regMap = new Map(registered.map((t) => [t.name, t]));
   for (const t of incoming) {
     const existing = regMap.get(t.name);
-    if (!existing || existing !== stableJson(t.inputSchema)) {
+    if (!existing) return false;
+    // `agy` caches tool definitions inside the native session, so a changed
+    // description needs a fresh `tools/list` just like a changed schema.
+    if ((existing.description ?? "") !== (t.description ?? "")) return false;
+    if (stableJson(existing.inputSchema) !== stableJson(t.inputSchema)) {
       return false;
     }
   }
@@ -847,8 +863,37 @@ interface PersistedParkedSession {
   messageDigests: PersistedParkedMessageDigest[];
 }
 
+/**
+ * Exactly one resume ledger may be bound to a freshly started worker. A
+ * `parked` (in-memory) entry that fails any compatibility check must never
+ * donate its ledger or system-history seed to a worker resumed from the
+ * on-disk digest index.
+ */
+type SelectedResumeSource =
+  | { kind: "memory"; entry: ParkedSession }
+  | { kind: "persisted"; entry: PersistedParkedSession }
+  | null;
+
 function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/**
+ * Digest of a single tool definition. The description is part of the digest so
+ * a description-only change also invalidates persisted reuse (the native
+ * session keeps the tool definitions it fetched at `session/new`).
+ */
+function toolDigestFor(tool: {
+  name: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+}): string {
+  return sha256Hex(
+    stableJson({
+      description: tool.description ?? "",
+      inputSchema: tool.inputSchema,
+    }),
+  );
 }
 
 function digestToolsForPersistence(
@@ -860,7 +905,7 @@ function digestToolsForPersistence(
 ): Array<{ name: string; schemaDigest: string }> {
   return tools.map((t) => ({
     name: t.name,
-    schemaDigest: sha256Hex(stableJson(t.inputSchema)),
+    schemaDigest: toolDigestFor(t),
   }));
 }
 
@@ -876,7 +921,7 @@ function toolsMatchPersistedDigests(
   const byName = new Map(digests.map((d) => [d.name, d.schemaDigest]));
   for (const t of tools) {
     const existing = byName.get(t.name);
-    if (!existing || existing !== sha256Hex(stableJson(t.inputSchema))) {
+    if (!existing || existing !== toolDigestFor(t)) {
       return false;
     }
   }
@@ -1240,6 +1285,9 @@ export class SessionCoordinator {
     if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) return null;
     if (entry.accountRef !== account.accountRef) return null;
     if (entry.minimalAgent !== requestedMinimalAgent) return null;
+    if (normalizeWorkDir(entry.workDir) !== normalizeWorkDir(req.workDir)) {
+      return null;
+    }
     if (entry.systemPromptDigest !== sha256Hex(stripVolatileSystem(req.system))) {
       return null;
     }
@@ -1258,6 +1306,19 @@ export class SessionCoordinator {
         this.activeWorkers.delete(key);
       }
     }
+  }
+
+  /**
+   * Drops a worker from every registry and closes it. Used whenever a turn ended
+   * in a state that cannot be trusted for reuse (error, abandoned mid-turn).
+   */
+  private async retireWorker(
+    worker: AgySessionWorker,
+    reason: string,
+  ): Promise<void> {
+    this.removeActiveWorker(worker);
+    this.scheduler.unregisterWorker(worker);
+    await worker.close(reason);
   }
 
   pruneParkedSessions(now = Date.now()): void {
@@ -1561,6 +1622,26 @@ export class SessionCoordinator {
 
     // Case 3: Session in AWAITING_TOOL_RESULTS
     if (existingWorker && existingWorker.state === "AWAITING_TOOL_RESULTS") {
+      if (
+        normalizeWorkDir(existingWorker.workDir) !==
+        normalizeWorkDir(req.workDir)
+      ) {
+        // The native session is bound to the workDir it started with (`--add-dir`
+        // plus the workDir disambiguation note), so a workspace switch has to
+        // cold-replay under the new workDir instead of continuing this one.
+        this.removeActiveWorker(existingWorker);
+        this.scheduler.unregisterWorker(existingWorker);
+        await existingWorker.close("workdir_changed");
+        yield* this.executeFreshSessionTurn(
+          account,
+          req,
+          modelSelection,
+          options,
+          sessionKey,
+          signal,
+        );
+        return;
+      }
       yield* this.executeAwaitingToolsTurn(
         existingWorker,
         req,
@@ -1572,12 +1653,13 @@ export class SessionCoordinator {
       return;
     }
 
-    // Case 2: Warm IDLE session with matching prefix, system prompt, and compatible tool set
+    // Case 2: Warm IDLE session with matching prefix, system prompt, work dir, and compatible tool set
     if (
       existingWorker &&
       existingWorker.state === "IDLE" &&
       stripVolatileSystem(existingWorker.systemPrompt) ===
         stripVolatileSystem(req.system) &&
+      normalizeWorkDir(existingWorker.workDir) === normalizeWorkDir(req.workDir) &&
       isToolSetCompatible(existingWorker.registeredTools, req.tools) &&
       isPrefixMatch(existingWorker.committedMessages, req.messages)
     ) {
@@ -1591,7 +1673,7 @@ export class SessionCoordinator {
       return;
     }
 
-    // Case 4: Warm IDLE session where history diverged/compacted or tools changed
+    // Case 4: Warm IDLE session where history diverged/compacted, tools changed, or workDir changed
     if (existingWorker && existingWorker.state === "IDLE") {
       this.removeActiveWorker(existingWorker);
       this.scheduler.unregisterWorker(existingWorker);
@@ -1636,6 +1718,9 @@ export class SessionCoordinator {
         continue;
       }
       if (candidate.minimalAgent !== requestedMinimalAgent) continue;
+      if (normalizeWorkDir(candidate.workDir) !== normalizeWorkDir(req.workDir)) {
+        continue;
+      }
 
       const pendingIds = candidate.broker.getExposedPendingIds();
       if (!pendingIds.some((id) => incomingToolUseIds.has(id))) continue;
@@ -1675,6 +1760,28 @@ export class SessionCoordinator {
     return undefined;
   }
 
+  /**
+   * Whether an interrupted turn must take its worker out of service.
+   *
+   * Finishing cleanly never retires. A deliberate client abort while the agent
+   * is still generating is left to the worker's own `handleClientAbort`, which
+   * either settles the prompt back to `IDLE` or closes an unsettled worker —
+   * retiring here would defeat that recovery. Everything else is uncommitted
+   * state: an `error` frame, an abandoned consumer that unwound mid-generation,
+   * or a `tool_use` the caller never received (so no ledger and no tool ids).
+   */
+  private shouldRetireUnfinishedTurn(
+    worker: AgySessionWorker,
+    turnFinishedCleanly: boolean,
+    signal?: AbortSignal,
+  ): "turn_error" | "turn_aborted" | null {
+    if (turnFinishedCleanly || worker.state === "CLOSED") return null;
+    if (worker.state === "AWAITING_TOOL_RESULTS") return "turn_aborted";
+    if (worker.state !== "GENERATING") return null;
+    if (signal?.aborted === true) return null;
+    return "turn_aborted";
+  }
+
   private async *executeFreshSessionTurn(
     account: AccountDescriptor,
     req: NormalizedAnthropicRequest,
@@ -1692,26 +1799,31 @@ export class SessionCoordinator {
     );
     const now = Date.now();
     this.pruneParkedSessions(now);
+    let resumeSource: SelectedResumeSource = null;
     const parked = this.parkedSessions.get(sessionKey);
-    let resumeSessionId: string | undefined = undefined;
-    if (
-      parked &&
-      now - parked.parkedAt < PARKED_SESSION_TTL_MS &&
-      parked.minimalAgent === requestedMinimalAgent &&
-      stripVolatileSystem(parked.systemPrompt) ===
-        stripVolatileSystem(req.system) &&
-      isToolSetCompatible(parked.registeredTools, req.tools) &&
-      isPrefixMatch(parked.committedMessages, req.messages)
-    ) {
-      resumeSessionId = parked.nativeSessionId;
+    if (parked) {
+      const parkedCompatible =
+        now - parked.parkedAt < PARKED_SESSION_TTL_MS &&
+        parked.minimalAgent === requestedMinimalAgent &&
+        normalizeWorkDir(parked.workDir) === normalizeWorkDir(req.workDir) &&
+        stripVolatileSystem(parked.systemPrompt) ===
+          stripVolatileSystem(req.system) &&
+        isToolSetCompatible(parked.registeredTools, req.tools) &&
+        isPrefixMatch(parked.committedMessages, req.messages);
+      if (parkedCompatible) {
+        resumeSource = { kind: "memory", entry: parked };
+      } else {
+        // Stale/incompatible shelf entry: it must never donate its ledger or
+        // system-history seed to a session resumed from the on-disk index.
+        this.parkedSessions.delete(sessionKey);
+      }
     }
 
     const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
     // Cross-restart resume: fall back to the digest-only on-disk index when the
     // in-memory shelf is empty (fresh plugin host / SIGKILLed host / update).
-    let persisted: PersistedParkedSession | null = null;
-    if (!resumeSessionId) {
-      persisted = this.resolvePersistedResume(
+    if (!resumeSource) {
+      const persisted = this.resolvePersistedResume(
         account,
         req,
         sessionKey,
@@ -1719,8 +1831,14 @@ export class SessionCoordinator {
         now,
         spawnFn,
       );
-      if (persisted) resumeSessionId = persisted.nativeSessionId;
+      if (persisted) resumeSource = { kind: "persisted", entry: persisted };
     }
+
+    const resumeSessionId = resumeSource?.entry.nativeSessionId;
+    const resumeSystemHistorySeed =
+      resumeSource?.kind === "memory"
+        ? resumeSource.entry.systemHistorySeed
+        : undefined;
 
     const { priorMessages, currentMessages } = splitPriorAndCurrent(
       req.messages,
@@ -1743,9 +1861,7 @@ export class SessionCoordinator {
         true,
       workDir: req.workDir,
       resumeSessionId,
-      resumeSystemHistorySeed: resumeSessionId
-        ? parked?.systemHistorySeed
-        : undefined,
+      resumeSystemHistorySeed,
       systemPrompt: req.system,
       systemHistorySeed: coldPlan.systemHistorySeed,
       tools: req.tools,
@@ -1753,6 +1869,9 @@ export class SessionCoordinator {
       steerCancelTimeoutMs:
         options?.steerCancelTimeoutMs ??
         this.options?.steerCancelTimeoutMs,
+      steerToolCommitTimeoutMs:
+        options?.steerToolCommitTimeoutMs ??
+        this.options?.steerToolCommitTimeoutMs,
       onStateChange: (_worker, _oldState, newState) => {
         if (newState === "CLOSED") {
           this.removeActiveWorker(_worker);
@@ -1768,6 +1887,14 @@ export class SessionCoordinator {
       workerOptions,
     );
     worker.pinned = true;
+    // Turn-outcome flags are declared outside the `try` so the `finally` can
+    // retire a worker whose turn ended without a clean `finish` (an error frame,
+    // or a consumer that unwound the generator mid-turn, e.g. the SSE/JSON
+    // encoders calling `iterator.return()` on `{ type: "error" }`).
+    let started = false;
+    let handedOff = false;
+    let sawError = false;
+    let turnFinishedCleanly = false;
 
     try {
       try {
@@ -1780,6 +1907,7 @@ export class SessionCoordinator {
 
       try {
         await worker.start(signal);
+        started = true;
       } catch (err) {
         this.removeActiveWorker(worker);
         this.scheduler.unregisterWorker(worker);
@@ -1787,9 +1915,12 @@ export class SessionCoordinator {
         throw err;
       }
 
-      if (worker.resumedFromShelf && parked) {
-        worker.committedMessages = [...parked.committedMessages];
+      if (worker.resumedFromShelf && resumeSource?.kind === "memory") {
+        // Bind only THIS entry's ledger, never a competing persisted one.
+        worker.committedMessages = [...resumeSource.entry.committedMessages];
+        worker.registeredTools = [...resumeSource.entry.registeredTools];
         this.parkedSessions.delete(sessionKey);
+        handedOff = true;
         yield* this.executeWarmIdleTurn(
           worker,
           req,
@@ -1799,14 +1930,21 @@ export class SessionCoordinator {
         );
         return;
       }
+      if (resumeSource?.kind === "memory") {
+        // The agent refused `session/resume` (or its .db vanished): drop the
+        // shelf entry and cold-start instead of trusting a stale ledger.
+        this.parkedSessions.delete(sessionKey);
+      }
 
-      if (worker.resumedFromShelf && persisted) {
+      if (worker.resumedFromShelf && resumeSource?.kind === "persisted") {
         // Rebuild the ledger from the persisted digest length only; the digests
         // prove this prefix is byte-identical to the pre-restart conversation.
         worker.committedMessages = req.messages.slice(
           0,
-          persisted.messageDigests.length,
+          resumeSource.entry.messageDigests.length,
         );
+        worker.registeredTools = [...req.tools];
+        handedOff = true;
         yield* this.executeWarmIdleTurn(
           worker,
           req,
@@ -1817,7 +1955,7 @@ export class SessionCoordinator {
         return;
       }
 
-      if (persisted && !worker.resumedFromShelf) {
+      if (resumeSource?.kind === "persisted" && !worker.resumedFromShelf) {
         // Resume was rejected by the agent (or its .db vanished): drop the stale
         // index entry and continue with a normal cold start.
         this.persistedSessions.delete(sessionKey);
@@ -1825,7 +1963,7 @@ export class SessionCoordinator {
       }
 
       if (requestHasImages(req.messages) && !worker.imageSupported) {
-        await worker.close("image_not_supported");
+        await this.retireWorker(worker, "image_not_supported");
         throw new BridgeHttpError(
           400,
           "invalid_request_error",
@@ -1873,7 +2011,6 @@ export class SessionCoordinator {
       }> = [];
       let fullAnswerText = "";
 
-      let sawError = false;
       this.invalidatePersistedSession(sessionKey, worker.nativeSessionId);
       for await (const event of worker.startPromptTurn(promptParts, signal)) {
         if (event.type === "tool_use") {
@@ -1883,6 +2020,7 @@ export class SessionCoordinator {
         } else if (event.type === "error") {
           sawError = true;
         } else if (event.type === "finish") {
+          turnFinishedCleanly = true;
           commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
           if (generatedToolCalls.length === 0) {
             this.recordPersistedSession(worker, sessionKey);
@@ -1890,14 +2028,16 @@ export class SessionCoordinator {
         }
         yield event;
       }
-
-      if (sawError) {
-        this.removeActiveWorker(worker);
-        this.scheduler.unregisterWorker(worker);
-        await worker.close("turn_error");
-      }
     } finally {
       worker.pinned = false;
+      if (started && !handedOff) {
+        // A fresh worker has no previously committed turns to preserve: any
+        // uncommitted exit must retire it from coordinator and scheduler alike.
+        const why = sawError
+          ? "turn_error"
+          : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
+        if (why) await this.retireWorker(worker, why);
+      }
     }
   }
 
@@ -1909,6 +2049,9 @@ export class SessionCoordinator {
     signal?: AbortSignal,
   ): AsyncGenerator<TurnStreamEvent> {
     worker.pinned = true;
+    let promptStarted = false;
+    let sawError = false;
+    let turnFinishedCleanly = false;
     try {
       if (requestHasImages(req.messages) && !worker.imageSupported) {
         throw new BridgeHttpError(
@@ -1944,8 +2087,8 @@ export class SessionCoordinator {
       }> = [];
       let fullAnswerText = "";
 
-      let sawError = false;
       this.invalidatePersistedSession(sessionKey, worker.nativeSessionId);
+      promptStarted = true;
       for await (const event of worker.startPromptTurn(promptParts, signal)) {
         if (event.type === "tool_use") {
           generatedToolCalls.push(event);
@@ -1954,6 +2097,7 @@ export class SessionCoordinator {
         } else if (event.type === "error") {
           sawError = true;
         } else if (event.type === "finish") {
+          turnFinishedCleanly = true;
           commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
           if (generatedToolCalls.length === 0) {
             this.recordPersistedSession(worker, sessionKey);
@@ -1961,16 +2105,14 @@ export class SessionCoordinator {
         }
         yield event;
       }
-
-      if (sawError) {
-        for (const [k, w] of this.activeWorkers) {
-          if (w === worker) this.activeWorkers.delete(k);
-        }
-        this.scheduler.unregisterWorker(worker);
-        await worker.close("turn_error");
-      }
     } finally {
       worker.pinned = false;
+      if (promptStarted) {
+        const why = sawError
+          ? "turn_error"
+          : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
+        if (why) await this.retireWorker(worker, why);
+      }
     }
   }
 
@@ -1986,6 +2128,13 @@ export class SessionCoordinator {
     if (options?.steerCancelTimeoutMs !== undefined) {
       worker.steerCancelTimeoutMs = options.steerCancelTimeoutMs;
     }
+    if (options?.steerToolCommitTimeoutMs !== undefined) {
+      worker.steerToolCommitTimeoutMs = options.steerToolCommitTimeoutMs;
+    }
+    let handedOff = false;
+    let sawError = false;
+    let turnFinishedCleanly = false;
+    let continuationStarted = false;
     try {
       // Verify prefix matches committed ledger
       const prefixLen = worker.committedMessages.length;
@@ -1997,6 +2146,7 @@ export class SessionCoordinator {
           this.removeActiveWorker(worker);
           this.scheduler.unregisterWorker(worker);
           await worker.close("compacted_during_tool_turn");
+          handedOff = true;
           yield* this.executeFreshSessionTurn(
             worker.account,
             req,
@@ -2121,9 +2271,9 @@ export class SessionCoordinator {
       let fullAnswerText = "";
 
       let yieldedAny = false;
-      let sawError = false;
       this.invalidatePersistedSession(sessionKey, worker.nativeSessionId);
       try {
+        continuationStarted = true;
         for await (const event of worker.continueWithToolResults(
           toolResults,
           steeringParts,
@@ -2138,6 +2288,7 @@ export class SessionCoordinator {
           } else if (event.type === "error") {
             sawError = true;
           } else if (event.type === "finish") {
+            turnFinishedCleanly = true;
             commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
             if (generatedToolCalls.length === 0) {
               this.recordPersistedSession(worker, sessionKey);
@@ -2150,6 +2301,7 @@ export class SessionCoordinator {
           this.removeActiveWorker(worker);
           this.scheduler.unregisterWorker(worker);
           await worker.close("steer_replay_needed");
+          handedOff = true;
           yield* this.executeFreshSessionTurn(
             worker.account,
             req,
@@ -2162,14 +2314,14 @@ export class SessionCoordinator {
         }
         throw err;
       }
-
-      if (sawError) {
-        this.removeActiveWorker(worker);
-        this.scheduler.unregisterWorker(worker);
-        await worker.close("turn_error");
-      }
     } finally {
       worker.pinned = false;
+      if (!handedOff && continuationStarted) {
+        const why = sawError
+          ? "turn_error"
+          : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
+        if (why) await this.retireWorker(worker, why);
+      }
     }
   }
 

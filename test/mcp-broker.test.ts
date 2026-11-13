@@ -850,4 +850,54 @@ describe("tool_choice tool and disable_parallel_tool_use", () => {
     expect((await readBody(await first)).result).toEqual({ content: [{ type: "text", text: "one done" }] })
     expect((await readBody(await second)).result).toEqual({ content: [{ type: "text", text: "two done" }] })
   })
+
+  test("disable_parallel_tool_use releases late siblings one call per round", async () => {
+    const bridge = startBridge({ batchWindowMs: 5_000 })
+    bridge.broker.setTools([{ name: "echo_tool", inputSchema: echoToolSchema }])
+    bridge.broker.setToolChoice({ type: "auto", disableParallelToolUse: true })
+    bridge.broker.openTurnWindow()
+
+    // Call 1 flushes alone; calls 2 and 3 arrive after the HTTP turn closed.
+    const first = callTool(bridge.url, "echo_tool", { text: "one" }, 1)
+    const firstBatch = await waitFor(() => bridge.batches[0])
+    expect(firstBatch).toHaveLength(1)
+
+    const second = callTool(bridge.url, "echo_tool", { text: "two" }, 2)
+    const third = callTool(bridge.url, "echo_tool", { text: "three" }, 3)
+    await sleep(60)
+    expect(bridge.batches).toHaveLength(1)
+    expect(bridge.broker.hasPendingWork()).toBe(true)
+
+    // Round 2: exactly one late sibling is exposed, never both at once.
+    const afterFirst = bridge.broker.deliverToolResults([
+      { toolUseId: firstBatch[0]!.id, isError: false, content: [{ type: "text", text: "one done" }] },
+    ])
+    expect(afterFirst.allPendingResolved).toBe(false)
+    expect(afterFirst.newlyExposedCalls).toHaveLength(1)
+    const secondCall = afterFirst.newlyExposedCalls[0]!
+    expect(secondCall.input).toEqual({ text: "two" })
+    expect(afterFirst.remainingExposedIds).toEqual([secondCall.id])
+
+    // Round 3: the last sibling stays queued until round 2's result arrives.
+    const afterSecond = bridge.broker.deliverToolResults([
+      { toolUseId: secondCall.id, isError: false, content: [{ type: "text", text: "two done" }] },
+    ])
+    expect(afterSecond.allPendingResolved).toBe(false)
+    expect(afterSecond.newlyExposedCalls).toHaveLength(1)
+    const thirdCall = afterSecond.newlyExposedCalls[0]!
+    expect(thirdCall.input).toEqual({ text: "three" })
+    expect(thirdCall.id).not.toBe(secondCall.id)
+    expect(afterSecond.remainingExposedIds).toEqual([thirdCall.id])
+    expect(bridge.batches).toHaveLength(1)
+
+    const afterThird = bridge.broker.deliverToolResults([
+      { toolUseId: thirdCall.id, isError: false, content: [{ type: "text", text: "three done" }] },
+    ])
+    expect(afterThird).toEqual({ allPendingResolved: true, remainingExposedIds: [], newlyExposedCalls: [] })
+    expect(bridge.broker.hasPendingWork()).toBe(false)
+
+    expect((await readBody(await first)).result).toEqual({ content: [{ type: "text", text: "one done" }] })
+    expect((await readBody(await second)).result).toEqual({ content: [{ type: "text", text: "two done" }] })
+    expect((await readBody(await third)).result).toEqual({ content: [{ type: "text", text: "three done" }] })
+  })
 })

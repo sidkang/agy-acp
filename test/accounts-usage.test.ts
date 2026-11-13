@@ -1069,6 +1069,232 @@ exit 1
       else delete process.env.AGY_PATH;
     }
   });
+
+  test("a failed file-lock acquisition does not wedge the in-memory provisioning lock", async () => {
+    const { accountRefFromEmail } = await import("../src/accounts/auth");
+    const email = "lock_release_d1@example.com";
+    const accountRef = accountRefFromEmail(email);
+
+    const lockFetch = (async (input: any, init?: any) => {
+      const url = typeof input === "string" ? input : input.url;
+      if (url.includes("oauth2.googleapis.com/token")) {
+        return new Response(
+          JSON.stringify({ access_token: "ya29.lock_release", expires_in: 3600 }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("googleapis.com/oauth2/v2/userinfo")) {
+        return new Response(JSON.stringify({ email }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const accountsDir = path.join(TEST_DIR, "accounts");
+    fs.mkdirSync(accountsDir, { recursive: true });
+    const lockPath = path.join(accountsDir, `${accountRef}.lock`);
+    // A lock owned by THIS live pid is never swept, so acquisition must time out.
+    fs.writeFileSync(lockPath, `${process.pid}:test-held-lock\n`, { mode: 0o600 });
+
+    const deps = {
+      fetchFn: lockFetch,
+      verifyAccountFn: async () => ({ ok: true }),
+      accountFileLockTimeoutMs: 150,
+    };
+
+    let lockError = "";
+    try {
+      await importAccountFiles(
+        [JSON.stringify({ refresh_token: "1//04lock_release_d1" })],
+        undefined,
+        deps
+      );
+    } catch (err: any) {
+      lockError = err?.message ?? String(err);
+    }
+    expect(lockError).toContain("Timed out waiting for concurrent sign-in lock");
+
+    // The stale lock is gone: the same account must provision instead of hanging
+    // forever behind the leaked in-memory lock.
+    fs.rmSync(lockPath, { force: true });
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const deadlocked = new Promise<never>((_resolve, reject) => {
+      watchdog = setTimeout(
+        () => reject(new Error("provisioning deadlocked on accountProvisionLocks")),
+        5_000
+      );
+    });
+    let retried: Awaited<ReturnType<typeof importAccountFiles>>;
+    try {
+      retried = await Promise.race([
+        importAccountFiles(
+          [JSON.stringify({ refresh_token: "1//04lock_release_d1" })],
+          undefined,
+          deps
+        ),
+        deadlocked,
+      ]);
+    } finally {
+      if (watchdog) clearTimeout(watchdog);
+    }
+    expect(retried[0]?.type).toBe("success");
+    expect((retried[0] as any)?.metadata?.accountRef).toBe(accountRef);
+    expect(fs.existsSync(path.join(accountsDir, accountRef, ".commit-stamp"))).toBe(true);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  test("aborting the terminal code flow after the URL is returned kills agy and rolls back the temp account", async () => {
+    const pidFile = path.join(TEST_DIR, "mock-agy-terminal-pid.txt");
+    fs.rmSync(pidFile, { force: true });
+    const mockAgyPath = path.join(TEST_DIR, "mock-agy-terminal-abandon.sh");
+    fs.writeFileSync(
+      mockAgyPath,
+      `#!/bin/sh
+if [ "$1" = "acp" ]; then
+  echo "https://accounts.google.com/o/oauth2/auth?client_id=123&response_type=code"
+  echo $$ > "${pidFile}"
+  read line
+  exit 0
+fi
+if [ "$1" = "models" ]; then
+  echo "gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)"
+  exit 0
+fi
+exit 1
+`,
+      { mode: 0o755 }
+    );
+
+    const prevAgy = process.env.AGY_PATH;
+    process.env.AGY_PATH = mockAgyPath;
+
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const waitFor = async (probe: () => boolean, timeoutMs = 3_000): Promise<boolean> => {
+      const startedAt = Date.now();
+      for (;;) {
+        if (probe()) return true;
+        if (Date.now() - startedAt > timeoutMs) return false;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+
+    const accountsDir = path.join(TEST_DIR, "accounts");
+    fs.mkdirSync(accountsDir, { recursive: true });
+    const dirsBefore = new Set(fs.readdirSync(accountsDir));
+    const controller = new AbortController();
+    let childPid = 0;
+
+    try {
+      const oauthMethod = createAuthMethods()[3]!;
+      const flow = (await (oauthMethod as any).authorize(undefined, {
+        signal: controller.signal,
+      })) as any;
+      expect(flow.method).toBe("code");
+      expect(flow.url).toContain("https://accounts.google.com/o/oauth2/auth");
+
+      const createdDirs = fs
+        .readdirSync(accountsDir)
+        .filter((name) => !dirsBefore.has(name));
+      expect(createdDirs).toHaveLength(1);
+      const tempDir = path.join(accountsDir, createdDirs[0]!);
+      expect(fs.existsSync(tempDir)).toBe(true);
+
+      expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+      childPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      expect(childPid).toBeGreaterThan(1);
+      expect(isAlive(childPid)).toBe(true);
+
+      // Abandon the sign-in: the URL was handed to the user, `callback` never runs.
+      controller.abort();
+
+      expect(await waitFor(() => !isAlive(childPid))).toBe(true);
+      expect(await waitFor(() => !fs.existsSync(tempDir))).toBe(true);
+    } finally {
+      if (childPid > 1 && isAlive(childPid)) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {}
+      }
+      if (prevAgy) process.env.AGY_PATH = prevAgy;
+      else delete process.env.AGY_PATH;
+    }
+  });
+
+  test("the terminal code flow timeout also reaps an abandoned agy login", async () => {
+    const pidFile = path.join(TEST_DIR, "mock-agy-terminal-timeout-pid.txt");
+    fs.rmSync(pidFile, { force: true });
+    const mockAgyPath = path.join(TEST_DIR, "mock-agy-terminal-timeout.sh");
+    fs.writeFileSync(
+      mockAgyPath,
+      `#!/bin/sh
+if [ "$1" = "acp" ]; then
+  echo "https://accounts.google.com/o/oauth2/auth?client_id=123&response_type=code"
+  echo $$ > "${pidFile}"
+  read line
+  exit 0
+fi
+exit 1
+`,
+      { mode: 0o755 }
+    );
+
+    const prevAgy = process.env.AGY_PATH;
+    process.env.AGY_PATH = mockAgyPath;
+
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const waitFor = async (probe: () => boolean, timeoutMs = 3_000): Promise<boolean> => {
+      const startedAt = Date.now();
+      for (;;) {
+        if (probe()) return true;
+        if (Date.now() - startedAt > timeoutMs) return false;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+
+    const accountsDir = path.join(TEST_DIR, "accounts");
+    fs.mkdirSync(accountsDir, { recursive: true });
+    const dirsBefore = new Set(fs.readdirSync(accountsDir));
+    let childPid = 0;
+
+    try {
+      const oauthMethod = createAuthMethods({ terminalFlowTimeoutMs: 800 })[3]!;
+      const flow = (await (oauthMethod as any).authorize()) as any;
+      expect(flow.method).toBe("code");
+
+      const createdDirs = fs
+        .readdirSync(accountsDir)
+        .filter((name) => !dirsBefore.has(name));
+      expect(createdDirs).toHaveLength(1);
+      const tempDir = path.join(accountsDir, createdDirs[0]!);
+      expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+      childPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      expect(isAlive(childPid)).toBe(true);
+
+      expect(await waitFor(() => !isAlive(childPid))).toBe(true);
+      expect(await waitFor(() => !fs.existsSync(tempDir))).toBe(true);
+    } finally {
+      if (childPid > 1 && isAlive(childPid)) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {}
+      }
+      if (prevAgy) process.env.AGY_PATH = prevAgy;
+      else delete process.env.AGY_PATH;
+    }
+  });
 });
 
 describe("src/usage/catalog.ts", () => {

@@ -81,6 +81,7 @@ export interface WorkerOptions {
   toolChoice?: ToolChoiceSpec;
   workspaceDir?: string;
   steerCancelTimeoutMs?: number;
+  steerToolCommitTimeoutMs?: number;
   onStateChange?: (
     worker: AgySessionWorker,
     oldState: WorkerState,
@@ -284,6 +285,7 @@ export class AgySessionWorker {
   readonly activeAcpToolCallIds = new Set<string>();
   pinned: boolean = false;
   steerCancelTimeoutMs?: number;
+  steerToolCommitTimeoutMs?: number;
 
   private promptSeq = 0;
   private activePromptSeq = 0;
@@ -321,6 +323,7 @@ export class AgySessionWorker {
     this.minimalAgent = Boolean(this.options.minimalAgent);
     this.onEvict = this.options.onEvict;
     this.steerCancelTimeoutMs = this.options.steerCancelTimeoutMs;
+    this.steerToolCommitTimeoutMs = this.options.steerToolCommitTimeoutMs;
 
     ensureWorkerExitHookRegistered();
     sweepStaleWorkspacesOnce();
@@ -1570,8 +1573,21 @@ export class AgySessionWorker {
     this.activePromptSeq = ++this.promptSeq;
 
     try {
-      await this.waitForActiveToolCallsCommit(5_000);
-    } catch {}
+      await this.waitForActiveToolCallsCommit(
+        this.steerToolCommitTimeoutMs ??
+          this.options.steerToolCommitTimeoutMs ??
+          5_000,
+      );
+    } catch (err) {
+      // The barrier already closed the worker; continuing would talk to a dead
+      // connection. Surface a replay request so the coordinator cold-replays.
+      this.suppressingSteerCancel = false;
+      throw new SteerReplayNeededError(
+        err instanceof Error
+          ? err.message
+          : "Timed out waiting for active tool calls to commit before steering",
+      );
+    }
 
     const oldPromptPromise = this.pendingPromptPromise;
     this.pendingPromptPromise = null;

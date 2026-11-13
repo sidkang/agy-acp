@@ -40,6 +40,10 @@ const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo?alt=j
 
 const BROWSER_SIGN_IN_TIMEOUT_MS = 10 * 60 * 1000;
 const LISTENER_MAX_LIFETIME_MS = BROWSER_SIGN_IN_TIMEOUT_MS + 30_000;
+// Overall budget for the terminal (`agy acp --login`) flow, from spawn to a
+// decided outcome. It is the only owner that can reap a sign-in the user
+// abandoned after being shown the authorization URL.
+const TERMINAL_SIGN_IN_FLOW_TIMEOUT_MS = 10 * 60 * 1000;
 const IMPORT_MAX_ACCOUNTS = 100;
 
 export const IMPORT_FROM_EN =
@@ -66,12 +70,15 @@ function isLockPidAlive(pid: number): boolean {
   }
 }
 
-async function acquireAccountFileLock(accountRef: string): Promise<() => void> {
+async function acquireAccountFileLock(
+  accountRef: string,
+  timeoutMs: number = ACCOUNT_FILE_LOCK_STALE_MS
+): Promise<() => void> {
   const accountsDir = path.join(getPluginDataRoot(), "accounts");
   fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
   const lockPath = path.join(accountsDir, `${accountRef}.lock`);
   const lockToken = `${process.pid}:${crypto.randomUUID()}`;
-  const deadline = Date.now() + ACCOUNT_FILE_LOCK_STALE_MS;
+  const deadline = Date.now() + timeoutMs;
 
   const publishLockAtomically = (): boolean => {
     const staging = `${lockPath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
@@ -138,7 +145,8 @@ async function acquireAccountFileLock(accountRef: string): Promise<() => void> {
 
 async function withAccountProvisionLock<T>(
   accountRef: string,
-  fn: () => Promise<T>
+  fn: () => Promise<T>,
+  options?: { fileLockTimeoutMs?: number }
 ): Promise<T> {
   const prev = accountProvisionLocks.get(accountRef) ?? Promise.resolve();
   let releaseMem!: () => void;
@@ -148,11 +156,17 @@ async function withAccountProvisionLock<T>(
   const chained = prev.then(() => gate);
   accountProvisionLocks.set(accountRef, chained);
   await prev;
-  const releaseFile = await acquireAccountFileLock(accountRef);
+  // Acquired inside the guarded scope: a failed/timed-out file lock must still
+  // release the in-process gate, otherwise every later provisioning of this
+  // accountRef would wait on a lock owner that never runs its `finally`.
+  let releaseFile: (() => void) | undefined;
   try {
+    releaseFile = await acquireAccountFileLock(accountRef, options?.fileLockTimeoutMs);
     return await fn();
   } finally {
-    releaseFile();
+    try {
+      releaseFile?.();
+    } catch {}
     releaseMem();
     if (accountProvisionLocks.get(accountRef) === chained) {
       accountProvisionLocks.delete(accountRef);
@@ -694,6 +708,26 @@ export interface AuthRuntimeDeps {
     signal?: AbortSignal
   ) => Promise<{ ok: boolean; error?: string }>;
   listenerMaxLifetimeMs?: number;
+  /** Test/embedding override for the per-account `.lock` acquisition deadline. */
+  accountFileLockTimeoutMs?: number;
+  /** Test/embedding override for the terminal (`agy acp --login`) flow deadline. */
+  terminalFlowTimeoutMs?: number;
+}
+
+/**
+ * Coalesces a caller's cancellation signal with a hard HTTP deadline so that
+ * passing `signal` can never strip the network timeout of an OAuth request.
+ */
+function combineWithTimeoutSignal(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number
+): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  if (!callerSignal) return timeoutSignal;
+  const anySignal = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal })
+    .any;
+  if (typeof anySignal === "function") return anySignal.call(AbortSignal, [callerSignal, timeoutSignal]);
+  return callerSignal;
 }
 
 function parseJsonSafe(text: string): any {
@@ -788,7 +822,7 @@ async function provisionIsolatedAccountFromTokens(
           client_id: GOOGLE_CLIENT_ID,
           client_secret: GOOGLE_CLIENT_SECRET,
         }).toString(),
-        signal: options?.signal ?? AbortSignal.timeout(30_000),
+        signal: combineWithTimeoutSignal(options?.signal, 30_000),
       });
       const tokenText = await tokenRes.text();
       if (!tokenRes.ok) {
@@ -834,7 +868,7 @@ async function provisionIsolatedAccountFromTokens(
   try {
     const whoRes = await doFetch(GOOGLE_USERINFO_URL, {
       headers: { Authorization: `Bearer ${accessToken}` },
-      signal: options?.signal ?? AbortSignal.timeout(20_000),
+      signal: combineWithTimeoutSignal(options?.signal, 20_000),
     });
     const whoText = await whoRes.text();
     if (!whoRes.ok) {
@@ -973,7 +1007,7 @@ async function provisionIsolatedAccountFromTokens(
         },
       };
     }
-  });
+  }, { fileLockTimeoutMs: deps?.accountFileLockTimeoutMs });
 }
 
 /**
@@ -1232,7 +1266,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
                   client_secret: GOOGLE_CLIENT_SECRET,
                   code_verifier: verifier,
                 }).toString(),
-                signal: sig ?? AbortSignal.timeout(30_000),
+                signal: combineWithTimeoutSignal(sig, 30_000),
               });
 
               const tokenText = await tokenRes.text();
@@ -1411,6 +1445,11 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
         options?: { signal?: AbortSignal }
       ): Promise<OAuthCodeFlowResult | AuthMethodFailed> => {
         const accountRef = crypto.randomUUID();
+        // Recorded before `resolveIsolatedHomeDir` creates the directories: an
+        // abandoned sign-in may only roll back its own throwaway account.
+        const createdIsolatedDir = !fs.existsSync(
+          path.join(getPluginDataRoot(), "accounts", accountRef)
+        );
         const isolatedHomeDir = resolveIsolatedHomeDir(accountRef);
         const cleanLabel = inputs?.["label"]?.trim() || "";
         const isolatedAccount: AccountDescriptor = {
@@ -1433,58 +1472,114 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
           };
         };
 
+        const rollbackIsolatedDir = () => {
+          if (!createdIsolatedDir) return;
+          try {
+            fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
+          } catch {}
+        };
+
         let child: ReturnType<typeof spawnAgy>;
         try {
           child = spawnAgy(isolatedAccount, ["acp", "--login"]);
         } catch (err: any) {
-          try {
-            fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-          } catch {}
+          rollbackIsolatedDir();
           return makeAuthorizeFailure(
             `Failed to spawn agy acp --login: ${err?.message ?? String(err)}`
           );
         }
 
-        let out = "";
-        let settled = false;
-        let startTimer: NodeJS.Timeout | undefined;
+        const flowSignal = options?.signal;
+        if (flowSignal?.aborted) {
+          killProcessTree(child);
+          rollbackIsolatedDir();
+          return makeAuthorizeFailure("Sign-in aborted");
+        }
 
-        const cleanup = () => {
-          if (startTimer) clearTimeout(startTimer);
+        const flowTimeoutMs = deps?.terminalFlowTimeoutMs ?? TERMINAL_SIGN_IN_FLOW_TIMEOUT_MS;
+        let out = "";
+        let startupPending = true;
+        let pendingStartupReject: ((error: Error) => void) | null = null;
+        let startTimer: NodeJS.Timeout | undefined;
+        let flowTimer: NodeJS.Timeout | undefined;
+        let flowAbortHandler: (() => void) | null = null;
+        let flowDisposed = false;
+        let callbackStarted = false;
+        let flowAbandonReason: string | undefined;
+
+        const stopWatchdogs = () => {
+          if (startTimer) {
+            clearTimeout(startTimer);
+            startTimer = undefined;
+          }
+          if (flowTimer) {
+            clearTimeout(flowTimer);
+            flowTimer = undefined;
+          }
+          if (flowSignal && flowAbortHandler) {
+            flowSignal.removeEventListener("abort", flowAbortHandler);
+          }
+          flowAbortHandler = null;
         };
 
+        // Single idempotent owner of the abandoned-flow cleanup: whoever fires
+        // first -- the overall flow timeout, an abort on `authorize`'s signal, or
+        // an `agy` exit before the code was submitted -- kills the login process
+        // and rolls back the throwaway account directory exactly once.
+        const cleanupAbandonedFlow = (reason: string) => {
+          if (flowDisposed) return;
+          flowDisposed = true;
+          flowAbandonReason = reason;
+          stopWatchdogs();
+          killProcessTree(child);
+          rollbackIsolatedDir();
+          const rejectStartup = pendingStartupReject;
+          pendingStartupReject = null;
+          startupPending = false;
+          rejectStartup?.(new Error(reason));
+        };
+
+        // Successful sign-in (or an already-handled failure): stop watching and
+        // keep the freshly saved account.
+        const releaseFlowWatchdog = () => {
+          if (flowDisposed) return;
+          flowDisposed = true;
+          stopWatchdogs();
+        };
+
+        flowAbortHandler = () => cleanupAbandonedFlow("Sign-in aborted");
+        flowSignal?.addEventListener("abort", flowAbortHandler, { once: true });
+        // Killing `agy` mid-login can EPIPE the stdin pipe; that must surface as a
+        // failed sign-in, never as an unhandled stream error in the host process.
+        child.stdin.on("error", () => {});
+        flowTimer = setTimeout(
+          () => cleanupAbandonedFlow("Timed out waiting for the agy terminal sign-in to finish"),
+          flowTimeoutMs
+        );
+        (flowTimer as any).unref?.();
+
         const authUrlPromise = new Promise<{ url: string }>((resolve, reject) => {
-          startTimer = setTimeout(() => {
-            killProcessTree(child);
-            try {
-              fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-            } catch {}
-            reject(new Error("Timeout waiting for agy to output sign-in URL"));
-          }, 30_000);
-
-          const onAbort = () => {
-            killProcessTree(child);
-            try {
-              fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-            } catch {}
-            reject(new Error("Sign-in aborted"));
-          };
-
-          if (options?.signal?.aborted) {
-            onAbort();
-            return;
-          }
-          options?.signal?.addEventListener("abort", onAbort, { once: true });
+          pendingStartupReject = reject;
+          startTimer = setTimeout(
+            () => cleanupAbandonedFlow("Timeout waiting for agy to output sign-in URL"),
+            30_000
+          );
+          (startTimer as any).unref?.();
 
           const onData = (chunk: Buffer) => {
             out += chunk.toString("utf8");
             const match =
               /https:\/\/accounts\.google\.com\/o\/oauth2\/auth\S+/.exec(out) ||
               /https:\/\/accounts\.google\.com\/[^\s"'<>]+/.exec(out);
-            if (match && !settled) {
-              settled = true;
-              cleanup();
-              options?.signal?.removeEventListener("abort", onAbort);
+            if (match && startupPending) {
+              startupPending = false;
+              pendingStartupReject = null;
+              if (startTimer) {
+                clearTimeout(startTimer);
+                startTimer = undefined;
+              }
+              // The flow-level watchdog keeps running until `callback` finishes:
+              // handing out the URL does not prove the sign-in completed.
               resolve({ url: match[0] });
             }
           };
@@ -1493,31 +1588,21 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
           child.stderr.on("data", onData);
 
           child.on("error", (err) => {
-            if (!settled) {
-              settled = true;
-              cleanup();
-              killProcessTree(child);
-              try {
-                fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-              } catch {}
-              reject(err);
-            }
+            cleanupAbandonedFlow(err?.message ?? String(err));
           });
 
           child.on("exit", (code) => {
-            if (!settled) {
-              settled = true;
-              cleanup();
-              killProcessTree(child);
-              try {
-                fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-              } catch {}
-              reject(
-                new Error(
-                  `agy exited with code ${code} before printing sign-in URL. Output: ${redactSecrets(
-                    out.trim()
-                  )}`
-                )
+            if (startupPending) {
+              cleanupAbandonedFlow(
+                `agy exited with code ${code} before printing sign-in URL. Output: ${redactSecrets(
+                  out.trim()
+                )}`
+              );
+              return;
+            }
+            if (!callbackStarted) {
+              cleanupAbandonedFlow(
+                `agy exited with code ${code} before the authorization code was submitted`
               );
             }
           });
@@ -1527,27 +1612,25 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
           const { url } = await authUrlPromise;
           let used = false;
 
-          const singleUseCallback = async (
+          const runCallback = async (
             rawCode: string,
             callbackOpts?: { signal?: AbortSignal }
           ): Promise<AuthMethodSuccess | AuthMethodFailed> => {
-            if (used) {
-              throw new Error("Callback has already been invoked");
-            }
-            used = true;
-
             let code: string;
             try {
               code = extractAuthorizationCode(rawCode);
             } catch (err: any) {
               killProcessTree(child);
-              try {
-                fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-              } catch {}
+              rollbackIsolatedDir();
               return { type: "failed", error: err?.message ?? String(err) };
             }
 
             const waitExit = new Promise<number | null>((resolve, reject) => {
+              // An abandoned flow may already have killed the login process.
+              if (child.exitCode !== null || child.signalCode !== null) {
+                resolve(child.exitCode);
+                return;
+              }
               const timer = setTimeout(() => {
                 killProcessTree(child);
                 reject(new Error("Timed out waiting for agy to complete sign-in"));
@@ -1578,9 +1661,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
               await waitExit;
             } catch (err: any) {
               killProcessTree(child);
-              try {
-                fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-              } catch {}
+              rollbackIsolatedDir();
               return {
                 type: "failed",
                 error: `Login failed: ${redactSecrets(err?.message ?? String(err))}`,
@@ -1609,6 +1690,13 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
 
               const loggedInMatch = /Logged in as\s+([^\s.\r\n]+@[^\s.\r\n]+)/i.exec(out);
               const detectedEmail = loggedInMatch?.[1]?.trim();
+              // The host cancelled (or the flow timed out) while the login process
+              // was finishing: never commit a cancelled sign-in.
+              if (flowAbandonReason) {
+                killProcessTree(child);
+                rollbackIsolatedDir();
+                return { type: "failed", error: flowAbandonReason };
+              }
               if (detectedEmail) {
                 recordAccountIndexMapping(detectedEmail, accountRef);
               }
@@ -1633,13 +1721,29 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
               };
             } catch (err: any) {
               killProcessTree(child);
-              try {
-                fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-              } catch {}
+              rollbackIsolatedDir();
               return {
                 type: "failed",
                 error: `Verification failed: ${redactSecrets(err?.message ?? String(err))}`,
               };
+            }
+          };
+
+          const singleUseCallback = async (
+            rawCode: string,
+            callbackOpts?: { signal?: AbortSignal }
+          ): Promise<AuthMethodSuccess | AuthMethodFailed> => {
+            if (used) {
+              throw new Error("Callback has already been invoked");
+            }
+            used = true;
+            // The callback now owns the tail of the flow; the watchdog keeps
+            // watching the process until the outcome is decided.
+            callbackStarted = true;
+            try {
+              return await runCallback(rawCode, callbackOpts);
+            } finally {
+              releaseFlowWatchdog();
             }
           };
 
@@ -1652,10 +1756,8 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
             callback: singleUseCallback,
           };
         } catch (err: any) {
-          killProcessTree(child);
-          try {
-            fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
-          } catch {}
+          // Teardown is idempotent: the watchdog may already have cleaned up.
+          cleanupAbandonedFlow(err?.message ?? String(err));
           return makeAuthorizeFailure(err?.message ?? String(err));
         }
       },

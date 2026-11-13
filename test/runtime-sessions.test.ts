@@ -20,6 +20,10 @@ import {
   type ModelSelection,
 } from "../src/runtime/worker";
 import { SessionCoordinator } from "../src/sessions/coordinator";
+import {
+  collectAnthropicJsonResponse,
+  encodeAnthropicSseResponse,
+} from "../src/protocol/anthropic";
 import { getSharedMcpServer } from "../src/mcp/http-server";
 import { settleStepUsage } from "../src/usage/step-usage";
 
@@ -2832,6 +2836,706 @@ describe("Runtime Sessions & Coordinator Integration", () => {
         schedB.destroy();
       }
       fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("36. [HIGH-2] an error frame consumed by the JSON/SSE encoders retires the stateful worker instead of leaving a zombie", async () => {
+    const errSched = new GlobalScheduler({
+      maxGlobalWorkers: 4,
+      maxPerAccountWorkers: 2,
+      idleTimeoutMs: 60_000,
+    });
+    let spawnCount = 0;
+    const spawnCounted = (
+      account: AccountDescriptor,
+      args: string[],
+      opts?: any,
+    ) => {
+      spawnCount++;
+      return spawnFakeAcp(account, args, opts);
+    };
+    const errCoord = new SessionCoordinator({
+      scheduler: errSched,
+      mcpServer,
+      spawnFn: spawnCounted,
+    });
+
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+    const sessionId = `test-high2-error-${Date.now()}`;
+    const sessionKey = `${testAccount.slotKey}::${sessionId}`;
+    const errorReq: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Error retirement test",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "TRIGGER_ERROR_TERMINATION" }],
+        },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    try {
+      // 1. The non-streaming JSON encoder returns immediately on `{ type: "error" }`,
+      //    which unwinds the generator (`iterator.return()`) and skips any
+      //    post-loop retirement code.
+      const jsonRes = await collectAnthropicJsonResponse(
+        "gemini-3.8-flash",
+        errCoord.executeTurn(testAccount, errorReq, sel),
+      );
+      expect(jsonRes.status).toBeGreaterThanOrEqual(400);
+      expect(spawnCount).toBe(1);
+      expect(errCoord.getActiveWorker(sessionKey)).toBeUndefined();
+      expect(errSched.getActiveWorkers().length).toBe(0);
+
+      // 2. The SSE encoder treats a pre-stream error the same way (source.close()).
+      const sseRes = await encodeAnthropicSseResponse(
+        "gemini-3.8-flash",
+        errCoord.executeTurn(testAccount, errorReq, sel),
+      );
+      expect(sseRes.status).toBeGreaterThanOrEqual(400);
+      expect(spawnCount).toBe(2);
+      expect(errCoord.getActiveWorker(sessionKey)).toBeUndefined();
+      expect(errSched.getActiveWorkers().length).toBe(0);
+
+      // 3. The next turn spawns a clean worker on a brand-new native session.
+      const okReq: NormalizedAnthropicRequest = {
+        ...errorReq,
+        messages: [
+          { role: "user", content: [{ type: "text", text: "Hello after the error" }] },
+        ],
+      };
+      let answer = "";
+      for await (const ev of errCoord.executeTurn(testAccount, okReq, sel)) {
+        if (ev.type === "text_delta") answer += ev.text;
+      }
+      expect(answer).toContain("Hello after the error");
+      expect(spawnCount).toBe(3);
+
+      const freshWorker = errCoord.getActiveWorker(sessionKey);
+      expect(freshWorker).toBeDefined();
+      expect(freshWorker!.state).toBe("IDLE");
+      await freshWorker!.close("test36_done");
+    } finally {
+      await errSched.closeAll("test36_cleanup");
+      errSched.destroy();
+    }
+  });
+
+  test("37. [HIGH-3] an incompatible in-memory parked entry never donates its ledger/seed to a session resumed from the persisted index", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-magpie-high3-"));
+    const prevDataDir = process.env.AGY_ACP_DATA_DIR;
+    process.env.AGY_ACP_DATA_DIR = dataDir;
+
+    const SECRET = "nebula-42";
+    const sessionId = `test-high3-${Date.now()}`;
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    const schedA = new GlobalScheduler({
+      maxGlobalWorkers: 2,
+      maxPerAccountWorkers: 2,
+      idleTimeoutMs: 60_000,
+    });
+    let schedB: GlobalScheduler | undefined;
+
+    try {
+      const coordA = new SessionCoordinator({
+        scheduler: schedA,
+        mcpServer,
+        spawnFn: spawnFakeAcp,
+      });
+
+      const turn1User: NormalizedAnthropicRequest["messages"][number] = {
+        role: "user",
+        content: [{ type: "text", text: `Turn 1 secret ${SECRET}` }],
+      };
+      const turn1Req: NormalizedAnthropicRequest = {
+        model: "gemini-3.8-flash",
+        system: "Competing resume sources test",
+        messages: [turn1User],
+        tools: [],
+        toolChoice: { type: "auto" },
+        stream: true,
+        thinkingEnabled: false,
+        sessionId,
+      };
+      let turn1Answer = "";
+      for await (const ev of coordA.executeTurn(testAccount, turn1Req, sel)) {
+        if (ev.type === "text_delta") turn1Answer += ev.text;
+      }
+      const workerA = coordA.getActiveWorker(sessionKey)!;
+      expect(workerA).toBeDefined();
+      const nativeSessionId = workerA.nativeSessionId;
+      expect(nativeSessionId).toBeTruthy();
+
+      schedA.closeAllSync("plugin_update_exit");
+      schedA.destroy();
+
+      // New coordinator: empty in-memory shelf, same digest index on disk.
+      schedB = new GlobalScheduler({
+        maxGlobalWorkers: 2,
+        maxPerAccountWorkers: 2,
+        idleTimeoutMs: 60_000,
+      });
+      const coordB = new SessionCoordinator({
+        scheduler: schedB,
+        mcpServer,
+        spawnFn: spawnFakeAcp,
+      });
+      (coordB as any).ensurePersistedSessionsLoaded();
+      const persisted = (coordB as any).persistedSessions.get(sessionKey);
+      expect(persisted).toBeDefined();
+      // [turn 1 user, turn 1 assistant]
+      expect(persisted.messageDigests.length).toBe(2);
+
+      // Competing source: a stale in-memory shelf entry from an older, LONGER
+      // conversation under the same session key. It fails the prefix match, so
+      // it must be dropped instead of donating its ledger and system seed.
+      (coordB as any).parkedSessions.set(sessionKey, {
+        nativeSessionId: "stale-native-session-from-old-session-a",
+        committedMessages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "STALE_OLD_SESSION_PROMPT" }],
+          },
+          { role: "assistant", content: [{ type: "text", text: "stale answer" }] },
+          { role: "user", content: [{ type: "text", text: "stale third turn" }] },
+        ],
+        systemPrompt: turn1Req.system,
+        systemHistorySeed: "STALE_SEED_MARKER",
+        minimalAgent: false,
+        registeredTools: [],
+        workDir: undefined,
+        resumeSupported: true,
+        parkedAt: Date.now(),
+        estimatedBytes: 4096,
+      });
+
+      const turn2Req: NormalizedAnthropicRequest = {
+        ...turn1Req,
+        messages: [
+          turn1User,
+          { role: "assistant", content: [{ type: "text", text: turn1Answer }] },
+          {
+            role: "user",
+            content: [{ type: "text", text: "INSPECT_RESUME follow up" }],
+          },
+        ],
+      };
+      let turn2Answer = "";
+      for await (const ev of coordB.executeTurn(testAccount, turn2Req, sel)) {
+        if (ev.type === "text_delta") turn2Answer += ev.text;
+      }
+
+      // Delta-only prompt under the persisted ledger length (2) — never empty.
+      expect(turn2Answer).toContain("INSPECT_RESUME follow up");
+      expect(turn2Answer).toContain(`[resumedSessionId=${nativeSessionId}]`);
+      expect(turn2Answer).not.toContain(SECRET);
+      expect(turn2Answer).not.toContain("<conversation_history>");
+      expect(turn2Answer).not.toContain("STALE_SEED_MARKER");
+
+      const workerB = coordB.getActiveWorker(sessionKey)!;
+      expect(workerB).toBeDefined();
+      expect(workerB.resumedFromShelf).toBe(true);
+      expect(workerB.nativeSessionId).toBe(nativeSessionId);
+      expect(workerB.appliedSystemHistorySeed).toBeUndefined();
+      expect(workerB.committedMessages.length).toBe(4);
+      expect((coordB as any).parkedSessions.has(sessionKey)).toBe(false);
+    } finally {
+      if (prevDataDir === undefined) {
+        delete process.env.AGY_ACP_DATA_DIR;
+      } else {
+        process.env.AGY_ACP_DATA_DIR = prevDataDir;
+      }
+      try {
+        schedA.closeAllSync("test_cleanup");
+      } catch {}
+      schedA.destroy();
+      if (schedB) {
+        try {
+          await schedB.closeAll("test_cleanup");
+        } catch {}
+        schedB.destroy();
+      }
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("38. [MED-6] steering commit-barrier timeout raises SteerReplayNeededError and replays on a fresh session", async () => {
+    const sessionId = `test-med6-steer-commit-${Date.now()}`;
+    const sessionKey = `${testAccount.slotKey}::${sessionId}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object", properties: { city: { type: "string" } } },
+      },
+    ];
+
+    let workerCount = 0;
+    const spawnNoCommit = (
+      account: AccountDescriptor,
+      args: string[],
+      opts?: any,
+    ) => {
+      workerCount++;
+      const currentWorker = workerCount;
+      const child = spawn("bun", ["run", fakeAcpPath], {
+        cwd: opts?.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      if (currentWorker === 1) {
+        // Drop every tool_call_update: the active ACP tool call never commits.
+        const origStdout = child.stdout;
+        const intercepted = new PassThrough();
+        let remainder = "";
+        origStdout.on("data", (chunk: Buffer) => {
+          remainder += chunk.toString("utf-8");
+          const lines = remainder.split("\n");
+          remainder = lines.pop() ?? "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const msg = JSON.parse(trimmed);
+              if (
+                msg?.method === "session/update" &&
+                msg?.params?.update?.sessionUpdate === "tool_call_update"
+              ) {
+                continue;
+              }
+            } catch {}
+            intercepted.write(line + "\n");
+          }
+        });
+        (child as any).stdout = intercepted;
+      }
+      return child;
+    };
+
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Steer commit barrier test",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    const events1: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req1, sel, {
+      spawnFn: spawnNoCommit,
+    })) {
+      events1.push(ev);
+    }
+    const toolUse = events1.find((e) => e.type === "tool_use") as any;
+    expect(toolUse).toBeDefined();
+    const worker1 = coordinator.getActiveWorker(sessionKey);
+    expect(worker1?.state).toBe("AWAITING_TOOL_RESULTS");
+    expect(worker1!.activeAcpToolCallIds.size).toBe(1);
+
+    const req2: NormalizedAnthropicRequest = {
+      ...req1,
+      messages: [
+        ...req1.messages,
+        { role: "assistant", content: [toolUse] },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: toolUse.id,
+              isError: false,
+              content: [{ type: "text", text: "72F and sunny" }],
+            },
+            { type: "text", text: "Steer: ignore weather and say REPLAY_OK" },
+          ],
+        },
+      ],
+    };
+
+    let caught: any = null;
+    const events2: TurnStreamEvent[] = [];
+    try {
+      for await (const ev of coordinator.executeTurn(testAccount, req2, sel, {
+        spawnFn: spawnNoCommit,
+        steerToolCommitTimeoutMs: 30,
+      })) {
+        events2.push(ev);
+      }
+    } catch (err) {
+      caught = err;
+    }
+
+    // No closed-connection failure: the barrier failure replays on a fresh worker.
+    expect(caught).toBeNull();
+    expect(events2.some((e) => e.type === "finish")).toBe(true);
+    expect(worker1?.state).toBe("CLOSED");
+    expect(workerCount).toBe(2);
+    const worker2 = coordinator.getActiveWorker(sessionKey);
+    expect(worker2).toBeDefined();
+    expect(worker2).not.toBe(worker1);
+    await worker2?.close("test38_done");
+  });
+
+  test("39. [MED-8] switching req.workDir invalidates warm IDLE / parked / AWAITING_TOOL_RESULTS reuse", async () => {
+    const workDirA = "/Users/example/project-a";
+    const workDirB = "/Users/example/project-b";
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+    const sessionId = `test-med8-workdir-${Date.now()}`;
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
+
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Workdir reuse test",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "workdir turn 1" }] },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+      workDir: workDirA,
+    };
+    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+
+    const w1 = coordinator.getActiveWorker(sessionKey)!;
+    expect(w1).toBeDefined();
+    expect(w1.state).toBe("IDLE");
+    expect(w1.workDir).toBe(workDirA);
+    expect(w1.effectiveSystemPrompt).toContain(JSON.stringify(workDirA));
+
+    // Same workDir + continued history still reuses the warm worker.
+    const req2: NormalizedAnthropicRequest = {
+      ...req1,
+      messages: [
+        ...w1.committedMessages,
+        { role: "user", content: [{ type: "text", text: "workdir turn 2" }] },
+      ],
+    };
+    for await (const _ of coordinator.executeTurn(testAccount, req2, sel)) {}
+    expect(coordinator.getActiveWorker(sessionKey)).toBe(w1);
+    expect(w1.state).toBe("IDLE");
+
+    // Switching workDir retires the warm worker and cold-starts in the new one.
+    const req3: NormalizedAnthropicRequest = {
+      ...req2,
+      workDir: workDirB,
+      messages: [
+        ...w1.committedMessages,
+        { role: "user", content: [{ type: "text", text: "workdir turn 3" }] },
+      ],
+    };
+    let text3 = "";
+    for await (const ev of coordinator.executeTurn(testAccount, req3, sel)) {
+      if (ev.type === "text_delta") text3 += ev.text;
+    }
+    expect(text3).toContain("workdir turn 3");
+    expect(w1.state).toBe("CLOSED");
+    const w3 = coordinator.getActiveWorker(sessionKey)!;
+    expect(w3).toBeDefined();
+    expect(w3).not.toBe(w1);
+    expect(w3.workDir).toBe(workDirB);
+    expect(w3.effectiveSystemPrompt).toContain(JSON.stringify(workDirB));
+
+    // Parked/persisted reuse must require the same workDir too.
+    (coordinator as any).parkSession(w3);
+    await w3.close("test39_park");
+    expect((coordinator as any).parkedSessions.get(sessionKey)?.workDir).toBe(
+      workDirB,
+    );
+
+    const req4: NormalizedAnthropicRequest = {
+      ...req3,
+      workDir: workDirA,
+      messages: [
+        ...w3.committedMessages,
+        { role: "user", content: [{ type: "text", text: "workdir turn 4" }] },
+      ],
+    };
+    for await (const _ of coordinator.executeTurn(testAccount, req4, sel)) {}
+    const w4 = coordinator.getActiveWorker(sessionKey)!;
+    expect(w4).toBeDefined();
+    expect(w4).not.toBe(w3);
+    expect(w4.resumedFromShelf).toBe(false);
+    expect(w4.workDir).toBe(workDirA);
+    expect((coordinator as any).parkedSessions.has(sessionKey)).toBe(false);
+    await w4.close("test39_done");
+
+    // AWAITING_TOOL_RESULTS: a workspace switch must retire instead of continuing.
+    const toolSessionId = `test-med8-workdir-tool-${Date.now()}`;
+    const toolKey = `${testAccount.slotKey}::${testAccount.accountRef}::${toolSessionId}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object" },
+      },
+    ];
+    const toolReq1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Workdir tool test",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId: toolSessionId,
+      workDir: workDirA,
+    };
+    let toolUse: any = null;
+    for await (const ev of coordinator.executeTurn(testAccount, toolReq1, sel)) {
+      if (ev.type === "tool_use") toolUse = ev;
+    }
+    expect(toolUse).toBeDefined();
+    const tw1 = coordinator.getActiveWorker(toolKey)!;
+    expect(tw1.state).toBe("AWAITING_TOOL_RESULTS");
+
+    const toolReq2: NormalizedAnthropicRequest = {
+      ...toolReq1,
+      workDir: workDirB,
+      messages: [
+        ...toolReq1.messages,
+        { role: "assistant", content: [toolUse] },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: toolUse.id,
+              isError: false,
+              content: [{ type: "text", text: "72F" }],
+            },
+          ],
+        },
+      ],
+    };
+    const toolEvents2: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, toolReq2, sel)) {
+      toolEvents2.push(ev);
+    }
+    expect(toolEvents2.some((e) => e.type === "finish")).toBe(true);
+    expect(tw1.state).toBe("CLOSED");
+    const tw2 = coordinator.getActiveWorker(toolKey)!;
+    expect(tw2).toBeDefined();
+    expect(tw2).not.toBe(tw1);
+    expect(tw2.workDir).toBe(workDirB);
+    await tw2.close("test39_done");
+  });
+
+  test("40. [MED-9] a tool description change invalidates warm IDLE and parked reuse so `agy` re-fetches tools/list", async () => {
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+    const sessionId = `test-med9-tool-desc-${Date.now()}`;
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
+    const inputSchema = {
+      type: "object",
+      properties: { city: { type: "string" } },
+    };
+    const toolsV1 = [
+      { name: "get_weather", description: "Weather v1", inputSchema },
+    ];
+    const toolsV2 = [
+      { name: "get_weather", description: "Weather v2", inputSchema },
+    ];
+
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Tool description test",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "tool description turn 1" }] },
+      ],
+      tools: toolsV1,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+    const w1 = coordinator.getActiveWorker(sessionKey)!;
+    expect(w1).toBeDefined();
+    expect(w1.registeredTools[0]!.description).toBe("Weather v1");
+
+    // Description-only change on a warm IDLE session: retire + fresh tools/list.
+    const req2: NormalizedAnthropicRequest = {
+      ...req1,
+      tools: toolsV2,
+      messages: [
+        ...w1.committedMessages,
+        { role: "user", content: [{ type: "text", text: "tool description turn 2" }] },
+      ],
+    };
+    for await (const _ of coordinator.executeTurn(testAccount, req2, sel)) {}
+    expect(w1.state).toBe("CLOSED");
+    const w2 = coordinator.getActiveWorker(sessionKey)!;
+    expect(w2).toBeDefined();
+    expect(w2).not.toBe(w1);
+    expect(w2.registeredTools[0]!.description).toBe("Weather v2");
+
+    // Parked resume applies the same rule (and so does the persisted digest).
+    (coordinator as any).parkSession(w2);
+    await w2.close("test40_park");
+    expect(
+      (coordinator as any).parkedSessions.get(sessionKey)?.registeredTools[0]
+        .description,
+    ).toBe("Weather v2");
+
+    const req3: NormalizedAnthropicRequest = {
+      ...req2,
+      tools: toolsV1,
+      messages: [
+        ...w2.committedMessages,
+        { role: "user", content: [{ type: "text", text: "tool description turn 3" }] },
+      ],
+    };
+    for await (const _ of coordinator.executeTurn(testAccount, req3, sel)) {}
+    const w3 = coordinator.getActiveWorker(sessionKey)!;
+    expect(w3).toBeDefined();
+    expect(w3).not.toBe(w2);
+    expect(w3.resumedFromShelf).toBe(false);
+    expect(w3.registeredTools[0]!.description).toBe("Weather v1");
+    expect((coordinator as any).parkedSessions.has(sessionKey)).toBe(false);
+    await w3.close("test40_done");
+  });
+
+  test("41. Cancelling an unread tool_use SSE response retires the worker and cross-session adoption respects workDir", async () => {
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object", properties: { city: { type: "string" } } },
+      },
+    ];
+    // Its own scheduler: this test needs two live workers at once (a pending
+    // session plus the forking request that must NOT steal it).
+    const sched = new GlobalScheduler({
+      maxGlobalWorkers: 4,
+      maxPerAccountWorkers: 4,
+      idleTimeoutMs: 60_000,
+    });
+    const coord = new SessionCoordinator({
+      scheduler: sched,
+      mcpServer,
+      spawnFn: spawnFakeAcp,
+    });
+    const sk = (sid: string) =>
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sid}`;
+
+    try {
+      // Part A: cancelling an unread tool_use SSE response must retire the worker.
+      const sidCancel = `test-unread-tool-cancel-${Date.now()}`;
+      const reqCancel: NormalizedAnthropicRequest = {
+        model: "gemini-3.8-flash",
+        system: "Unread tool cancel test",
+        messages: [
+          { role: "user", content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }] },
+        ],
+        tools,
+        toolChoice: { type: "auto" },
+        stream: true,
+        thinkingEnabled: false,
+        sessionId: sidCancel,
+      };
+      const resCancel = await encodeAnthropicSseResponse(
+        reqCancel.model,
+        coord.executeTurn(testAccount, reqCancel, sel),
+      );
+      // The peeked `tool_use` already moved the worker to AWAITING_TOOL_RESULTS,
+      // yet the caller never saw the tool id and no ledger was committed.
+      expect(coord.getActiveWorker(sk(sidCancel))?.state).toBe(
+        "AWAITING_TOOL_RESULTS",
+      );
+      await resCancel.body!.cancel();
+      for (let i = 0; i < 50 && coord.getActiveWorker(sk(sidCancel)); i += 1) {
+        await new Promise((r) => setTimeout(r, 1));
+      }
+      expect(coord.getActiveWorker(sk(sidCancel))).toBeUndefined();
+      expect(sched.getActiveCount()).toBe(0);
+
+      // Part B: a tool_result arriving from a different session in a different
+      // workspace must not adopt (and therefore destroy) session A's worker.
+      const sidA = `test-adopt-ws-a-${Date.now()}`;
+      const sidB = `test-adopt-ws-b-${Date.now()}`;
+      const reqA: NormalizedAnthropicRequest = {
+        ...reqCancel,
+        sessionId: sidA,
+        workDir: "/Users/example/ws-a",
+      };
+      const evsA: TurnStreamEvent[] = [];
+      for await (const ev of coord.executeTurn(testAccount, reqA, sel)) {
+        evsA.push(ev);
+      }
+      const tuA = evsA.find((e) => e.type === "tool_use") as any;
+      expect(tuA).toBeDefined();
+      const workerA = coord.getActiveWorker(sk(sidA))!;
+      expect(workerA.state).toBe("AWAITING_TOOL_RESULTS");
+
+      const reqForkB: NormalizedAnthropicRequest = {
+        ...reqA,
+        sessionId: sidB,
+        workDir: "/Users/example/ws-b",
+        messages: [
+          ...reqA.messages,
+          { role: "assistant", content: [tuA] },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                toolUseId: tuA.id,
+                isError: false,
+                content: [{ type: "text", text: "Sunny" }],
+              },
+            ],
+          },
+        ],
+      };
+      for await (const _ of coord.executeTurn(testAccount, reqForkB, sel)) {}
+      // Session A's pending worker in ws-a must remain untouched and alive.
+      expect(coord.getActiveWorker(sk(sidA))).toBe(workerA);
+      expect(workerA.state).toBe("AWAITING_TOOL_RESULTS");
+      // ... and the forking request got a worker of its own in ws-b.
+      const workerB = coord.getActiveWorker(sk(sidB));
+      expect(workerB).toBeDefined();
+      expect(workerB).not.toBe(workerA);
+      expect(workerB!.workDir).toBe("/Users/example/ws-b");
+    } finally {
+      sched.closeAllSync("test41_done");
+      sched.destroy();
     }
   });
 });
