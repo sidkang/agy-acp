@@ -66,18 +66,58 @@ class StderrRingBuffer {
   }
 }
 
-export function isMagpieMcpPermissionRequest(params: unknown): boolean {
-  if (!params || typeof params !== "object") return false;
-  try {
-    const raw = JSON.stringify(params);
-    return (
-      /\bfrom MCP server ["']?magpie["']?(?:\b|$)/i.test(raw) ||
-      /\bmcp\(\s*magpie\//i.test(raw) ||
-      /\bmcp_magpie_[A-Za-z0-9_-]/i.test(raw)
-    );
-  } catch {
-    return false;
+/**
+ * Extracts the sanitized MCP tool name ONLY if `params` structurally identifies
+ * an `agy` permission prompt for our `"magpie"` MCP server.
+ *
+ * Security invariant: NEVER inspect `toolCall.rawInput`, `toolCall.content`,
+ * `toolCall.locations`, or `JSON.stringify(params)` — prompt-injected tool
+ * arguments (e.g. a shell command echoing `"from MCP server magpie"`) must
+ * never spoof this check.
+ */
+export function extractMagpieMcpToolFromPermission(
+  params: unknown,
+): string | null {
+  if (!params || typeof params !== "object") return null;
+  const p = params as Record<string, unknown>;
+  const toolCall =
+    p.toolCall && typeof p.toolCall === "object"
+      ? (p.toolCall as Record<string, unknown>)
+      : null;
+
+  if (toolCall) {
+    if (typeof toolCall.name === "string") {
+      const m = /^(?:mcp_magpie_|magpie\/)([A-Za-z0-9_.-]+)$/.exec(
+        toolCall.name.trim(),
+      );
+      if (m?.[1]) return m[1];
+    }
+    if (typeof toolCall.title === "string") {
+      const m =
+        /^Run ([A-Za-z0-9_.-]+) from MCP server ["']?magpie["']?$/.exec(
+          toolCall.title.trim(),
+        );
+      if (m?.[1]) return m[1];
+    }
   }
+
+  if (Array.isArray(p.options)) {
+    for (const opt of p.options) {
+      if (!opt || typeof opt !== "object") continue;
+      const o = opt as Record<string, unknown>;
+      for (const field of [o.name, o.label]) {
+        if (typeof field !== "string") continue;
+        const m = /'mcp\(magpie\/([A-Za-z0-9_.-]+)\)'/.exec(field);
+        if (m?.[1]) return m[1];
+      }
+    }
+  }
+
+  return null;
+}
+
+export function isMagpieMcpPermissionRequest(params: unknown): boolean {
+  return extractMagpieMcpToolFromPermission(params) !== null;
 }
 
 function selectPermissionOption(

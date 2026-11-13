@@ -176,7 +176,7 @@ async function AntigravityMagpiePlugin(
           signal: opts?.signal,
         });
         const allModelIds = Object.keys(
-          buildProviderModels(catalog, { includeRawIds: false }),
+          buildProviderModels(catalog, { includeRawIds: true }),
         );
         const res = await queryAccountUsage(account, allModelIds, {
           quotaRouting: providerOptions.quotaRouting,
