@@ -27,6 +27,27 @@ const breakUp = (line: string): string =>
   line.replace(/[A-Za-z0-9]{3,}/g, (w) => w[0]! + ZW + w[1]! + ZW + w.slice(2));
 
 /**
+ * Paragraphs that Antigravity accepts without 429 but answers poorly unless reworded
+ * with equivalent meaning (e.g. DeepSeek Harness @-path rule, #1028).
+ */
+export const REWORDED: ReadonlyArray<readonly [string, string]> = [
+  [
+    'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.',
+    'When the user writes @ followed by a path, they are pointing at that file or folder. Relative paths start at the workspace root; absolute paths are host paths. A path ending in a slash is a folder, so list it if its contents matter; otherwise it is a file, so open it with the read tool before relying on it. Paths with spaces appear as @"...".',
+  ],
+];
+
+export function rewordSystemPrompt(system: string): string {
+  let out = String(system ?? "");
+  for (const [from, to] of REWORDED) {
+    if (out.includes(from)) {
+      out = out.split(from).join(to);
+    }
+  }
+  return out;
+}
+
+/**
  * Strips Claude Code's rotating billing header line before forwarding or comparing.
  */
 export function stripBillingHeader(text: string | undefined | null): string {
@@ -102,26 +123,30 @@ export function stripVolatileMessageText(text: string | undefined | null): strin
  */
 export function cloakSystemPrompt(system: string | undefined | null, enabled = true): string {
   const cleaned = stripBillingHeader(system).trim();
-  if (!enabled || !cleaned || !turnsAway(cleaned)) return cleaned;
-  const low = asciiLower(cleaned);
-  const at: Array<[number, number]> = [];
-  for (const line of TURNED_AWAY) {
-    for (let i = 0; ; ) {
-      const j = low.indexOf(line, i);
-      if (j < 0) break;
-      at.push([j, j + line.length]);
-      i = j + line.length;
+  if (!enabled || !cleaned) return cleaned;
+  let cloaked = cleaned;
+  if (turnsAway(cloaked)) {
+    const low = asciiLower(cloaked);
+    const at: Array<[number, number]> = [];
+    for (const line of TURNED_AWAY) {
+      for (let i = 0; ; ) {
+        const j = low.indexOf(line, i);
+        if (j < 0) break;
+        at.push([j, j + line.length]);
+        i = j + line.length;
+      }
     }
+    at.sort((a, b) => a[0] - b[0]);
+    let out = "";
+    let prev = 0;
+    for (const [from, to] of at) {
+      if (from < prev) continue;
+      out += cloaked.slice(prev, from) + breakUp(cloaked.slice(from, to));
+      prev = to;
+    }
+    cloaked = out + cloaked.slice(prev);
   }
-  at.sort((a, b) => a[0] - b[0]);
-  let out = "";
-  let prev = 0;
-  for (const [from, to] of at) {
-    if (from < prev) continue;
-    out += cleaned.slice(prev, from) + breakUp(cleaned.slice(from, to));
-    prev = to;
-  }
-  return out + cleaned.slice(prev);
+  return rewordSystemPrompt(cloaked);
 }
 
 const HINT =

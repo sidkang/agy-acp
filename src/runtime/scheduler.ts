@@ -61,8 +61,11 @@ export class GlobalScheduler {
       : undefined;
 
     this.maxGlobalWorkers = options?.maxGlobalWorkers ?? envMax ?? 16;
-    this.maxPerAccountWorkers = options?.maxPerAccountWorkers ?? 8;
-    this.idleTimeoutMs = options?.idleTimeoutMs ?? 10 * 60 * 1000; // 10 minutes
+    this.maxPerAccountWorkers = options?.maxPerAccountWorkers ?? 6;
+    // Match Magpie's official Claude subscription bridge (`idleLongest = time.Hour`,
+    // `claude_subscription.go:135`): keep idle warm sessions alive across the 1-hour
+    // prompt-cache window instead of evicting after 10m and replaying history cold.
+    this.idleTimeoutMs = options?.idleTimeoutMs ?? 60 * 60 * 1000; // 1 hour
     this.awaitingToolTimeoutMs = options?.awaitingToolTimeoutMs ?? 10 * 60 * 1000; // 10 minutes
     this.reaperIntervalMs = options?.reaperIntervalMs ?? 60 * 1000; // 1 minute
     this.onBeforeEvictIdle = options?.onBeforeEvictIdle;

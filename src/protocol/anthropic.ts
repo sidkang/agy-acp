@@ -924,6 +924,41 @@ export function parseAnthropicRequest(
     throw invalidRequest("messages must contain at least one user or assistant message");
   }
 
+  // Structured output reminder (`output_config.format` / `response_format`),
+  // used by Claude Code prompt-hooks and structured-output callers.
+  const rawFormat = isPlainObject(outputConfig?.format)
+    ? outputConfig.format
+    : isPlainObject(body.response_format)
+      ? body.response_format
+      : undefined;
+  if (rawFormat) {
+    let formatReminder: string | null = null;
+    if (rawFormat.type === "json_schema") {
+      const schema = isPlainObject(rawFormat.schema)
+        ? rawFormat.schema
+        : isPlainObject((rawFormat.json_schema as any)?.schema)
+          ? (rawFormat.json_schema as any).schema
+          : undefined;
+      if (schema) {
+        formatReminder = `<system-reminder>\nStructured output requirement: Respond ONLY with a single valid JSON value (no Markdown code fences, no backticks, and no explanatory prose before or after) conforming strictly to this JSON Schema:\n${JSON.stringify(schema)}\n</system-reminder>`;
+      }
+    } else if (rawFormat.type === "json_object") {
+      formatReminder =
+        "<system-reminder>\nStructured output requirement: Respond ONLY with a single valid JSON object (no Markdown code fences, no backticks, and no explanatory prose before or after).\n</system-reminder>";
+    }
+    if (formatReminder) {
+      const lastMsg = messages[messages.length - 1]!;
+      if (lastMsg.role === "user") {
+        lastMsg.content.push({ type: "text", text: formatReminder });
+      } else {
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: formatReminder }],
+        });
+      }
+    }
+  }
+
   const sessionIdHeader = headerValue(SESSION_ID_HEADER);
   const sessionId = sessionIdHeader === null ? null : nonEmptyString(sessionIdHeader);
 

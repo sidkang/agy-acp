@@ -236,11 +236,17 @@ function sweepStaleWorkspacesOnce(): void {
   sweepStaleWorkspaces();
 }
 
+function buildWorkDirDisambiguationNote(callerWorkDir: string): string {
+  return `The caller's working directory is ${JSON.stringify(callerWorkDir)}. The environment the caller describes (working directory, platform, OS, shell, git status) is where every tool runs. The bridge's temporary workspace only holds its agent configuration; where an environment given elsewhere in this conversation differs, go by the caller's instructions without checking.`;
+}
+
 export class AgySessionWorker {
   readonly account: AccountDescriptor;
   readonly sessionId: string;
   workspaceDir: string = "";
   readonly workDir?: string;
+  readonly minimalAgent: boolean;
+  effectiveSystemPrompt: string = "";
   readonly onEvict?: () => void;
   private readonly mcpServer: LoopbackMcpServer;
   private readonly options: WorkerOptions;
@@ -307,6 +313,7 @@ export class AgySessionWorker {
     this.mcpServer = mcpServer;
     this.options = options ?? {};
     this.workDir = this.options.workDir;
+    this.minimalAgent = Boolean(this.options.minimalAgent);
     this.onEvict = this.options.onEvict;
     this.steerCancelTimeoutMs = this.options.steerCancelTimeoutMs;
 
@@ -451,7 +458,12 @@ export class AgySessionWorker {
         "--log-file",
         logFile,
       ];
-      if (this.options.workDir && fs.existsSync(this.options.workDir)) {
+      if (
+        this.options.workDir &&
+        path.isAbsolute(this.options.workDir) &&
+        !/[\r\n\0]/.test(this.options.workDir) &&
+        fs.existsSync(this.options.workDir)
+      ) {
         args.push("--add-dir", this.options.workDir);
       }
 
@@ -544,8 +556,8 @@ export class AgySessionWorker {
       // Cloak system prompt
       let effectiveSystem = "";
       let systemWithWorkDir = this.options.systemPrompt ?? "";
-      if (this.options.workDir && fs.existsSync(this.options.workDir)) {
-        const dirNote = `Working directory: ${this.options.workDir}`;
+      if (this.options.workDir && !/[\r\n\0]/.test(this.options.workDir)) {
+        const dirNote = buildWorkDirDisambiguationNote(this.options.workDir);
         systemWithWorkDir = systemWithWorkDir.trim()
           ? `${systemWithWorkDir}\n\n${dirNote}`
           : dirNote;
@@ -554,6 +566,7 @@ export class AgySessionWorker {
         systemWithWorkDir,
         this.options.cloakPrompts !== false,
       );
+      this.effectiveSystemPrompt = effectiveSystem;
 
       // 6. ACP session/resume or session/new
       let sessionRes: any = null;

@@ -409,6 +409,22 @@ export interface ExecBoundedOptions {
   extraEnv?: Record<string, string>;
 }
 
+const activeBoundedProbes = new Set<ChildProcess>();
+let boundedExitHookRegistered = false;
+
+function registerBoundedExitHookOnce(): void {
+  if (boundedExitHookRegistered) return;
+  boundedExitHookRegistered = true;
+  process.once("exit", () => {
+    for (const child of Array.from(activeBoundedProbes)) {
+      try {
+        killProcessTree(child, "SIGKILL");
+      } catch {}
+    }
+    activeBoundedProbes.clear();
+  });
+}
+
 /**
  * Executes `agy` with bounded output and timeout, killing the process tree on timeout/abort.
  * Resolves promptly without hanging on descendant open pipes.
@@ -423,9 +439,12 @@ export function execAgyBounded(
     const maxBytes = options?.maxBytes ?? 1024 * 1024;
     const signal = options?.signal;
 
+    registerBoundedExitHookOnce();
+
     let child: ChildProcessWithoutNullStreams;
     try {
       child = spawnAgy(account, args, { cwd: options?.cwd, extraEnv: options?.extraEnv });
+      activeBoundedProbes.add(child);
     } catch (err: any) {
       resolve({
         exitCode: -1,
@@ -444,6 +463,7 @@ export function execAgyBounded(
     let timer: NodeJS.Timeout | undefined;
 
     const cleanup = () => {
+      activeBoundedProbes.delete(child);
       if (timer) clearTimeout(timer);
       if (signal && onAbort) {
         signal.removeEventListener("abort", onAbort);

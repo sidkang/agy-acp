@@ -2233,4 +2233,84 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     }
     expect(alive).toBe(false);
   });
+
+  test("31. Claude bridge parity: 1h default idleTimeoutMs, minimalAgent mode-switch isolation, and workDir disambiguation note", async () => {
+    const defaultSched = new GlobalScheduler();
+    expect(defaultSched.idleTimeoutMs).toBe(60 * 60 * 1000);
+    expect(defaultSched.maxPerAccountWorkers).toBe(6);
+    defaultSched.destroy();
+
+    const sessionId = `test-minimal-switch-${Date.now()}`;
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Stay concise.",
+      messages: [{ role: "user", content: [{ type: "text", text: "turn 1" }] }],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+      workDir: "/Users/example/project",
+    };
+
+    for await (const _ of coordinator.executeTurn(
+      testAccount,
+      req1,
+      sel,
+      {
+        providerOptions: {
+          quotaRouting: false,
+          cloakPrompts: true,
+          minimalAgent: false,
+          exposeThinking: false,
+        },
+      },
+    )) {
+      // consume
+    }
+
+    const w1 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(w1).toBeDefined();
+    expect(w1?.minimalAgent).toBe(false);
+    expect(w1?.effectiveSystemPrompt).toContain("where every tool runs");
+    expect(w1?.effectiveSystemPrompt).toContain('"/Users/example/project"');
+
+    // Toggle minimalAgent: false -> true on Turn 2 — must retire w1 and start fresh w2!
+    const req2: NormalizedAnthropicRequest = {
+      ...req1,
+      messages: [
+        ...req1.messages,
+        { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        { role: "user", content: [{ type: "text", text: "turn 2" }] },
+      ],
+    };
+
+    for await (const _ of coordinator.executeTurn(
+      testAccount,
+      req2,
+      sel,
+      {
+        providerOptions: {
+          quotaRouting: false,
+          cloakPrompts: true,
+          minimalAgent: true,
+          exposeThinking: false,
+        },
+      },
+    )) {
+      // consume
+    }
+
+    const w2 = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(w1?.state).toBe("CLOSED");
+    expect(w2).toBeDefined();
+    expect(w2).not.toBe(w1);
+    expect(w2?.minimalAgent).toBe(true);
+    await w2?.close("test_done");
+  });
 });

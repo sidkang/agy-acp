@@ -2062,4 +2062,36 @@ describe("cloak.ts", () => {
     );
     expect(stripVolatileMessageText(undefined)).toBe("");
   });
+
+  test("cloakSystemPrompt rewords DeepSeek Harness @-path paragraph (#1028)", () => {
+    const dsh =
+      'Rule: Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.';
+    const rewritten = cloakSystemPrompt(dsh, true);
+    expect(rewritten).not.toContain("Tokens prefixed with @ are paths");
+    expect(rewritten).toContain("When the user writes @ followed by a path");
+  });
+
+  test("parseAnthropicRequest appends structured-output reminder for output_config.format json_schema/json_object", () => {
+    const parsed = parseAnthropicRequest(
+      JSON.stringify({
+        model: "agy-acp/gemini-3.8-flash",
+        messages: [{ role: "user", content: "Evaluate safety." }],
+        output_config: {
+          format: {
+            type: "json_schema",
+            schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+          },
+        },
+      }),
+      new Headers(),
+      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false },
+    );
+    const last = parsed.messages[parsed.messages.length - 1]!;
+    const texts = last.content
+      .filter((p) => p.type === "text")
+      .map((p: any) => p.text)
+      .join("\n");
+    expect(texts).toContain("Structured output requirement:");
+    expect(texts).toContain('"ok":{"type":"boolean"}');
+  });
 });

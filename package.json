@@ -11,6 +11,7 @@
   "files": [
     "src",
     "assets",
+    "docs",
     "opencode.mjs",
     "opencode2.mjs",
     "README.md",
@@ -46,8 +47,8 @@
     "maxConcurrency": 16,
     "options": {
       "maxGlobalWorkers": 16,
-      "maxPerAccountWorkers": 4,
-      "idleTimeoutMs": 300000
+      "maxPerAccountWorkers": 6,
+      "idleTimeoutMs": 3600000
     },
     "summary": {
       "en": "Multi-account Antigravity CLI provider over ACP (agy acp): sign in to multiple isolated Google accounts or adopt your local agy login, with native HTTP MCP tool bridging, warm session reuse, session/resume, per-step cache token accounting, and quota-aware routing. Shares each Google account's Antigravity quota pool with antigravity and agy-cli.",

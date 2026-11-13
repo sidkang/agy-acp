@@ -58,12 +58,12 @@ magpie quota agy-acp
 ```json
 {
   "maxGlobalWorkers": 16,
-  "maxPerAccountWorkers": 4,
-  "idleTimeoutMs": 300000
+  "maxPerAccountWorkers": 6,
+  "idleTimeoutMs": 3600000
 }
 ```
 
-`AGY_PATH` overrides the `agy` binary location; `AGY_ACP_DATA_DIR` overrides the isolated account storage root.
+`AGY_PATH` overrides the `agy` binary location; `AGY_ACP_DATA_DIR` overrides the isolated account storage root. See [docs/claude-bridge-parity.md](./docs/claude-bridge-parity.md) for alignment notes with Magpie's official Claude Code bridge.
 
 ## Development
 

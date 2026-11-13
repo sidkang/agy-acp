@@ -58,12 +58,12 @@ magpie quota agy-acp
 ```json
 {
   "maxGlobalWorkers": 16,
-  "maxPerAccountWorkers": 4,
-  "idleTimeoutMs": 300000
+  "maxPerAccountWorkers": 6,
+  "idleTimeoutMs": 3600000
 }
 ```
 
-可通过环境变量 `AGY_PATH` 指定 `agy` 可执行文件路径，`AGY_ACP_DATA_DIR` 指定隔离账号存储根目录。
+可通过环境变量 `AGY_PATH` 指定 `agy` 可执行文件路径，`AGY_ACP_DATA_DIR` 指定隔离账号存储根目录。与 Magpie 官方 Claude 桥接的设计对齐说明见 [docs/claude-bridge-parity.md](./docs/claude-bridge-parity.md)。
 
 ## 开发与测试
 

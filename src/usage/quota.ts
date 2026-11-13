@@ -232,6 +232,22 @@ const CACHE_TTL_MS = 30_000;
  * transient failure must be retried on the next call so a fresh sign-in (or a
  * recovered CLI) is visible immediately instead of after 30s.
  */
+const activeUsageTempDirs = new Set<string>();
+let usageExitHookRegistered = false;
+
+function ensureUsageExitHookOnce(): void {
+  if (usageExitHookRegistered) return;
+  usageExitHookRegistered = true;
+  process.once("exit", () => {
+    for (const dir of Array.from(activeUsageTempDirs)) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+    activeUsageTempDirs.clear();
+  });
+}
+
 function isCacheableUsageResult(result: AccountUsageResult): boolean {
   return result.signIn === "kept" && result.error === undefined && result.windows.length > 0;
 }
@@ -266,6 +282,8 @@ export async function queryAccountUsage(
 
     try {
       tempDir = fs.mkdtempSync(path.join(tempRoot, "magpie-agy-usage-"));
+      activeUsageTempDirs.add(tempDir);
+      ensureUsageExitHookOnce();
       try {
         fs.chmodSync(tempDir, 0o700);
       } catch {}
@@ -324,6 +342,7 @@ export async function queryAccountUsage(
       }
     } finally {
       if (tempDir) {
+        activeUsageTempDirs.delete(tempDir);
         try {
           fs.rmSync(tempDir, { recursive: true, force: true });
         } catch {}

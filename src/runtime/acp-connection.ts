@@ -343,5 +343,13 @@ export class AcpConnection {
     }
     this.pendingRequests.clear();
     this.sessionUpdateListeners.clear();
+
+    try {
+      this.child.stdin.end();
+    } catch {}
+    try {
+      this.child.stdout.removeAllListeners("data");
+      this.child.stderr.removeAllListeners("data");
+    } catch {}
   }
 }

@@ -611,7 +611,7 @@ function renderMessagesToPrompt(
   return parts;
 }
 
-const PARKED_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const PARKED_SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const MAX_PARKED_SESSIONS = 32;
 const MAX_SINGLE_PARKED_BYTES = 4 * 1024 * 1024; // 4 MiB
 const MAX_TOTAL_PARKED_BYTES = 16 * 1024 * 1024; // 16 MiB
@@ -620,6 +620,7 @@ interface ParkedSession {
   nativeSessionId: string;
   committedMessages: NormalizedMessage[];
   systemPrompt?: string;
+  minimalAgent: boolean;
   registeredTools: Array<{
     name: string;
     description?: string;
@@ -736,6 +737,7 @@ export class SessionCoordinator {
         nativeSessionId: worker.nativeSessionId,
         committedMessages: [...worker.committedMessages],
         systemPrompt: worker.systemPrompt,
+        minimalAgent: worker.minimalAgent,
         registeredTools: [...worker.registeredTools],
         workDir: worker.workDir,
         resumeSupported: worker.resumeSupported,
@@ -905,6 +907,22 @@ export class SessionCoordinator {
       existingWorker = undefined;
     }
 
+    const requestedMinimalAgent = Boolean(
+      options?.providerOptions?.minimalAgent ??
+        this.providerOptions?.minimalAgent ??
+        false,
+    );
+    if (existingWorker && existingWorker.minimalAgent !== requestedMinimalAgent) {
+      for (const [k, w] of this.activeWorkers) {
+        if (w === existingWorker) {
+          this.activeWorkers.delete(k);
+        }
+      }
+      this.scheduler.unregisterWorker(existingWorker);
+      await existingWorker.close("system_prompt_mode_changed");
+      existingWorker = undefined;
+    }
+
     // Fork detection when parent is in AWAITING_TOOL_RESULTS
     if (
       existingWorker &&
@@ -990,6 +1008,11 @@ export class SessionCoordinator {
   ): AsyncGenerator<TurnStreamEvent> {
     validateNoOrphanToolResults(req.messages);
 
+    const requestedMinimalAgent = Boolean(
+      options?.providerOptions?.minimalAgent ??
+        this.providerOptions?.minimalAgent ??
+        false,
+    );
     const now = Date.now();
     this.pruneParkedSessions(now);
     const parked = this.parkedSessions.get(sessionKey);
@@ -997,6 +1020,7 @@ export class SessionCoordinator {
     if (
       parked &&
       now - parked.parkedAt < PARKED_SESSION_TTL_MS &&
+      parked.minimalAgent === requestedMinimalAgent &&
       stripVolatileSystem(parked.systemPrompt) ===
         stripVolatileSystem(req.system) &&
       isToolSetCompatible(parked.registeredTools, req.tools) &&
@@ -1111,8 +1135,8 @@ export class SessionCoordinator {
         }
       }
 
-      if (req.system && !worker.appendSystemSupported) {
-        const sysPrompt = `<system_instructions>\n${req.system}\n</system_instructions>\n\n`;
+      if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
+        const sysPrompt = `<external_system_instructions>\n${worker.effectiveSystemPrompt}\n</external_system_instructions>\n\n`;
         if (promptParts.length > 0 && promptParts[0]!.type === "text") {
           promptParts[0] = {
             type: "text",
@@ -1417,6 +1441,11 @@ export class SessionCoordinator {
           this.providerOptions?.minimalAgent ??
           false,
         exposeThinking: req.thinkingEnabled,
+        cloakPrompts:
+          options?.providerOptions?.cloakPrompts ??
+          this.providerOptions?.cloakPrompts ??
+          true,
+        workDir: req.workDir,
         systemPrompt: req.system,
         tools: req.tools,
         toolChoice: req.toolChoice,
@@ -1469,8 +1498,8 @@ export class SessionCoordinator {
         priorMessages,
         currentMessages,
       );
-      if (req.system && !worker.appendSystemSupported) {
-        const sysPrompt = `<system_instructions>\n${req.system}\n</system_instructions>\n\n`;
+      if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
+        const sysPrompt = `<external_system_instructions>\n${worker.effectiveSystemPrompt}\n</external_system_instructions>\n\n`;
         if (promptParts.length > 0 && promptParts[0]!.type === "text") {
           promptParts[0] = {
             type: "text",
