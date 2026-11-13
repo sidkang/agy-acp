@@ -1685,7 +1685,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
             if (!trimmed) continue;
             try {
               const msg = JSON.parse(trimmed);
-              if (cancelSeen && msg.id !== undefined && msg.id === promptId) {
+              if (promptId !== null && msg.id !== undefined && msg.id === promptId) {
                 setTimeout(() => {
                   interceptedStdout.write(line + "\n");
                 }, 500);

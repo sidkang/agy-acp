@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import type { AccountDescriptor, TokenUsageSummary } from "../types";
 
 export interface StepTokenUsage {
@@ -20,14 +21,42 @@ let opener:
     })
   | null = null;
 
+function isCheckpointedWal(resolvedPath: string): boolean {
+  try {
+    if (
+      fs.existsSync(`${resolvedPath}-wal`) ||
+      fs.existsSync(`${resolvedPath}-shm`)
+    ) {
+      return false;
+    }
+    const fd = fs.openSync(resolvedPath, "r");
+    try {
+      const hdr = Buffer.alloc(20);
+      const read = fs.readSync(fd, hdr, 0, 20, 0);
+      return read === 20 && hdr[18] === 2 && hdr[19] === 2;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function immutableUri(resolvedPath: string): string {
+  return `${pathToFileURL(resolvedPath).href}?immutable=1`;
+}
+
 function getDbOpener() {
   if (opener !== null) return opener;
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { Database } = require("bun:sqlite");
+    const { Database, constants } = require("bun:sqlite");
     if (typeof Database === "function") {
-      opener = (file: string) => {
-        const db = new Database(file, { readonly: true });
+      const flags =
+        (constants?.SQLITE_OPEN_READONLY ?? 1) |
+        (constants?.SQLITE_OPEN_URI ?? 0x40);
+      opener = (target: string) => {
+        const db = new Database(target, flags);
         return {
           all: (sql: string, ...args: any[]) => {
             const stmt = db.prepare(sql);
@@ -251,63 +280,74 @@ export function readConversationStepUsages(
   const open = getDbOpener();
   if (!open) return [];
 
-  let db: ReturnType<typeof open> | null = null;
-  try {
-    db = open(dbPath);
-
-    // 1. Try gen_metadata first
+  const resolved = path.resolve(dbPath);
+  const readFromTarget = (target: string): StepTokenUsage[] => {
+    let db: ReturnType<typeof open> | null = null;
     try {
-      const genRows = db.all("SELECT idx, data FROM gen_metadata ORDER BY idx");
-      if (Array.isArray(genRows) && genRows.length > 0) {
-        const steps: StepTokenUsage[] = [];
-        for (const row of genRows) {
-          const idx = Number(row?.idx);
-          const usage = decodeGenerationUsage(row?.data);
-          if (
-            Number.isSafeInteger(idx) &&
-            usage &&
-            usage.input +
-              usage.read +
-              usage.write +
-              usage.output +
-              usage.thinking >
-              0
-          ) {
-            steps.push({ idx, ...usage });
+      db = open(target);
+
+      // 1. Try gen_metadata first
+      try {
+        const genRows = db.all("SELECT idx, data FROM gen_metadata ORDER BY idx");
+        if (Array.isArray(genRows) && genRows.length > 0) {
+          const steps: StepTokenUsage[] = [];
+          for (const row of genRows) {
+            const idx = Number(row?.idx);
+            const usage = decodeGenerationUsage(row?.data);
+            if (
+              Number.isSafeInteger(idx) &&
+              usage &&
+              usage.input +
+                usage.read +
+                usage.write +
+                usage.output +
+                usage.thinking >
+                0
+            ) {
+              steps.push({ idx, ...usage });
+            }
+          }
+          if (steps.length > 0) {
+            return steps;
           }
         }
-        if (steps.length > 0) {
+      } catch {}
+
+      // 2. Fall back to steps table (step_type = 15, status = 3)
+      try {
+        const stepRows = db.all(
+          "SELECT idx, metadata FROM steps WHERE step_type = 15 AND status = 3 ORDER BY idx",
+        );
+        if (Array.isArray(stepRows) && stepRows.length > 0) {
+          const steps: StepTokenUsage[] = [];
+          for (const row of stepRows) {
+            const idx = Number(row?.idx);
+            const usage = decodeStepUsage(row?.metadata);
+            if (Number.isSafeInteger(idx) && usage) {
+              steps.push({ idx, ...usage });
+            }
+          }
           return steps;
         }
-      }
-    } catch {}
+      } catch {}
 
-    // 2. Fall back to steps table (step_type = 15, status = 3)
-    try {
-      const stepRows = db.all(
-        "SELECT idx, metadata FROM steps WHERE step_type = 15 AND status = 3 ORDER BY idx",
-      );
-      if (Array.isArray(stepRows) && stepRows.length > 0) {
-        const steps: StepTokenUsage[] = [];
-        for (const row of stepRows) {
-          const idx = Number(row?.idx);
-          const usage = decodeStepUsage(row?.metadata);
-          if (Number.isSafeInteger(idx) && usage) {
-            steps.push({ idx, ...usage });
-          }
-        }
-        return steps;
-      }
-    } catch {}
+      return [];
+    } catch {
+      return [];
+    } finally {
+      try {
+        db?.close();
+      } catch {}
+    }
+  };
 
-    return [];
-  } catch {
-    return [];
-  } finally {
-    try {
-      db?.close();
-    } catch {}
+  if (isCheckpointedWal(resolved)) {
+    const res = readFromTarget(immutableUri(resolved));
+    if (!fs.existsSync(`${resolved}-wal`)) {
+      return res;
+    }
   }
+  return readFromTarget(resolved);
 }
 
 function tokenCount(v: any): number {

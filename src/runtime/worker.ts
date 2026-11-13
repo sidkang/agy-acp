@@ -228,6 +228,7 @@ export class AgySessionWorker {
   private turnLogOffset: number = 0;
   private heldText: string = "";
   private promptStepCount: number = 1;
+  private lastReportedStepIdx: number = -1;
 
   constructor(
     account: AccountDescriptor,
@@ -268,6 +269,7 @@ export class AgySessionWorker {
 
   private setState(newState: WorkerState): void {
     if (this._state === newState) return;
+    if (this._state === "CLOSED") return;
     const oldState = this._state;
     this._state = newState;
     this.lastActivityAt = Date.now();
@@ -491,6 +493,13 @@ export class AgySessionWorker {
           this.resumedFromShelf = true;
           this.nativeSessionId =
             sessionRes?.sessionId || this.options.resumeSessionId;
+          const priorSteps = readConversationStepUsages(
+            this.account,
+            this.nativeSessionId,
+          );
+          if (priorSteps.length > 0) {
+            this.lastReportedStepIdx = priorSteps[priorSteps.length - 1]!.idx;
+          }
         } catch {
           this.resumedFromShelf = false;
         }
@@ -798,16 +807,27 @@ export class AgySessionWorker {
     this.promptStepCount++;
     this.setState("AWAITING_TOOL_RESULTS");
 
-    // 4. Yield finish(tool_use, zeroUsage)
+    // 4. Read exact per-step usage from agy's SQLite gen_metadata if already flushed
+    let toolStepUsage: TokenUsageSummary = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    };
+    const dbSteps = readConversationStepUsages(
+      this.account,
+      this.nativeSessionId,
+    ).filter((s) => s.idx > this.lastReportedStepIdx);
+    if (dbSteps.length > 0) {
+      const latest = dbSteps[dbSteps.length - 1]!;
+      this.lastReportedStepIdx = latest.idx;
+      toolStepUsage = settleStepUsage(undefined, 1, [latest]);
+    }
+
     this.activeTurnQueue.push({
       type: "finish",
       stopReason: "tool_use",
-      usage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheReadInputTokens: 0,
-        cacheCreationInputTokens: 0,
-      },
+      usage: toolStepUsage,
     });
 
     // 5. Close the active HTTP turn queue WITHOUT cancelling session/prompt!
@@ -1068,14 +1088,20 @@ export class AgySessionWorker {
       }
     }
 
-    const stepUsages = readConversationStepUsages(
+    const allDbSteps = readConversationStepUsages(
       this.account,
       this.nativeSessionId,
     );
+    const unseenDbSteps = allDbSteps.filter(
+      (s) => s.idx > this.lastReportedStepIdx,
+    );
+    if (unseenDbSteps.length > 0) {
+      this.lastReportedStepIdx = unseenDbSteps[unseenDbSteps.length - 1]!.idx;
+    }
     const settledUsage = settleStepUsage(
       result?.usage,
       this.promptStepCount,
-      stepUsages.length > 0 ? stepUsages : undefined,
+      unseenDbSteps.length > 0 ? unseenDbSteps : undefined,
     );
     this.promptStepCount = 1;
 

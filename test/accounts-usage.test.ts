@@ -34,6 +34,7 @@ import {
   parseUsageReport,
   queryAccountUsage,
 } from "../src/usage/quota";
+import { readConversationStepUsages } from "../src/usage/step-usage";
 
 const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-accounts-usage-test-"));
 const ORIGINAL_DATA_DIR = process.env.ANTIGRAVITY_MAGPIE_DATA_DIR;
@@ -1162,3 +1163,91 @@ exit 1
     }
   });
 });
+
+describe("src/usage/step-usage.ts", () => {
+  test("reads gen_metadata from both live WAL and checkpointed WAL SQLite stores without creating sidecars", () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Database } = require("bun:sqlite");
+    const convDir = path.join(TEST_DIR, "sqlite-conversations");
+    fs.mkdirSync(convDir, { recursive: true });
+    const sessionId = "check-wal-session-01";
+    const dbPath = path.join(convDir, `${sessionId}.db`);
+
+    function encodeVarint(n: number): number[] {
+      const out: number[] = [];
+      let v = n;
+      while (v >= 0x80) {
+        out.push((v & 0x7f) | 0x80);
+        v = Math.floor(v / 128);
+      }
+      out.push(v);
+      return out;
+    }
+    const usageMsg = Buffer.from([
+      (2 << 3) | 0,
+      ...encodeVarint(23406),
+      (3 << 3) | 0,
+      ...encodeVarint(42),
+      (5 << 3) | 0,
+      ...encodeVarint(20415),
+      (9 << 3) | 0,
+      ...encodeVarint(18),
+    ]);
+    const inner = Buffer.concat([
+      Buffer.from([(4 << 3) | 2, ...encodeVarint(usageMsg.length)]),
+      usageMsg,
+    ]);
+    const outer = Buffer.concat([
+      Buffer.from([(1 << 3) | 2, ...encodeVarint(inner.length)]),
+      inner,
+    ]);
+
+    const writer = new Database(dbPath);
+    writer.exec("PRAGMA journal_mode = WAL;");
+    writer.exec("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);");
+    writer
+      .prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)")
+      .run(0, outer);
+
+    const prevDir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR;
+    process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir;
+    const account: AccountDescriptor = {
+      slotKey: "agy-acp",
+      accountRef: "host",
+      mode: "host",
+      label: "host",
+      isolatedHomeDir: null,
+    };
+
+    try {
+      const liveSteps = readConversationStepUsages(account, sessionId);
+      expect(liveSteps).toEqual([
+        {
+          idx: 0,
+          input: 23406,
+          output: 42,
+          write: 0,
+          read: 20415,
+          thinking: 18,
+        },
+      ]);
+
+      writer.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+      writer.close();
+      fs.rmSync(`${dbPath}-wal`, { force: true });
+      fs.rmSync(`${dbPath}-shm`, { force: true });
+      expect(fs.existsSync(`${dbPath}-wal`)).toBe(false);
+      const closedSteps = readConversationStepUsages(account, sessionId);
+      expect(closedSteps).toEqual(liveSteps);
+      expect(fs.existsSync(`${dbPath}-wal`)).toBe(false);
+      expect(fs.existsSync(`${dbPath}-shm`)).toBe(false);
+    } finally {
+      if (prevDir !== undefined) {
+        process.env.AGY_BRIDGE_CONVERSATIONS_DIR = prevDir;
+      } else {
+        delete process.env.AGY_BRIDGE_CONVERSATIONS_DIR;
+      }
+    }
+  });
+});
+
