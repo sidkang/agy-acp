@@ -635,6 +635,10 @@ export class CatalogService {
         .finally(() => {
           if (this.inFlight.get(cacheScopeKey) === refresh) {
             this.inFlight.delete(cacheScopeKey);
+            // Trim only once this key leaves `inFlight`: `pruneStaleCache` skips
+            // in-flight keys, so pruning during a concurrent refresh burst would
+            // leave every settled entry counted (200 refreshes -> 200 entries).
+            this.pruneStaleCache(Date.now());
           }
         });
 

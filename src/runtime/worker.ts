@@ -420,7 +420,13 @@ export class AgySessionWorker {
     return new AsyncEventQueue<TurnStreamEvent>({
       maxBufferedBytes: this.options.maxTurnBufferBytes,
       onOverflow: () => {
-        void this.close("turn_buffer_overflow");
+        // The queue has already error-and-closed itself, so the producer that
+        // overflowed it can unwind first. Tearing the worker down synchronously
+        // would clear `activeTurnQueue` mid-`push()` and make the caller's own
+        // bookkeeping observe `null` from inside an unobserved promise chain.
+        queueMicrotask(() => {
+          void this.close("turn_buffer_overflow");
+        });
       },
     });
   }
@@ -640,14 +646,21 @@ export class AgySessionWorker {
 
       // 4. Spawn agy ACP
       const logFile = path.join(this.workspaceDir, "agy-acp.log");
-      // Single process per session: `--process-per-session` added a second Go
-      // process (~54% more RSS) with no capability this bridge needs, while
-      // splitting the real failure log into `agy-acp.log.<pid>`.
+      // One Go process per session. `--process-per-session` forked a second
+      // process (~54% more RSS) and split the real failure log into
+      // `agy-acp.log.<pid>`, but plain `--stdio` without it is *not*
+      // equivalent either: measured on `agy 1.5.8`, the bare front server omits
+      // `mcpCapabilities.http` and silently drops the session's HTTP
+      // `mcpServers`, so no caller tool can ever reach `agy`. `--worker` runs the
+      // single-process session server directly and keeps every capability the
+      // bridge relies on (`mcpCapabilities.http`, `--add-dir`,
+      // `_meta.antigravity.systemPrompt.append`, `session/resume`).
       const args = [
         "acp",
         "--agent",
         "magpie-bridge",
         "--stdio",
+        "--worker",
         "--disable-telemetry",
         "--log-file",
         logFile,
@@ -1021,7 +1034,7 @@ export class AgySessionWorker {
    * Error evidence written since this turn started, from the front log and
    * every `agy-acp.log.<pid>` session-worker log in this workspace.
    *
-   * Without this, `--process-per-session` hid every real failure: the front
+   * Without this, a forked session worker hid every real failure: the front
    * process logs only `front: session/prompt`, while the executor error is
    * written by the per-session worker into its own numbered log.
    */
@@ -1117,18 +1130,29 @@ export class AgySessionWorker {
   }
 
   private handleFatalToolLoop(reason: string): void {
-    if (this.activeTurnQueue) {
-      this.activeTurnQueue.push({
-        type: "error",
-        status: 500,
-        errorType: "api_error",
-        message: `Fatal tool loop detected: ${reason}`,
-      });
-      const q = this.activeTurnQueue;
-      this.activeTurnQueue = null;
-      q.close();
-    }
+    this.finishTurnQueueWith({
+      type: "error",
+      status: 500,
+      errorType: "api_error",
+      message: `Fatal tool loop detected: ${reason}`,
+    });
     void this.close("fatal_tool_loop");
+  }
+
+  /**
+   * Pushes the turn's final event, then closes its queue.
+   *
+   * The queue is captured *before* the push because `push()` can overflow it: an
+   * overflow error-and-closes the queue and schedules worker teardown, so
+   * re-reading `this.activeTurnQueue` afterwards could observe `null` and throw
+   * from inside an unobserved `.then()` / `.catch()` chain.
+   */
+  private finishTurnQueueWith(event: TurnStreamEvent): void {
+    const q = this.activeTurnQueue;
+    if (!q) return;
+    q.push(event);
+    if (this.activeTurnQueue === q) this.activeTurnQueue = null;
+    q.close();
   }
 
   private handleBatchReady(calls: ExposedToolCall[]): void {
@@ -1439,12 +1463,7 @@ export class AgySessionWorker {
     if (this.heldText.includes(AGENT_ERROR_CORE)) {
       this.heldText = "";
       const errorEvent = this.diagnoseTerminationError();
-      if (this.activeTurnQueue) {
-        this.activeTurnQueue.push(errorEvent);
-        const q = this.activeTurnQueue;
-        this.activeTurnQueue = null;
-        q.close();
-      }
+      this.finishTurnQueueWith(errorEvent);
       this.setState("IDLE");
       this.pendingPromptPromise = null;
       return;
@@ -1461,12 +1480,7 @@ export class AgySessionWorker {
         diag.type === "error" &&
         (diag.status === 400 || diag.status === 401 || diag.status === 429)
       ) {
-        if (this.activeTurnQueue) {
-          this.activeTurnQueue.push(diag);
-          const q = this.activeTurnQueue;
-          this.activeTurnQueue = null;
-          q.close();
-        }
+        this.finishTurnQueueWith(diag);
         this.setState("IDLE");
         this.pendingPromptPromise = null;
         return;
@@ -1535,14 +1549,11 @@ export class AgySessionWorker {
       }
 
       if (this.activeTurnQueue && result?.stopReason !== "cancelled") {
-        this.activeTurnQueue.push({
+        this.finishTurnQueueWith({
           type: "finish",
           stopReason,
           usage,
         });
-        const q = this.activeTurnQueue;
-        this.activeTurnQueue = null;
-        q.close();
       }
 
       this.setState("IDLE");
@@ -1578,12 +1589,7 @@ export class AgySessionWorker {
               message: redactSecrets(err?.message || "ACP prompt failed"),
             };
 
-      if (this.activeTurnQueue) {
-        this.activeTurnQueue.push(eventToSend);
-        const q = this.activeTurnQueue;
-        this.activeTurnQueue = null;
-        q.close();
-      }
+      this.finishTurnQueueWith(eventToSend);
       this.setState("IDLE");
     }
     this.pendingPromptPromise = null;

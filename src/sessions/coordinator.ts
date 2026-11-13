@@ -1366,7 +1366,29 @@ export class SessionCoordinator {
     if (worker.state !== "IDLE") return false;
     if (!worker.resumeSupported) return false;
     if (!worker.nativeSessionId) return false;
+    // Recycling is only worth it if a resume checkpoint can actually be kept:
+    // retiring a worker whose session is too large for the memory shelf *and*
+    // seeded (so no digest index) would destroy the warm conversation outright.
+    if (!this.canRetainResumeCheckpoint(worker)) return false;
     return worker.getRssBytes() > this.maxWorkerRssBytes;
+  }
+
+  /** Would parking this worker leave behind a resume source of any kind? */
+  private canRetainResumeCheckpoint(worker: AgySessionWorker): boolean {
+    if (!worker.nativeSessionId) return false;
+    const canPersist =
+      worker.resumeSupported &&
+      !worker.appliedSystemHistorySeed &&
+      !worker.sessionId.startsWith("ephemeral-");
+    if (canPersist) return true;
+    return (
+      estimateParkedBytes(
+        worker.committedMessages,
+        worker.systemPrompt,
+        worker.appliedSystemHistorySeed,
+        worker.registeredTools,
+      ) <= MAX_SINGLE_PARKED_BYTES
+    );
   }
 
   pruneParkedSessions(now = Date.now()): void {
@@ -1392,7 +1414,14 @@ export class SessionCoordinator {
     }
   }
 
-  private parkSession(worker: AgySessionWorker): void {
+  /**
+   * Saves this worker's session to the memory and/or digest shelves.
+   *
+   * Returns whether at least one usable resume source was retained: callers that
+   * are about to close the worker must not treat an oversized, seeded ledger as
+   * recoverable when neither shelf accepted it.
+   */
+  private parkSession(worker: AgySessionWorker): boolean {
     let foundKey: string | null = null;
     for (const [key, w] of this.activeWorkers) {
       if (w === worker) {
@@ -1405,9 +1434,20 @@ export class SessionCoordinator {
     }
     const now = Date.now();
     this.pruneParkedSessions(now);
+
+    let persistedRetained = false;
     if (worker.resumeSupported && !worker.appliedSystemHistorySeed) {
+      try {
+        this.ensurePersistedSessionsLoaded(now);
+      } catch {}
+      const before = this.persistedSessions.get(foundKey);
       this.recordPersistedSession(worker, foundKey, now);
+      // `recordPersistedSession` swallows its own failures, so only a *fresh*
+      // entry installed by this call counts as a retained checkpoint.
+      persistedRetained = this.persistedSessions.get(foundKey) !== before;
     }
+
+    let memoryRetained = false;
     if (worker.nativeSessionId) {
       const estimatedBytes = estimateParkedBytes(
         worker.committedMessages,
@@ -1417,23 +1457,26 @@ export class SessionCoordinator {
       );
       if (estimatedBytes > MAX_SINGLE_PARKED_BYTES) {
         this.parkedSessions.delete(foundKey);
-        return;
+      } else {
+        this.parkedSessions.delete(foundKey);
+        this.parkedSessions.set(foundKey, {
+          nativeSessionId: worker.nativeSessionId,
+          committedMessages: [...worker.committedMessages],
+          systemPrompt: worker.systemPrompt,
+          systemHistorySeed: worker.appliedSystemHistorySeed,
+          minimalAgent: worker.minimalAgent,
+          registeredTools: [...worker.registeredTools],
+          workDir: worker.workDir,
+          resumeSupported: worker.resumeSupported,
+          parkedAt: now,
+          estimatedBytes,
+        });
+        this.pruneParkedSessions(now);
+        memoryRetained = this.parkedSessions.has(foundKey);
       }
-      this.parkedSessions.delete(foundKey);
-      this.parkedSessions.set(foundKey, {
-        nativeSessionId: worker.nativeSessionId,
-        committedMessages: [...worker.committedMessages],
-        systemPrompt: worker.systemPrompt,
-        systemHistorySeed: worker.appliedSystemHistorySeed,
-        minimalAgent: worker.minimalAgent,
-        registeredTools: [...worker.registeredTools],
-        workDir: worker.workDir,
-        resumeSupported: worker.resumeSupported,
-        parkedAt: now,
-        estimatedBytes,
-      });
-      this.pruneParkedSessions(now);
     }
+
+    return memoryRetained || persistedRetained;
   }
 
   getActiveWorker(sessionKey: string): AgySessionWorker | undefined {
@@ -2078,21 +2121,29 @@ export class SessionCoordinator {
         yield event;
       }
     } finally {
-      worker.pinned = false;
-      if (started && !handedOff) {
-        // A fresh worker has no previously committed turns to preserve: any
-        // uncommitted exit must retire it from coordinator and scheduler alike.
-        const why = sawError
-          ? "turn_error"
-          : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-        if (why) {
-          await this.retireWorker(worker, why);
-        } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
-          // Park first, while the session key is still registered, so the next
-          // turn resumes this exact conversation in a fresh process.
-          this.parkSession(worker);
-          await this.retireWorker(worker, "rss_limit_exceeded");
+      // Retirement and RSS recycling run while the worker is still pinned: an
+      // unpinned IDLE worker becomes evictable immediately, and a waiting
+      // admission would park the very session we are about to discard as
+      // failed. Unpin last, in an inner `finally`, so a throw cannot strand it.
+      try {
+        if (started && !handedOff) {
+          // A fresh worker has no previously committed turns to preserve: any
+          // uncommitted exit must retire it from coordinator and scheduler alike.
+          const why = sawError
+            ? "turn_error"
+            : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
+          if (why) {
+            await this.retireWorker(worker, why);
+          } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
+            // Park first, while the session key is still registered, so the next
+            // turn resumes this exact conversation in a fresh process.
+            if (this.parkSession(worker)) {
+              await this.retireWorker(worker, "rss_limit_exceeded");
+            }
+          }
         }
+      } finally {
+        worker.pinned = false;
       }
     }
   }
@@ -2162,17 +2213,21 @@ export class SessionCoordinator {
         yield event;
       }
     } finally {
-      worker.pinned = false;
-      if (promptStarted) {
-        const why = sawError
-          ? "turn_error"
-          : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-        if (why) {
-          await this.retireWorker(worker, why);
-        } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
-          this.parkSession(worker);
-          await this.retireWorker(worker, "rss_limit_exceeded");
+      try {
+        if (promptStarted) {
+          const why = sawError
+            ? "turn_error"
+            : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
+          if (why) {
+            await this.retireWorker(worker, why);
+          } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
+            if (this.parkSession(worker)) {
+              await this.retireWorker(worker, "rss_limit_exceeded");
+            }
+          }
         }
+      } finally {
+        worker.pinned = false;
       }
     }
   }
@@ -2376,17 +2431,21 @@ export class SessionCoordinator {
         throw err;
       }
     } finally {
-      worker.pinned = false;
-      if (!handedOff && continuationStarted) {
-        const why = sawError
-          ? "turn_error"
-          : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
-        if (why) {
-          await this.retireWorker(worker, why);
-        } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
-          this.parkSession(worker);
-          await this.retireWorker(worker, "rss_limit_exceeded");
+      try {
+        if (!handedOff && continuationStarted) {
+          const why = sawError
+            ? "turn_error"
+            : this.shouldRetireUnfinishedTurn(worker, turnFinishedCleanly, signal);
+          if (why) {
+            await this.retireWorker(worker, why);
+          } else if (turnFinishedCleanly && this.shouldRecycleForRss(worker)) {
+            if (this.parkSession(worker)) {
+              await this.retireWorker(worker, "rss_limit_exceeded");
+            }
+          }
         }
+      } finally {
+        worker.pinned = false;
       }
     }
   }

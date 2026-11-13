@@ -21,7 +21,7 @@ const BUSY_MESSAGE =
 
 interface CapacityWaiter {
   account: AccountDescriptor;
-  workerToRegister?: AgySessionWorker;
+  workerToRegister: AgySessionWorker;
   resolve: () => void;
   reject: (err: unknown) => void;
   cleanup: () => void;
@@ -182,6 +182,10 @@ export class GlobalScheduler {
     );
   }
 
+  private closedError(): BridgeHttpError {
+    return new BridgeHttpError(503, "overloaded_error", "Scheduler closed");
+  }
+
   private isAwaitingToolExpired(worker: AgySessionWorker, now: number): boolean {
     return (
       worker.state === "AWAITING_TOOL_RESULTS" &&
@@ -263,6 +267,7 @@ export class GlobalScheduler {
     worker: AgySessionWorker,
     signal?: AbortSignal,
   ): Promise<void> {
+    if (this.shuttingDown) throw this.closedError();
     const acquired = this.tryAcquireNow(worker.account, worker);
     if (acquired.admitted) {
       await this.closeVictims(acquired.victims);
@@ -271,22 +276,32 @@ export class GlobalScheduler {
     await this.waitForRoom(worker.account, worker, signal);
   }
 
+  /**
+   * Admits a worker or frees a slot *now*; never queues.
+   *
+   * A queueable bare admission would be unsound: the waiter registers no worker,
+   * so waking several of them on one capacity notification would hand the same
+   * released slot to all of them before any continuation could register. Callers
+   * that must wait use `reserveAndRegister`, which registers synchronously.
+   */
   async ensureCapacity(
     account: AccountDescriptor,
     signal?: AbortSignal,
   ): Promise<void> {
+    if (this.shuttingDown) throw this.closedError();
+    if (signal?.aborted) throw this.abortedError();
     const acquired = this.tryAcquireNow(account);
     if (acquired.admitted) {
       await this.closeVictims(acquired.victims);
       return;
     }
-    await this.waitForRoom(account, undefined, signal);
+    throw this.busyError();
   }
 
   /** Parks the request in FIFO order until a slot frees or the bound expires. */
   private waitForRoom(
     account: AccountDescriptor,
-    workerToRegister: AgySessionWorker | undefined,
+    workerToRegister: AgySessionWorker,
     signal?: AbortSignal,
   ): Promise<void> {
     if (signal?.aborted) return Promise.reject(this.abortedError());
@@ -480,6 +495,9 @@ export class GlobalScheduler {
   }
 
   destroy(): void {
+    // Match `closeAllSync`: a destroyed scheduler must refuse new admissions
+    // instead of silently reporting capacity it can no longer honour.
+    this.shuttingDown = true;
     this.rejectAllWaiters("Scheduler closed");
     if (this.reaperTimer) {
       clearInterval(this.reaperTimer);

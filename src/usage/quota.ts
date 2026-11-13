@@ -187,6 +187,7 @@ async function refreshAccessTokenForPlan(
     accessToken,
     expiresAtMs: Date.now() + expiresInSec * 1000,
   });
+  pruneQuotaCaches(Date.now());
   return accessToken;
 }
 
@@ -201,6 +202,7 @@ export async function queryAccountPlan(
 ): Promise<string | undefined> {
   const key = `${account.accountRef}::${account.slotKey}`;
   const now = Date.now();
+  pruneQuotaCaches(now);
   const existing = planCache.get(key);
   if (existing?.plan && now - existing.timestamp < PLAN_CACHE_TTL_MS) {
     return existing.plan;
@@ -261,6 +263,8 @@ export async function queryAccountPlan(
     return plan;
   } finally {
     delete entry.inFlight;
+    // Trim once the entry is settled so the map never rests above its cap.
+    pruneQuotaCaches(Date.now());
   }
 }
 
@@ -700,5 +704,7 @@ export async function queryAccountUsage(
     if (!entry.data && usageCache.get(cacheKey) === entry) {
       usageCache.delete(cacheKey);
     }
+    // Trim once the entry is settled so the map never rests above its cap.
+    pruneQuotaCaches(Date.now());
   }
 }

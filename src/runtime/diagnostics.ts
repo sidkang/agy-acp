@@ -4,13 +4,12 @@ import path from "node:path";
 /**
  * Turn-scoped diagnostics for `agy acp` failures.
  *
- * `agy acp --process-per-session` runs a *front* process plus one `--worker`
- * process per session. The front writes `agy-acp.log`; each session worker
- * writes its own `agy-acp.log.<pid>` sibling. The real failure text for a turn
- * (`E1113 ... agent executor error: ...`) lands in the numbered worker log,
- * while the front log usually only records `front: session/prompt`. Reading just
- * the front log masked every upstream failure as a generic
- * `500 Agent execution terminated due to error`.
+ * Both `agy acp --worker` (single-process session worker) and legacy
+ * `--process-per-session` write execution records (`E1113 ... agent executor
+ * error: ...`) into a PID-suffixed `agy-acp.log.<pid>` file rather than the
+ * base `agy-acp.log` path passed to `--log-file`. Reading only the base log
+ * masked upstream failures as a generic `500 Agent execution terminated due to
+ * error`.
  *
  * Two rules keep the verdict honest: only a turn's own bytes are evidence, and
  * only error records are evidence. Without them a stale failure, a glog

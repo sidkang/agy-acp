@@ -711,6 +711,22 @@ function openSummaryDbReadWrite(file: string): SummaryDbHandle | null {
 }
 
 /**
+ * True only when `conversations/<sessionId>.db` is definitively missing.
+ *
+ * Every other outcome (the file still exists, or the filesystem refused to say)
+ * is treated as "maybe present", so an index row is preserved rather than
+ * dropped for a session whose transcript is still there.
+ */
+function isTranscriptAbsent(cliDir: string, sessionId: string): boolean {
+  try {
+    fs.lstatSync(path.join(cliDir, "conversations", `${sessionId}.db`));
+    return false;
+  } catch (err: any) {
+    return err?.code === "ENOENT";
+  }
+}
+
+/**
  * Drops summary / full-text-index / parent rows whose `conversations/<id>.db`
  * no longer exists, and compacts the FTS5 index afterwards.
  *
@@ -802,6 +818,14 @@ function reclaimConversationSummaryOrphans(
 
     if (orphanIds.size === 0) return 0;
 
+    // A session is only an orphan when its transcript is provably gone. This
+    // keeps a failed unlink, an unreadable directory, or a concurrent create
+    // from costing a live conversation its summary, FTS entries and parent link.
+    for (const id of Array.from(orphanIds)) {
+      if (!isTranscriptAbsent(cliDir, id)) orphanIds.delete(id);
+    }
+    if (orphanIds.size === 0) return 0;
+
     let deleted = 0;
     try {
       db.exec("BEGIN IMMEDIATE");
@@ -860,7 +884,7 @@ function reclaimConversationSummaryOrphans(
  * 3. `log/*.log` older than `maxAgeMs`, then capped to `maxLogDirBytes`
  * 4. `annotations/<sessionId>.pbtxt` and `implicit/<sessionId>.pb`
  * 5. `crashes/*`
- * 6. `cli.log` (age prune or tail truncation)
+ * 6. `cli.log` (emptied when stale, tail-truncated when oversized)
  * 7. orphaned `conversation_summaries.db` rows + FTS5 index entries
  */
 export function sweepStaleAccountStorage(
@@ -913,23 +937,30 @@ export function sweepStaleAccountStorage(
             keepIds.add(sessionId);
             continue;
           }
-          const dbFile = path.join(convDir, ent.name);
-          const walFile = `${dbFile}-wal`;
-          const shmFile = `${dbFile}-shm`;
-          let newestMtime = fs.statSync(dbFile).mtimeMs;
+          // Per-entry isolation: one unreadable database must not abort the scan
+          // that decides which summaries are still referenced.
           try {
-            if (fs.existsSync(walFile)) {
-              newestMtime = Math.max(newestMtime, fs.statSync(walFile).mtimeMs);
+            const dbFile = path.join(convDir, ent.name);
+            const walFile = `${dbFile}-wal`;
+            const shmFile = `${dbFile}-shm`;
+            let newestMtime = fs.statSync(dbFile).mtimeMs;
+            try {
+              if (fs.existsSync(walFile)) {
+                newestMtime = Math.max(newestMtime, fs.statSync(walFile).mtimeMs);
+              }
+            } catch {}
+            if (now - newestMtime > maxAgeMs) {
+              for (const f of [walFile, shmFile, dbFile]) {
+                try {
+                  if (fs.existsSync(f)) fs.rmSync(f, { force: true });
+                } catch {}
+              }
+              removed++;
             }
-          } catch {}
-          if (now - newestMtime > maxAgeMs) {
-            for (const f of [walFile, shmFile, dbFile]) {
-              try {
-                if (fs.existsSync(f)) fs.rmSync(f, { force: true });
-              } catch {}
-            }
-            removed++;
-          } else {
+            // Keep unless the transcript is really gone: a failed delete must
+            // not be read as "orphaned" by the summary sweep below.
+            if (fs.existsSync(dbFile)) keepIds.add(sessionId);
+          } catch {
             keepIds.add(sessionId);
           }
         }
@@ -1058,34 +1089,46 @@ export function sweepStaleAccountStorage(
       }
     } catch {}
 
-    // 6. Age-prune or tail-truncate the root cli.log
+    // 6. Empty (stale) or tail-truncate (oversized) the root cli.log, always
+    // in place so an open appender never loses the file.
     const cliLogPath = path.join(cliDir, "cli.log");
+    let cliLogFd: number | undefined;
     try {
-      if (fs.existsSync(cliLogPath)) {
-        const st = fs.statSync(cliLogPath);
-        if (st.isFile()) {
-          if (now - st.mtimeMs > maxAgeMs) {
-            fs.rmSync(cliLogPath, { force: true });
-            removed++;
-          } else if (st.size > maxLogDirBytes && now - st.mtimeMs > 60_000) {
-            const keepBytes = Math.min(maxLogDirBytes, MIN_CLI_LOG_TAIL_BYTES);
-            const length = Math.min(keepBytes, st.size);
-            let tail = Buffer.alloc(0);
-            const fd = fs.openSync(cliLogPath, "r");
-            try {
-              tail = Buffer.alloc(length);
-              fs.readSync(fd, tail, 0, length, st.size - length);
-            } finally {
-              fs.closeSync(fd);
-            }
-            const tmp = `${cliLogPath}.gc-tmp`;
-            fs.writeFileSync(tmp, tail, { mode: st.mode & 0o777 });
-            fs.renameSync(tmp, cliLogPath);
+      cliLogFd = fs.openSync(cliLogPath, "r+");
+      const st = fs.fstatSync(cliLogFd);
+      if (st.isFile()) {
+        if (now - st.mtimeMs > maxAgeMs) {
+          // Truncate in place rather than unlinking. An idle CLI process can hold
+          // this file open with O_APPEND for hours; unlinking would leave it
+          // writing to an unreachable inode. Emptying the file (and skipping the
+          // count when it is already empty) keeps repeated sweeps idempotent.
+          if (st.size > 0) {
+            fs.ftruncateSync(cliLogFd, 0);
             removed++;
           }
+        } else if (st.size > maxLogDirBytes && now - st.mtimeMs > 60_000) {
+          // Truncate in place. Writing a fresh file and renaming it over
+          // `cli.log` would strand a live process's open O_APPEND descriptor on
+          // the unlinked inode: every later log line would vanish from the
+          // visible log (and stay unreclaimable) until that process exited.
+          const keepBytes = Math.min(maxLogDirBytes, MIN_CLI_LOG_TAIL_BYTES);
+          const length = Math.min(keepBytes, st.size);
+          const tail = Buffer.alloc(length);
+          fs.readSync(cliLogFd, tail, 0, length, st.size - length);
+          fs.ftruncateSync(cliLogFd, 0);
+          fs.writeSync(cliLogFd, tail, 0, length, 0);
+          removed++;
         }
       }
-    } catch {}
+    } catch {
+      // A missing or unreadable cli.log is not an error for the sweep.
+    } finally {
+      if (cliLogFd !== undefined) {
+        try {
+          fs.closeSync(cliLogFd);
+        } catch {}
+      }
+    }
 
     // 7. Reclaim orphaned summary rows and FTS5 index entries
     removed += reclaimConversationSummaryOrphans(cliDir, keepIds, now, maxAgeMs);

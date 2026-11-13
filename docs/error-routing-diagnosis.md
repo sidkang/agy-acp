@@ -16,7 +16,7 @@ agent executor error: generating and executing: serializing trajectory: maxMessa
 
 插件使用 `--process-per-session` 时，前台进程写 `agy-acp.log`，真正执行的子进程写 `agy-acp.log.<PID>`。旧诊断只读前者，漏掉了上面的真实错误。
 
-> 后续变更（本仓库 Phase 2）：桥接已改为单进程（去掉 `--process-per-session`，加 `--disable-telemetry`）。诊断仍同时读取 `agy-acp.log` 与 `agy-acp.log.<PID>`，因此单进程下只是没有后者可读，不依赖进程模型。
+> 后续变更（`0.1.3` Phase 2）：桥接已改为直启单进程会话 worker（`agy acp --worker --disable-telemetry`，省去冗余前台进程，同时保留 `mcpCapabilities.http`）。`--worker` 仍将日志写入 `agy-acp.log.<PID>`，因此 `TurnLogWatch` 同时监听 `agy-acp.log` 与 `agy-acp.log.<PID>` 依然是必需能力。
 
 **边界：** 能确认错误发生在 `agy` 的 trajectory 序列化阶段，不能据此断言是账号额度耗尽，也不能单凭这一条日志确定是模型配置缺陷还是长系统提示/历史触发了预算问题。此次修复改善诊断，不声称修复了闭源 CLI 的零预算计算。
 
