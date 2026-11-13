@@ -50,7 +50,19 @@ export interface MagpieModelMetadata {
   variants?: Record<string, Record<string, never>>;
 }
 
+// Keep the emergency catalog in step with the known CLI families. A fresh
+// account's first probe may exceed the fast-wait budget; omitting a known
+// family here makes Magpie mark that account `unlisted` and skip failover.
 export const STATIC_FALLBACK_MODELS: RawModelEntry[] = [
+  { rawModelId: "gemini-4-carbon-high", displayName: "Gemini 4 Carbon (High)" },
+  { rawModelId: "gemini-4-carbon-medium", displayName: "Gemini 4 Carbon (Medium)" },
+  { rawModelId: "gemini-4-carbon-low", displayName: "Gemini 4 Carbon (Low)" },
+  { rawModelId: "gemini-4-hydrogen-xhigh", displayName: "Gemini 4 Hydrogen (XHigh)" },
+  { rawModelId: "gemini-4-hydrogen-high", displayName: "Gemini 4 Hydrogen (High)" },
+  { rawModelId: "gemini-4-hydrogen-medium", displayName: "Gemini 4 Hydrogen (Medium)" },
+  { rawModelId: "gemini-4-hydrogen-low", displayName: "Gemini 4 Hydrogen (Low)" },
+  { rawModelId: "gemini-pro-orchestrator", displayName: "Orchestrator (Carbon)" },
+  { rawModelId: "gemini-pro-orchestrator-argon", displayName: "Orchestrator (Argon)" },
   { rawModelId: "gemini-4-argon-high", displayName: "Gemini 4 Argon (High)" },
   { rawModelId: "gemini-4-argon-medium", displayName: "Gemini 4 Argon (Medium)" },
   { rawModelId: "gemini-4-argon-low", displayName: "Gemini 4 Argon (Low)" },

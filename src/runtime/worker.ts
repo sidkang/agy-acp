@@ -17,6 +17,14 @@ import {
 } from "../types";
 import { AcpConnection } from "./acp-connection";
 import {
+  CONTEXT_BUDGET_FAILURE_MESSAGE,
+  GENERIC_FAILURE_MESSAGE,
+  TurnLogWatch,
+  classifyAgentFailure,
+  extractErrorEvidence,
+  stderrDelta,
+} from "./diagnostics";
+import {
   turnsAway,
   refusalHint,
   cloakSystemPrompt,
@@ -303,7 +311,8 @@ export class AgySessionWorker {
     cacheReadInputTokens: 0,
     cacheCreationInputTokens: 0,
   };
-  private turnLogOffset: number = 0;
+  private turnLogs: TurnLogWatch | null = null;
+  private turnStderrBaseline: string = "";
   private heldText: string = "";
   private promptStepCount: number = 1;
   private lastReportedStepIdx: number = -1;
@@ -809,28 +818,48 @@ export class AgySessionWorker {
     }
   }
 
-  private diagnoseTerminationError(rawErr?: unknown): TurnStreamEvent {
-    let logContent = "";
+  /**
+   * Snapshots the diagnostics window for the turn that is about to start.
+   *
+   * The stderr baseline is taken *before* `session/prompt` because `agy` logs
+   * a burst of start-up `E ... You are not logged into Antigravity.` records
+   * while its token source is still warming up; a whole-buffer read would
+   * attribute them to this turn and fabricate a `401`.
+   */
+  private markTurnDiagnosticsStart(): void {
     try {
-      const logPath = path.join(this.workspaceDir, "agy-acp.log");
-      if (fs.existsSync(logPath)) {
-        const stat = fs.statSync(logPath);
-        const length = stat.size - this.turnLogOffset;
-        if (length > 0) {
-          const fd = fs.openSync(logPath, "r");
-          try {
-            const buf = Buffer.alloc(length);
-            fs.readSync(fd, buf, 0, length, this.turnLogOffset);
-            logContent = buf.toString("utf-8");
-          } finally {
-            try {
-              fs.closeSync(fd);
-            } catch {}
-          }
-        }
-      }
-    } catch {}
+      this.turnStderrBaseline = this.conn?.getStderrTail() ?? "";
+    } catch {
+      this.turnStderrBaseline = "";
+    }
+    try {
+      this.turnLogs = new TurnLogWatch(this.workspaceDir);
+      this.turnLogs.markTurnStart();
+    } catch {
+      this.turnLogs = null;
+    }
+  }
 
+  /**
+   * Error evidence written since this turn started, from the front log and
+   * every `agy-acp.log.<pid>` session-worker log in this workspace.
+   *
+   * Without this, `--process-per-session` hid every real failure: the front
+   * process logs only `front: session/prompt`, while the executor error is
+   * written by the per-session worker into its own numbered log.
+   */
+  private currentTurnLogEvidence(): string {
+    try {
+      // No mark means no turn window (diagnosis before any prompt): read the
+      // bounded tail rather than the whole file so nothing unbounded is loaded.
+      const watch = this.turnLogs ?? new TurnLogWatch(this.workspaceDir);
+      return extractErrorEvidence(watch.readTurnEvidence());
+    } catch {
+      return "";
+    }
+  }
+
+  private diagnoseTerminationError(rawErr?: unknown): TurnStreamEvent {
     const rawErrMsg =
       rawErr instanceof Error
         ? rawErr.message
@@ -839,58 +868,75 @@ export class AgySessionWorker {
           : "";
     const redactedRawErr = redactSecrets(rawErrMsg);
 
-    const stderrTail = this.conn?.getStderrTail() ?? "";
-    const combined = `${logContent}\n${stderrTail}\n${redactedRawErr}`;
-
-    if (
-      /please sign in|not (?:logged|signed) in|authentication expired|login required|unauthenticated/i.test(
-        combined,
-      )
-    ) {
-      return {
-        type: "error",
-        status: 401,
-        errorType: "authentication_error",
-        message: "Antigravity CLI authentication expired. Please sign in again.",
-        signInExpired: true,
-      };
+    let stderrEvidence = "";
+    try {
+      stderrEvidence = extractErrorEvidence(
+        stderrDelta(this.turnStderrBaseline, this.conn?.getStderrTail() ?? ""),
+      );
+    } catch {
+      stderrEvidence = "";
     }
 
-    if (
-      /429|RESOURCE_EXHAUSTED|exhausted your quota|quota/i.test(combined)
-    ) {
-      if (turnsAway(this.systemPrompt) && !this.options.cloakPrompts) {
+    const evidence = [this.currentTurnLogEvidence(), stderrEvidence]
+      .filter(Boolean)
+      .join("\n");
+
+    // Log records and turn-scoped stderr are merged as evidence; the ACP error
+    // text is passed separately because it is authoritative for this turn and
+    // may therefore state auth in wording that a log must not trust.
+    switch (classifyAgentFailure(evidence, redactedRawErr)) {
+      case "context_budget":
+        // `agy` refused to serialize the trajectory (`maxMessageTokens must be
+        // positive, got 0`). The public text is fixed and neutral: the raw line
+        // is not actionable, and naming quotas would trip Magpie's quota-word
+        // detector and rest a healthy account.
+        return {
+          type: "error",
+          status: 500,
+          errorType: "api_error",
+          message: CONTEXT_BUDGET_FAILURE_MESSAGE,
+        };
+      case "auth":
+        return {
+          type: "error",
+          status: 401,
+          errorType: "authentication_error",
+          message: "Antigravity CLI authentication expired. Please sign in again.",
+          signInExpired: true,
+        };
+      case "quota":
+        if (turnsAway(this.systemPrompt) && !this.options.cloakPrompts) {
+          return {
+            type: "error",
+            status: 400,
+            errorType: "invalid_request_error",
+            message: refusalHint(this.systemPrompt),
+          };
+        }
+        return {
+          type: "error",
+          status: 429,
+          errorType: "rate_limit_error",
+          message: "Account quota exhausted",
+        };
+      case "invalid_request":
         return {
           type: "error",
           status: 400,
           errorType: "invalid_request_error",
-          message: refusalHint(this.systemPrompt),
+          message: "Invalid request to agent",
         };
-      }
-      return {
-        type: "error",
-        status: 429,
-        errorType: "rate_limit_error",
-        message: "Account quota exhausted",
-      };
+      default:
+        // Never echo the raw error: for a process exit it carries the whole
+        // stderr tail, whose `quotaProject=` metadata would make Magpie rest a
+        // healthy account.
+        return {
+          type: "error",
+          status: 500,
+          errorType: "api_error",
+          message: GENERIC_FAILURE_MESSAGE,
+        };
     }
-    if (/invalid_request|bad request|invalid argument/i.test(combined)) {
-      return {
-        type: "error",
-        status: 400,
-        errorType: "invalid_request_error",
-        message: "Invalid request to agent",
-      };
-    }
-    const fallbackMsg = redactedRawErr
-      ? `Agent execution terminated due to error: ${redactedRawErr}`
-      : "Agent execution terminated due to error";
-    return {
-      type: "error",
-      status: 500,
-      errorType: "api_error",
-      message: fallbackMsg,
-    };
   }
 
   private handleFatalToolLoop(reason: string): void {
@@ -1132,12 +1178,7 @@ export class AgySessionWorker {
     this.setState("GENERATING");
     this.currentThinkingAccumulator = "";
     this.heldText = "";
-    const logPath = path.join(this.workspaceDir, "agy-acp.log");
-    try {
-      this.turnLogOffset = fs.statSync(logPath).size;
-    } catch {
-      this.turnLogOffset = 0;
-    }
+    this.markTurnDiagnosticsStart();
     const queue = new AsyncEventQueue<TurnStreamEvent>();
     this.activeTurnQueue = queue;
 
