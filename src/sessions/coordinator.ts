@@ -611,6 +611,11 @@ function renderMessagesToPrompt(
   return parts;
 }
 
+const PARKED_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const MAX_PARKED_SESSIONS = 32;
+const MAX_SINGLE_PARKED_BYTES = 4 * 1024 * 1024; // 4 MiB
+const MAX_TOTAL_PARKED_BYTES = 16 * 1024 * 1024; // 16 MiB
+
 interface ParkedSession {
   nativeSessionId: string;
   committedMessages: NormalizedMessage[];
@@ -623,6 +628,22 @@ interface ParkedSession {
   workDir?: string;
   resumeSupported: boolean;
   parkedAt: number;
+  estimatedBytes: number;
+}
+
+function estimateParkedBytes(
+  messages: NormalizedMessage[],
+  systemPrompt: string | undefined,
+  tools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }>,
+): number {
+  let bytes = systemPrompt ? utf8Bytes(systemPrompt) : 0;
+  try {
+    bytes += utf8Bytes(JSON.stringify(tools));
+    bytes += utf8Bytes(JSON.stringify(messages));
+  } catch {
+    bytes += 64 * 1024;
+  }
+  return bytes;
 }
 
 export class SessionCoordinator {
@@ -654,6 +675,37 @@ export class SessionCoordinator {
       } catch {}
       this.parkSession(worker);
     };
+
+    const prevReapTick = this.scheduler.onReapTick;
+    this.scheduler.onReapTick = (now: number) => {
+      try {
+        prevReapTick?.(now);
+      } catch {}
+      this.pruneParkedSessions(now);
+    };
+  }
+
+  pruneParkedSessions(now = Date.now()): void {
+    let totalBytes = 0;
+    for (const [key, entry] of this.parkedSessions) {
+      if (now - entry.parkedAt >= PARKED_SESSION_TTL_MS) {
+        this.parkedSessions.delete(key);
+      } else {
+        totalBytes += entry.estimatedBytes;
+      }
+    }
+    while (
+      this.parkedSessions.size > MAX_PARKED_SESSIONS ||
+      totalBytes > MAX_TOTAL_PARKED_BYTES
+    ) {
+      const oldestKey = this.parkedSessions.keys().next().value;
+      if (!oldestKey) break;
+      const victim = this.parkedSessions.get(oldestKey);
+      this.parkedSessions.delete(oldestKey);
+      if (victim) {
+        totalBytes = Math.max(0, totalBytes - victim.estimatedBytes);
+      }
+    }
   }
 
   private parkSession(worker: AgySessionWorker): void {
@@ -667,7 +719,19 @@ export class SessionCoordinator {
     if (!foundKey) {
       foundKey = `${worker.account.slotKey}::${worker.account.accountRef}::${worker.sessionId}`;
     }
+    const now = Date.now();
+    this.pruneParkedSessions(now);
     if (worker.nativeSessionId) {
+      const estimatedBytes = estimateParkedBytes(
+        worker.committedMessages,
+        worker.systemPrompt,
+        worker.registeredTools,
+      );
+      if (estimatedBytes > MAX_SINGLE_PARKED_BYTES) {
+        this.parkedSessions.delete(foundKey);
+        return;
+      }
+      this.parkedSessions.delete(foundKey);
       this.parkedSessions.set(foundKey, {
         nativeSessionId: worker.nativeSessionId,
         committedMessages: [...worker.committedMessages],
@@ -675,12 +739,10 @@ export class SessionCoordinator {
         registeredTools: [...worker.registeredTools],
         workDir: worker.workDir,
         resumeSupported: worker.resumeSupported,
-        parkedAt: Date.now(),
+        parkedAt: now,
+        estimatedBytes,
       });
-      if (this.parkedSessions.size > 64) {
-        const oldestKey = this.parkedSessions.keys().next().value;
-        if (oldestKey) this.parkedSessions.delete(oldestKey);
-      }
+      this.pruneParkedSessions(now);
     }
   }
 
@@ -928,11 +990,13 @@ export class SessionCoordinator {
   ): AsyncGenerator<TurnStreamEvent> {
     validateNoOrphanToolResults(req.messages);
 
+    const now = Date.now();
+    this.pruneParkedSessions(now);
     const parked = this.parkedSessions.get(sessionKey);
     let resumeSessionId: string | undefined = undefined;
     if (
       parked &&
-      Date.now() - parked.parkedAt < 6 * 3600 * 1000 &&
+      now - parked.parkedAt < PARKED_SESSION_TTL_MS &&
       stripVolatileSystem(parked.systemPrompt) ===
         stripVolatileSystem(req.system) &&
       isToolSetCompatible(parked.registeredTools, req.tools) &&

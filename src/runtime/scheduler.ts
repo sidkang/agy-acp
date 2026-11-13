@@ -1,5 +1,5 @@
 import { BridgeHttpError, type AccountDescriptor } from "../types";
-import type { AgySessionWorker } from "./worker";
+import { sweepStaleWorkspaces, type AgySessionWorker } from "./worker";
 
 export interface GlobalSchedulerOptions {
   maxGlobalWorkers?: number;
@@ -9,6 +9,7 @@ export interface GlobalSchedulerOptions {
   awaitingToolTimeoutMs?: number;
   installSignalHandlers?: boolean;
   onBeforeEvictIdle?: (worker: AgySessionWorker) => void;
+  onReapTick?: (now: number) => void;
 }
 
 const globalActiveSchedulers = new Set<GlobalScheduler>();
@@ -17,6 +18,12 @@ let globalSignalsInstalled = false;
 function installGlobalSignalHandlersOnce(): void {
   if (globalSignalsInstalled) return;
   globalSignalsInstalled = true;
+
+  process.once("exit", () => {
+    for (const s of Array.from(globalActiveSchedulers)) {
+      s.closeAllSync("process_exit");
+    }
+  });
 
   process.once("SIGINT", () => {
     void Promise.allSettled(
@@ -42,6 +49,7 @@ export class GlobalScheduler {
   readonly reaperIntervalMs: number;
   readonly awaitingToolTimeoutMs: number;
   readonly onBeforeEvictIdle?: (worker: AgySessionWorker) => void;
+  onReapTick?: (now: number) => void;
 
   private readonly workers = new Set<AgySessionWorker>();
   private reaperTimer?: ReturnType<typeof setInterval>;
@@ -58,6 +66,7 @@ export class GlobalScheduler {
     this.awaitingToolTimeoutMs = options?.awaitingToolTimeoutMs ?? 10 * 60 * 1000; // 10 minutes
     this.reaperIntervalMs = options?.reaperIntervalMs ?? 60 * 1000; // 1 minute
     this.onBeforeEvictIdle = options?.onBeforeEvictIdle;
+    this.onReapTick = options?.onReapTick;
 
     this.reaperTimer = setInterval(() => {
       void this.reapIdleWorkers();
@@ -206,6 +215,12 @@ export class GlobalScheduler {
 
   async reapIdleWorkers(): Promise<number> {
     const now = Date.now();
+    try {
+      this.onReapTick?.(now);
+    } catch {}
+    try {
+      sweepStaleWorkspaces(now);
+    } catch {}
     let count = 0;
     for (const worker of Array.from(this.workers)) {
       if (worker.pinned) {
@@ -232,10 +247,18 @@ export class GlobalScheduler {
     return count;
   }
 
-  async closeAll(reason = "scheduler_shutdown"): Promise<void> {
+  closeAllSync(reason = "scheduler_shutdown"): void {
     const allWorkers = Array.from(this.workers);
     this.workers.clear();
-    await Promise.allSettled(allWorkers.map((w) => w.close(reason)));
+    for (const w of allWorkers) {
+      try {
+        w.closeSync(reason);
+      } catch {}
+    }
+  }
+
+  async closeAll(reason = "scheduler_shutdown"): Promise<void> {
+    this.closeAllSync(reason);
   }
 
   destroy(): void {

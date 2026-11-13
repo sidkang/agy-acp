@@ -309,20 +309,70 @@ export function spawnAgy(
   options?: SpawnAgyOptions
 ): ChildProcessWithoutNullStreams {
   const { bin, finalArgs, env, cwd } = buildAgyEnvAndArgs(account, args, options);
+  // Keep child inside the parent host's Unix session / Windows Job Object so
+  // Magpie's StartTree process-group sweep reaps descendants even if the plugin
+  // host is killed with SIGKILL.
   return spawn(bin, finalArgs, {
     cwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
-    detached: process.platform !== "win32",
+    detached: false,
   });
 }
 
+function collectUnixDescendantsBottomUp(rootPid: number): number[] {
+  try {
+    const res = spawnSync("ps", ["-ax", "-o", "pid=,ppid="], {
+      encoding: "utf-8",
+      timeout: 1_500,
+    });
+    if (!res.stdout) return [];
+    const childrenByPpid = new Map<number, number[]>();
+    for (const rawLine of res.stdout.split("\n")) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const parts = line.split(/\s+/);
+      if (parts.length < 2) continue;
+      const pid = Number(parts[0]);
+      const ppid = Number(parts[1]);
+      if (!Number.isInteger(pid) || !Number.isInteger(ppid) || pid <= 1) continue;
+      let list = childrenByPpid.get(ppid);
+      if (!list) {
+        list = [];
+        childrenByPpid.set(ppid, list);
+      }
+      list.push(pid);
+    }
+
+    const ordered: number[] = [];
+    const visited = new Set<number>([rootPid]);
+    const visit = (pid: number) => {
+      const kids = childrenByPpid.get(pid);
+      if (kids) {
+        for (const k of kids) {
+          if (!visited.has(k)) {
+            visited.add(k);
+            visit(k);
+            ordered.push(k);
+          }
+        }
+      }
+    };
+    visit(rootPid);
+    return ordered;
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Kills a child process and its process tree cleanly.
+ * Kills a child process and its descendant process tree cleanly without
+ * signaling the caller's own process group.
  */
 export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = "SIGKILL"): void {
   if (!child || !child.pid) return;
+  if (child.exitCode !== null && child.signalCode !== null) return;
   if (process.platform === "win32") {
     try {
       spawnSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
@@ -335,11 +385,17 @@ export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = "S
       } catch {}
     }
   } else {
+    const descendants = collectUnixDescendantsBottomUp(child.pid);
+    for (const pid of descendants) {
+      try {
+        process.kill(pid, signal);
+      } catch {}
+    }
     try {
-      process.kill(-child.pid, signal);
+      child.kill(signal);
     } catch {
       try {
-        child.kill(signal);
+        process.kill(child.pid, signal);
       } catch {}
     }
   }

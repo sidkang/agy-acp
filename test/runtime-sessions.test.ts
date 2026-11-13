@@ -13,6 +13,7 @@ import { GlobalScheduler } from "../src/runtime/scheduler";
 import {
   AgySessionWorker,
   createSyntheticThinkingSignature,
+  sweepStaleWorkspaces,
   type ModelSelection,
 } from "../src/runtime/worker";
 import { SessionCoordinator } from "../src/sessions/coordinator";
@@ -2133,5 +2134,103 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
     const worker = coordinator.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
     await worker?.close("test_done");
+  });
+
+  test("30. Cooldown lifecycle: parkedSessions TTL/byte caps, dead-PID workspace sweep, and process.exit(0) zero-orphan cleanup", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const { spawnSync } = await import("node:child_process");
+
+    // 1. Dead-PID workspace sweep removes crashed host's temp workspace
+    const fakeStaleDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-magpie-ws-"));
+    fs.writeFileSync(path.join(fakeStaleDir, ".owner-pid"), "999999\n");
+    const swept = sweepStaleWorkspaces();
+    expect(swept).toBeGreaterThanOrEqual(1);
+    expect(fs.existsSync(fakeStaleDir)).toBe(false);
+
+    // 2. Oversized (> 4 MiB) session is not retained in parkedSessions heap on idle eviction
+    const localScheduler = new GlobalScheduler({
+      maxGlobalWorkers: 2,
+      maxPerAccountWorkers: 2,
+      idleTimeoutMs: 10,
+    });
+    const localCoord = new SessionCoordinator({
+      scheduler: localScheduler,
+      mcpServer: getSharedMcpServer(),
+      spawnFn: spawnFakeAcp,
+    });
+    const sessionId = `test-oversized-park-${Date.now()}`;
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+    const req: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "test",
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    for await (const _ of localCoord.executeTurn(testAccount, req, sel)) {
+      // consume
+    }
+    const w = localCoord.getActiveWorker(`${testAccount.slotKey}::${sessionId}`)!;
+    expect(w).toBeDefined();
+    // Simulate a 5 MiB base64 image in committedMessages
+    w.committedMessages.push({
+      role: "user",
+      content: [{ type: "text", text: "x".repeat(5 * 1024 * 1024) }],
+    });
+    w.lastActivityAt = Date.now() - 1_000;
+    const reaped = await localScheduler.reapIdleWorkers();
+    expect(reaped).toBe(1);
+    expect((localCoord as any).parkedSessions.size).toBe(0);
+    localScheduler.destroy();
+
+    // 3. Real child host calling process.exit(0) kills its agy worker and deletes workspaceDir
+    const probeScript = `
+      import { AgySessionWorker } from "./src/runtime/worker.ts";
+      import { getSharedMcpServer } from "./src/mcp/http-server.ts";
+      import { spawn } from "node:child_process";
+      const w = new AgySessionWorker(
+        { slotKey: "s", accountRef: "host", mode: "host", label: "h", isolatedHomeDir: null },
+        "exit-probe",
+        getSharedMcpServer(),
+        {
+          spawnFn: (_acc, _args, opts) =>
+            spawn("bun", ["run", ${JSON.stringify(fakeAcpPath)}], {
+              cwd: opts?.cwd,
+              stdio: ["pipe", "pipe", "pipe"],
+            }),
+        }
+      );
+      await w.start();
+      console.log(JSON.stringify({ pid: (w as any).child.pid, ws: w.workspaceDir }));
+      process.exit(0);
+    `;
+    const run = spawnSync("bun", ["-e", probeScript], {
+      cwd: process.cwd(),
+      encoding: "utf-8",
+      timeout: 15_000,
+    });
+    expect(run.status).toBe(0);
+    const info = JSON.parse(run.stdout.trim().split("\n").pop()!);
+    expect(fs.existsSync(info.ws)).toBe(false);
+
+    // Wait briefly for OS to reap SIGKILLed child
+    let alive = true;
+    for (let i = 0; i < 20; i++) {
+      try {
+        process.kill(info.pid, 0);
+        await new Promise((r) => setTimeout(r, 25));
+      } catch {
+        alive = false;
+        break;
+      }
+    }
+    expect(alive).toBe(false);
   });
 });

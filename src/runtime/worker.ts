@@ -171,10 +171,75 @@ export class AsyncEventQueue<T> implements AsyncIterable<T> {
   }
 }
 
+const liveWorkersForExitCleanup = new Set<AgySessionWorker>();
+let exitHookRegistered = false;
+let staleWorkspacesSwept = false;
+
+function ensureWorkerExitHookRegistered(): void {
+  if (exitHookRegistered) return;
+  exitHookRegistered = true;
+  process.once("exit", () => {
+    for (const worker of Array.from(liveWorkersForExitCleanup)) {
+      try {
+        worker.closeSync("process_exit");
+      } catch {}
+    }
+  });
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code === "EPERM";
+  }
+}
+
+export function sweepStaleWorkspaces(now = Date.now()): number {
+  let removed = 0;
+  const tmpRoot = os.tmpdir();
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(tmpRoot, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const ent of entries) {
+    if (!ent.isDirectory() || !ent.name.startsWith("agy-magpie-ws-")) continue;
+    const fullPath = path.join(tmpRoot, ent.name);
+    const pidFile = path.join(fullPath, ".owner-pid");
+    try {
+      if (fs.existsSync(pidFile)) {
+        const ownerPid = Number(fs.readFileSync(pidFile, "utf-8").trim());
+        if (!isProcessAlive(ownerPid)) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+          removed++;
+        }
+      } else {
+        // Legacy workspace without .owner-pid older than 1 hour
+        const st = fs.statSync(fullPath);
+        if (now - st.mtimeMs > 60 * 60 * 1000) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+          removed++;
+        }
+      }
+    } catch {}
+  }
+  return removed;
+}
+
+function sweepStaleWorkspacesOnce(): void {
+  if (staleWorkspacesSwept) return;
+  staleWorkspacesSwept = true;
+  sweepStaleWorkspaces();
+}
+
 export class AgySessionWorker {
   readonly account: AccountDescriptor;
   readonly sessionId: string;
-  readonly workspaceDir: string;
+  workspaceDir: string = "";
   readonly workDir?: string;
   readonly onEvict?: () => void;
   private readonly mcpServer: LoopbackMcpServer;
@@ -229,6 +294,7 @@ export class AgySessionWorker {
   private heldText: string = "";
   private promptStepCount: number = 1;
   private lastReportedStepIdx: number = -1;
+  private readonly ownsWorkspaceDir: boolean;
 
   constructor(
     account: AccountDescriptor,
@@ -244,16 +310,32 @@ export class AgySessionWorker {
     this.onEvict = this.options.onEvict;
     this.steerCancelTimeoutMs = this.options.steerCancelTimeoutMs;
 
+    ensureWorkerExitHookRegistered();
+    sweepStaleWorkspacesOnce();
+
     if (this.options.workspaceDir) {
       this.workspaceDir = this.options.workspaceDir;
+      this.ownsWorkspaceDir = false;
     } else {
-      this.workspaceDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "agy-magpie-ws-"),
-      );
-      try {
-        fs.chmodSync(this.workspaceDir, 0o700);
-      } catch {}
+      this.ownsWorkspaceDir = true;
     }
+  }
+
+  private ensureWorkspaceDir(): string {
+    if (this.workspaceDir) return this.workspaceDir;
+    this.workspaceDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "agy-magpie-ws-"),
+    );
+    try {
+      fs.chmodSync(this.workspaceDir, 0o700);
+      fs.writeFileSync(
+        path.join(this.workspaceDir, ".owner-pid"),
+        `${process.pid}\n`,
+        { mode: 0o600 },
+      );
+    } catch {}
+    liveWorkersForExitCleanup.add(this);
+    return this.workspaceDir;
   }
 
   get state(): WorkerState {
@@ -295,6 +377,8 @@ export class AgySessionWorker {
     }
 
     try {
+      this.ensureWorkspaceDir();
+      liveWorkersForExitCleanup.add(this);
       // 1. Write agent manifest
       const agentDir = path.join(
         this.workspaceDir,
@@ -1496,9 +1580,10 @@ export class AgySessionWorker {
     });
   }
 
-  async close(reason = "normal"): Promise<void> {
+  closeSync(reason = "process_exit"): void {
     if (this.isClosed) return;
     this.isClosed = true;
+    liveWorkersForExitCleanup.delete(this);
     this.setState("CLOSED");
 
     this.unregisterMcp?.();
@@ -1530,15 +1615,23 @@ export class AgySessionWorker {
     } catch {}
 
     try {
-      if (this.child && !this.child.killed) {
+      if (this.child && this.child.exitCode === null) {
         killProcessTree(this.child, "SIGKILL");
       }
     } catch {}
 
     try {
-      if (this.workspaceDir && fs.existsSync(this.workspaceDir)) {
+      if (
+        this.ownsWorkspaceDir &&
+        this.workspaceDir &&
+        fs.existsSync(this.workspaceDir)
+      ) {
         fs.rmSync(this.workspaceDir, { recursive: true, force: true });
       }
     } catch {}
+  }
+
+  async close(reason = "normal"): Promise<void> {
+    this.closeSync(reason);
   }
 }
