@@ -89,6 +89,16 @@ export class GlobalScheduler {
   readonly onBeforeEvictIdle?: (worker: AgySessionWorker) => void;
   onReapTick?: (now: number) => void;
 
+  /**
+   * Additional owners of the two lifecycle events, so a second listener does not
+   * have to capture and re-wrap the property (which is what the coordinator had
+   * to do with `(scheduler as any).onBeforeEvictIdle`).
+   */
+  private readonly beforeEvictIdleHooks = new Set<
+    (worker: AgySessionWorker) => void
+  >();
+  private readonly reapTickHooks = new Set<(now: number) => void>();
+
   private readonly workers = new Set<AgySessionWorker>();
   private readonly waiters: CapacityWaiter[] = [];
   private drainingWaiters = false;
@@ -416,6 +426,27 @@ export class GlobalScheduler {
     }
   }
 
+  /**
+   * Registers a hook run before an idle worker is evicted (reaped or closed to
+   * make room). Returns an idempotent unregister.
+   */
+  addBeforeEvictIdleHook(
+    hook: (worker: AgySessionWorker) => void,
+  ): () => void {
+    this.beforeEvictIdleHooks.add(hook);
+    return () => {
+      this.beforeEvictIdleHooks.delete(hook);
+    };
+  }
+
+  /** Registers a hook run once per reaper tick. Returns an idempotent unregister. */
+  addReapTickHook(hook: (now: number) => void): () => void {
+    this.reapTickHooks.add(hook);
+    return () => {
+      this.reapTickHooks.delete(hook);
+    };
+  }
+
   private notifyEvictIdle(worker: AgySessionWorker): void {
     if (worker.state === "IDLE") {
       try {
@@ -423,6 +454,22 @@ export class GlobalScheduler {
       } catch {}
       try {
         this.onBeforeEvictIdle?.(worker);
+      } catch {}
+      for (const hook of Array.from(this.beforeEvictIdleHooks)) {
+        try {
+          hook(worker);
+        } catch {}
+      }
+    }
+  }
+
+  private notifyReapTick(now: number): void {
+    try {
+      this.onReapTick?.(now);
+    } catch {}
+    for (const hook of Array.from(this.reapTickHooks)) {
+      try {
+        hook(now);
       } catch {}
     }
   }
@@ -445,9 +492,7 @@ export class GlobalScheduler {
 
   async reapIdleWorkers(): Promise<number> {
     const now = Date.now();
-    try {
-      this.onReapTick?.(now);
-    } catch {}
+    this.notifyReapTick(now);
     try {
       sweepStaleWorkspaces(now);
     } catch {}

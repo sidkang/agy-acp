@@ -619,7 +619,7 @@ describe("src/usage/catalog.ts cache retention", () => {
     const delayedBin = path.join(TEST_DIR, "mock-agy-models-delayed.sh");
     fs.writeFileSync(
       delayedBin,
-      `#!/bin/sh\nsleep 0.15\nif [ "$1" = "models" ]; then\n  printf '%s' '${MODELS_OUTPUT}'\n  exit 0\nfi\nexit 1\n`,
+      `#!/bin/sh\nsleep 0.03\nif [ "$1" = "models" ]; then\n  printf '%s' '${MODELS_OUTPUT}'\n  exit 0\nfi\nexit 1\n`,
       { mode: 0o755 },
     );
     try {

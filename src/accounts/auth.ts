@@ -730,6 +730,182 @@ function combineWithTimeoutSignal(
   return callerSignal;
 }
 
+/**
+ * Combines a caller's cancellation signal with a hard deadline, and reports
+ * which one fired.
+ *
+ * `dispose()` detaches the timer and the caller's `abort` listener, so a
+ * long-lived caller signal never accumulates listeners across sign-in
+ * attempts (the `AbortSignal.any` form in `combineWithTimeoutSignal` cannot be
+ * undone and is therefore only used for one-shot fetches).
+ */
+export function combineSignals(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number
+): {
+  signal: AbortSignal;
+  timedOut: () => boolean;
+  callerAborted: () => boolean;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  let callerAborted = callerSignal?.aborted === true;
+  let disposed = false;
+
+  const abortWith = (kind: "caller" | "timeout") => {
+    if (disposed || controller.signal.aborted) return;
+    if (kind === "caller") callerAborted = true;
+    else timedOut = true;
+    controller.abort();
+  };
+
+  const onCallerAbort = () => abortWith("caller");
+  if (callerAborted) {
+    controller.abort();
+  } else if (callerSignal) {
+    callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+  }
+
+  const timer = setTimeout(() => abortWith("timeout"), Math.max(0, timeoutMs));
+  (timer as any).unref?.();
+
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    clearTimeout(timer);
+    if (callerSignal) callerSignal.removeEventListener("abort", onCallerAbort);
+  };
+
+  return {
+    signal: controller.signal,
+    timedOut: () => timedOut,
+    callerAborted: () => callerAborted,
+    dispose,
+  };
+}
+
+export type LoginAbandonReason = "aborted" | "timeout" | "disposed";
+
+export interface LoginSessionDisposerOptions {
+  callerSignal?: AbortSignal;
+  timeoutMs: number;
+  /** Rollback hook, run at most once, and never after `complete()`. */
+  onCleanup?: (reason: LoginAbandonReason, message: string) => void;
+  abortMessage?: string;
+  timeoutMessage?: string;
+}
+
+export type LoginWaitOutcome<T> =
+  | { kind: "resolved"; value: T }
+  | { kind: "aborted"; message: string }
+  | { kind: "timeout"; message: string };
+
+export interface LoginSessionDisposer {
+  /** Aborted when the caller cancels or the overall deadline passes. */
+  signal: AbortSignal;
+  /** Non-null once the flow was abandoned (never after `complete()`). */
+  abandonReason: () => string | null;
+  /** Races `promise` against abandonment, telling which one decided. */
+  waitOutcome: <T>(promise: Promise<T>) => Promise<LoginWaitOutcome<T>>;
+  /** Idempotent teardown that runs `onCleanup` at most once. */
+  dispose: (explicitMessage?: string) => void;
+  /** Detaches timers/listeners without running the rollback cleanup. */
+  complete: () => void;
+}
+
+/**
+ * One lifecycle owner for an interactive sign-in that spans several steps
+ * (`authorize()` handing back a URL, then `callback()` finishing it).
+ *
+ * Both the browser loopback flow and the terminal `agy acp --login` flow use
+ * it, so an abandoned sign-in always kills its child process and rolls back
+ * its throwaway account directory exactly once, whether it was abandoned by
+ * the caller's abort signal, by the overall deadline, or by an early exit.
+ */
+export function createLoginSessionDisposer(
+  options: LoginSessionDisposerOptions
+): LoginSessionDisposer {
+  const abortMessage = options.abortMessage ?? "Sign-in cancelled";
+  const timeoutMessage = options.timeoutMessage ?? "The sign-in timed out";
+  const combined = combineSignals(options.callerSignal, options.timeoutMs);
+  let abandoned: string | null = combined.callerAborted()
+    ? abortMessage
+    : null;
+  let finished = false;
+
+  const abandonNow = (): string | null => {
+    // The recorded reason outlives the teardown: a caller that asks after the
+    // cleanup ran must still learn why the sign-in ended.
+    if (abandoned !== null) return abandoned;
+    if (finished) return null;
+    if (combined.callerAborted()) abandoned = abortMessage;
+    else if (combined.timedOut()) abandoned = timeoutMessage;
+    return abandoned;
+  };
+
+  const settle = (reason: LoginAbandonReason, message: string): void => {
+    if (finished) return;
+    finished = true;
+    if (reason !== "disposed" || abandoned === null) abandoned = message;
+    combined.dispose();
+    try {
+      options.onCleanup?.(reason, message);
+    } catch {}
+  };
+
+  // The deadline or the caller's signal ends the flow on its own, even while
+  // the caller is only waiting for the authorization URL: the same `onCleanup`
+  // owner reaps the child process and its directory.
+  const onAbort = () => {
+    const reason: LoginAbandonReason = combined.callerAborted() ? "aborted" : "timeout";
+    settle(reason, reason === "aborted" ? abortMessage : timeoutMessage);
+  };
+  if (!combined.signal.aborted) {
+    combined.signal.addEventListener("abort", onAbort, { once: true });
+  } else {
+    onAbort();
+  }
+
+  return {
+    signal: combined.signal,
+    abandonReason: () => abandonNow(),
+    waitOutcome: async <T>(promise: Promise<T>): Promise<LoginWaitOutcome<T>> => {
+      const reason = abandonNow();
+      if (reason !== null) {
+        return combined.timedOut() ? { kind: "timeout", message: reason } : { kind: "aborted", message: reason };
+      }
+      let abortResolve: (() => void) | null = null;
+      const aborted = new Promise<void>((resolve) => {
+        abortResolve = resolve;
+      });
+      const onWaitAbort = () => abortResolve?.();
+      combined.signal.addEventListener("abort", onWaitAbort, { once: true });
+      try {
+        const winner = await Promise.race([
+          promise.then((value) => ({ kind: "value" as const, value })),
+          aborted.then(() => ({ kind: "abandoned" as const })),
+        ]);
+        if (winner.kind === "value") return { kind: "resolved", value: winner.value };
+        const message = abandonNow() ?? abortMessage;
+        return combined.timedOut()
+          ? { kind: "timeout", message }
+          : { kind: "aborted", message };
+      } finally {
+        combined.signal.removeEventListener("abort", onWaitAbort);
+      }
+    },
+    dispose: (explicitMessage?: string) => {
+      settle("disposed", explicitMessage ?? abortMessage);
+    },
+    complete: () => {
+      if (finished) return;
+      finished = true;
+      combined.dispose();
+    },
+  };
+}
+
 function parseJsonSafe(text: string): any {
   try {
     return JSON.parse(text);
@@ -1211,47 +1387,33 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
             }
             used = true;
 
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            const sig = callbackOpts?.signal ?? options?.signal;
-            let onAbort: (() => void) | undefined;
+            // One lifecycle owner for this callback: the caller's signal and the
+            // overall deadline both end it, and every timer/listener is detached
+            // in the `finally` below.
+            const flow = createLoginSessionDisposer({
+              callerSignal: callbackOpts?.signal ?? options?.signal,
+              timeoutMs: BROWSER_SIGN_IN_TIMEOUT_MS,
+              abortMessage: "Sign-in cancelled",
+              timeoutMessage: "The sign-in timed out",
+            });
 
             try {
-              const abortPromise = new Promise<null>((resolve) => {
-                if (sig?.aborted) {
-                  resolve(null);
-                  return;
-                }
-                onAbort = () => resolve(null);
-                sig?.addEventListener("abort", onAbort, { once: true });
-              });
-
-              const timeoutPromise = new Promise<"timeout">((resolve) => {
-                timer = setTimeout(() => resolve("timeout"), BROWSER_SIGN_IN_TIMEOUT_MS);
-                (timer as any).unref?.();
-              });
-
-              const outcome = await Promise.race([
-                callbackPromise,
-                abortPromise,
-                timeoutPromise,
-              ]);
+              const outcome = await flow.waitOutcome(callbackPromise);
 
               // Close loopback listener immediately once callback/abort/timeout settles
               listener.close();
 
-              if (outcome === null) {
-                return { type: "failed", error: "Sign-in cancelled" };
+              if (outcome.kind !== "resolved") {
+                return { type: "failed", error: outcome.message };
               }
-              if (outcome === "timeout") {
-                return { type: "failed", error: "The sign-in timed out" };
-              }
-              if (outcome.err) {
+              const granted = outcome.value;
+              if (granted.err) {
                 return {
                   type: "failed",
-                  error: `Google OAuth error: ${redactSecrets(outcome.err)}`,
+                  error: `Google OAuth error: ${redactSecrets(granted.err)}`,
                 };
               }
-              if (!outcome.code) {
+              if (!granted.code) {
                 return { type: "failed", error: "Google returned no authorization code" };
               }
 
@@ -1260,13 +1422,13 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
                 headers: { "Content-Type": "application/x-www-form-urlencoded" },
                 body: new URLSearchParams({
                   grant_type: "authorization_code",
-                  code: outcome.code,
+                  code: granted.code,
                   redirect_uri: redirectUri,
                   client_id: GOOGLE_CLIENT_ID,
                   client_secret: GOOGLE_CLIENT_SECRET,
                   code_verifier: verifier,
                 }).toString(),
-                signal: combineWithTimeoutSignal(sig, 30_000),
+                signal: combineWithTimeoutSignal(flow.signal, 30_000),
               });
 
               const tokenText = await tokenRes.text();
@@ -1303,7 +1465,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
                       ? Math.trunc(tokenJson.expires_in)
                       : 3600,
                 },
-                { signal: sig },
+                { signal: flow.signal },
                 deps
               );
               return provisioned.outcome;
@@ -1313,10 +1475,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
                 error: redactSecrets(err?.message ?? String(err)),
               };
             } finally {
-              if (timer) clearTimeout(timer);
-              if (sig && onAbort) {
-                sig.removeEventListener("abort", onAbort);
-              }
+              flow.dispose();
               listener.close();
             }
           },
@@ -1489,74 +1648,51 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
           );
         }
 
-        const flowSignal = options?.signal;
-        if (flowSignal?.aborted) {
-          killProcessTree(child);
-          rollbackIsolatedDir();
-          return makeAuthorizeFailure("Sign-in aborted");
-        }
-
-        const flowTimeoutMs = deps?.terminalFlowTimeoutMs ?? TERMINAL_SIGN_IN_FLOW_TIMEOUT_MS;
         let out = "";
         let startupPending = true;
         let pendingStartupReject: ((error: Error) => void) | null = null;
         let startTimer: NodeJS.Timeout | undefined;
-        let flowTimer: NodeJS.Timeout | undefined;
-        let flowAbortHandler: (() => void) | null = null;
-        let flowDisposed = false;
         let callbackStarted = false;
         let flowAbandonReason: string | undefined;
 
-        const stopWatchdogs = () => {
-          if (startTimer) {
-            clearTimeout(startTimer);
-            startTimer = undefined;
-          }
-          if (flowTimer) {
-            clearTimeout(flowTimer);
-            flowTimer = undefined;
-          }
-          if (flowSignal && flowAbortHandler) {
-            flowSignal.removeEventListener("abort", flowAbortHandler);
-          }
-          flowAbortHandler = null;
-        };
+        // Single idempotent owner of the whole terminal sign-in: the caller's
+        // abort signal, the overall flow deadline, and an `agy` exit before the
+        // code was submitted all end it the same way, killing the login process
+        // and rolling back the throwaway account directory exactly once
+        // (`MED-11`). Declared before the disposer so a signal that is already
+        // aborted can settle synchronously against initialised state.
+        const flow = createLoginSessionDisposer({
+          callerSignal: options?.signal,
+          timeoutMs: deps?.terminalFlowTimeoutMs ?? TERMINAL_SIGN_IN_FLOW_TIMEOUT_MS,
+          abortMessage: "Sign-in aborted",
+          timeoutMessage: "Timed out waiting for the agy terminal sign-in to finish",
+          onCleanup: (_reason, message) => {
+            flowAbandonReason = message;
+            if (startTimer) {
+              clearTimeout(startTimer);
+              startTimer = undefined;
+            }
+            killProcessTree(child);
+            rollbackIsolatedDir();
+            const rejectStartup = pendingStartupReject;
+            pendingStartupReject = null;
+            startupPending = false;
+            rejectStartup?.(new Error(message));
+          },
+        });
 
-        // Single idempotent owner of the abandoned-flow cleanup: whoever fires
-        // first -- the overall flow timeout, an abort on `authorize`'s signal, or
-        // an `agy` exit before the code was submitted -- kills the login process
-        // and rolls back the throwaway account directory exactly once.
-        const cleanupAbandonedFlow = (reason: string) => {
-          if (flowDisposed) return;
-          flowDisposed = true;
-          flowAbandonReason = reason;
-          stopWatchdogs();
-          killProcessTree(child);
-          rollbackIsolatedDir();
-          const rejectStartup = pendingStartupReject;
-          pendingStartupReject = null;
-          startupPending = false;
-          rejectStartup?.(new Error(reason));
-        };
-
+        const cleanupAbandonedFlow = (reason?: string) => flow.dispose(reason);
         // Successful sign-in (or an already-handled failure): stop watching and
         // keep the freshly saved account.
-        const releaseFlowWatchdog = () => {
-          if (flowDisposed) return;
-          flowDisposed = true;
-          stopWatchdogs();
-        };
+        const releaseFlowWatchdog = () => flow.complete();
 
-        flowAbortHandler = () => cleanupAbandonedFlow("Sign-in aborted");
-        flowSignal?.addEventListener("abort", flowAbortHandler, { once: true });
+        if (flow.signal.aborted) {
+          return makeAuthorizeFailure(flow.abandonReason() ?? "Sign-in aborted");
+        }
+
         // Killing `agy` mid-login can EPIPE the stdin pipe; that must surface as a
         // failed sign-in, never as an unhandled stream error in the host process.
         child.stdin.on("error", () => {});
-        flowTimer = setTimeout(
-          () => cleanupAbandonedFlow("Timed out waiting for the agy terminal sign-in to finish"),
-          flowTimeoutMs
-        );
-        (flowTimer as any).unref?.();
 
         const authUrlPromise = new Promise<{ url: string }>((resolve, reject) => {
           pendingStartupReject = reject;
@@ -1642,15 +1778,21 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
                 reject(new Error("Callback aborted"));
               };
 
-              if (callbackOpts?.signal?.aborted) {
-                onCbAbort();
+              // The flow's own signal: it carries the caller's cancellation and
+              // the overall sign-in deadline, so a stalled `agy` login can never
+              // outlive the flow that owns it.
+              const cbSignal = callbackOpts?.signal ?? flow.signal;
+              if (cbSignal?.aborted) {
+                clearTimeout(timer);
+                killProcessTree(child);
+                reject(new Error("Callback aborted"));
                 return;
               }
-              callbackOpts?.signal?.addEventListener("abort", onCbAbort, { once: true });
+              cbSignal?.addEventListener("abort", onCbAbort, { once: true });
 
               child.on("exit", (exitCode) => {
                 clearTimeout(timer);
-                callbackOpts?.signal?.removeEventListener("abort", onCbAbort);
+                cbSignal?.removeEventListener("abort", onCbAbort);
                 resolve(exitCode);
               });
             });
@@ -1671,7 +1813,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
             try {
               const probe = await execAgyBounded(isolatedAccount, ["models"], {
                 timeoutMs: 20_000,
-                signal: callbackOpts?.signal,
+                signal: callbackOpts?.signal ?? flow.signal,
               });
 
               if (

@@ -30,11 +30,8 @@ import {
   refusalHint,
   cloakSystemPrompt,
 } from "../protocol/cloak";
-import {
-  settleStepUsage,
-  readConversationStepUsages,
-  resolveConversationDbPath,
-} from "../usage/step-usage";
+import { settleStepUsage } from "../usage/step-usage";
+import { StepUsageTracker } from "../usage/tracker";
 import {
   spawnAgy,
   killProcessTree,
@@ -47,6 +44,13 @@ import {
   type ToolResultDelivery,
 } from "../mcp/broker";
 import { type LoopbackMcpServer } from "../mcp/http-server";
+import { AsyncEventQueue, TurnContext } from "./turn-context";
+
+export {
+  AsyncEventQueue,
+  DEFAULT_MAX_TURN_QUEUE_BYTES,
+  type AsyncEventQueueOptions,
+} from "./turn-context";
 
 export type WorkerState =
   | "STARTING"
@@ -130,150 +134,6 @@ export function createSyntheticThinkingSignature(
     .update(thinkingText)
     .digest("hex");
   return `agy1.${hmac}`;
-}
-
-/** 16 MiB is far above any legitimate single-turn event burst for this bridge. */
-export const DEFAULT_MAX_TURN_QUEUE_BYTES = 16 * 1024 * 1024;
-
-const DEFAULT_EVENT_OVERHEAD_BYTES = 128;
-
-function defaultEstimateEventBytes(item: any): number {
-  switch (item?.type) {
-    case "text_delta":
-      return 64 + Buffer.byteLength(String(item.text ?? ""));
-    case "thinking_delta":
-      return 64 + Buffer.byteLength(String(item.thinking ?? ""));
-    case "thinking_signature":
-      return 64 + Buffer.byteLength(String(item.signature ?? ""));
-    case "tool_use": {
-      let json = "{}";
-      try {
-        json = JSON.stringify(item.input ?? {});
-      } catch {
-        json = "{}";
-      }
-      return 128 + Buffer.byteLength(json);
-    }
-    default:
-      return DEFAULT_EVENT_OVERHEAD_BYTES;
-  }
-}
-
-export interface AsyncEventQueueOptions<T> {
-  /** Buffered-byte ceiling for undelivered items. Default 16 MiB. */
-  maxBufferedBytes?: number;
-  estimateBytes?: (item: T) => number;
-  /** Called once after the queue overflows and closes itself with an error. */
-  onOverflow?: (err: BridgeHttpError) => void;
-}
-
-export class AsyncEventQueue<T> implements AsyncIterable<T> {
-  private queue: T[] = [];
-  private bufferedBytes = 0;
-  private waiters: Array<{
-    resolve: (item: IteratorResult<T>) => void;
-    reject: (err: any) => void;
-  }> = [];
-  private closed = false;
-  private error: any = null;
-  private readonly maxBufferedBytes: number;
-  private readonly estimateBytes: (item: T) => number;
-  private readonly onOverflow?: (err: BridgeHttpError) => void;
-
-  constructor(options?: AsyncEventQueueOptions<T>) {
-    this.maxBufferedBytes =
-      options?.maxBufferedBytes ?? DEFAULT_MAX_TURN_QUEUE_BYTES;
-    this.estimateBytes =
-      options?.estimateBytes ??
-      (defaultEstimateEventBytes as (item: T) => number);
-    this.onOverflow = options?.onOverflow;
-  }
-
-  /** Bytes currently buffered (items already handed to a waiter are not). */
-  get pendingBytes(): number {
-    return this.bufferedBytes;
-  }
-
-  private measure(item: T): number {
-    try {
-      const bytes = this.estimateBytes(item);
-      return Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
-    } catch {
-      return 0;
-    }
-  }
-
-  push(item: T): void {
-    if (this.closed) return;
-    if (this.waiters.length > 0) {
-      const waiter = this.waiters.shift()!;
-      waiter.resolve({ value: item, done: false });
-      return;
-    }
-
-    const itemBytes = this.measure(item);
-    if (this.bufferedBytes + itemBytes > this.maxBufferedBytes) {
-      // A consumer that stopped reading must not let ACP stdout grow this queue
-      // without bound. Drop what is buffered and fail the turn instead.
-      this.queue = [];
-      this.bufferedBytes = 0;
-      const err = new BridgeHttpError(
-        502,
-        "api_error",
-        "Agent stream buffer exceeded maximum capacity due to slow consumer",
-      );
-      this.errorAndClose(err);
-      try {
-        this.onOverflow?.(err);
-      } catch {}
-      return;
-    }
-
-    this.queue.push(item);
-    this.bufferedBytes += itemBytes;
-  }
-
-  errorAndClose(err: any): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.error = err;
-    this.queue = [];
-    this.bufferedBytes = 0;
-    while (this.waiters.length > 0) {
-      const waiter = this.waiters.shift()!;
-      waiter.reject(err);
-    }
-  }
-
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    while (this.waiters.length > 0) {
-      const waiter = this.waiters.shift()!;
-      waiter.resolve({ value: undefined as any, done: true });
-    }
-  }
-
-  async next(): Promise<IteratorResult<T>> {
-    if (this.queue.length > 0) {
-      const value = this.queue.shift()!;
-      this.bufferedBytes = Math.max(0, this.bufferedBytes - this.measure(value));
-      return { value, done: false };
-    }
-    if (this.closed) {
-      if (this.error) {
-        throw this.error;
-      }
-      return { value: undefined as any, done: true };
-    }
-    return new Promise<IteratorResult<T>>((resolve, reject) => {
-      this.waiters.push({ resolve, reject });
-    });
-  }
-
-  [Symbol.asyncIterator](): AsyncIterator<T> {
-    return this;
-  }
 }
 
 const liveWorkersForExitCleanup = new Set<AgySessionWorker>();
@@ -408,13 +268,19 @@ export class AgySessionWorker {
   steerCancelTimeoutMs?: number;
   steerToolCommitTimeoutMs?: number;
 
-  private _pinned: boolean = false;
+  private pinLeases: number = 0;
+  private manualPinned: boolean = false;
   private capacityListener?: () => void;
   private lastRssSampleAt: number = 0;
   private lastRssBytes: number = 0;
 
+  /**
+   * A worker is held by every owner that currently needs it: the coordinator's
+   * turn (a `pin()` lease) and the admission and side-request paths that set
+   * `pinned` directly. It is evictable only when none of them holds it.
+   */
   get pinned(): boolean {
-    return this._pinned;
+    return this.pinLeases > 0 || this.manualPinned;
   }
 
   /**
@@ -422,10 +288,31 @@ export class AgySessionWorker {
    * parked in the scheduler must be woken instead of polling.
    */
   set pinned(value: boolean) {
-    const next = Boolean(value);
-    if (this._pinned === next) return;
-    this._pinned = next;
-    if (!next) this.notifyCapacityChange();
+    const wasPinned = this.pinned;
+    this.manualPinned = Boolean(value);
+    if (wasPinned && !this.pinned) {
+      this.notifyCapacityChange();
+    }
+  }
+
+  /**
+   * Holds this worker for the caller and returns an idempotent release.
+   *
+   * Leases nest: overlapping holds keep the worker pinned until the last one is
+   * released, and only that release wakes the scheduler's waiters.
+   */
+  pin(): () => void {
+    this.pinLeases += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const wasPinned = this.pinned;
+      this.pinLeases = Math.max(0, this.pinLeases - 1);
+      if (wasPinned && !this.pinned) {
+        this.notifyCapacityChange();
+      }
+    };
   }
 
   setSchedulerCapacityListener(listener: (() => void) | undefined): void {
@@ -438,12 +325,12 @@ export class AgySessionWorker {
    * the worker down so its native session state is never reused half-written.
    */
   private createTurnQueue(): AsyncEventQueue<TurnStreamEvent> {
-    return new AsyncEventQueue<TurnStreamEvent>({
+    return this.turn.beginTurnQueue({
       maxBufferedBytes: this.options.maxTurnBufferBytes,
       onOverflow: () => {
         // The queue has already error-and-closed itself, so the producer that
         // overflowed it can unwind first. Tearing the worker down synchronously
-        // would clear `activeTurnQueue` mid-`push()` and make the caller's own
+        // would clear the turn's queue mid-`push()` and make the caller's own
         // bookkeeping observe `null` from inside an unobserved promise chain.
         queueMicrotask(() => {
           void this.close("turn_buffer_overflow");
@@ -458,27 +345,14 @@ export class AgySessionWorker {
     } catch {}
   }
 
-  private promptSeq = 0;
-  private activePromptSeq = 0;
-  private suppressingSteerCancel = false;
-  private activeTurnQueue: AsyncEventQueue<TurnStreamEvent> | null = null;
-  private pendingPromptPromise: Promise<any> | null = null;
-  private currentThinkingAccumulator: string = "";
+  private readonly turn = new TurnContext();
+  private readonly usage = new StepUsageTracker();
   private unsubscribeSessionUpdate?: () => void;
   private unregisterMcp?: () => void;
   private isClosed = false;
   private readonly toolCommitWaiters = new Set<() => void>();
-  private unreportedUsage: TokenUsageSummary = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadInputTokens: 0,
-    cacheCreationInputTokens: 0,
-  };
   private turnLogs: TurnLogWatch | null = null;
   private turnStderrBaseline: string = "";
-  private heldText: string = "";
-  private promptStepCount: number = 1;
-  private lastReportedStepIdx: number = -1;
   private readonly ownsWorkspaceDir: boolean;
 
   constructor(
@@ -537,7 +411,7 @@ export class AgySessionWorker {
   setExposeThinking(enabled: boolean): void {
     this.options.exposeThinking = enabled;
     if (!enabled) {
-      this.currentThinkingAccumulator = "";
+      this.turn.resetThinking();
     }
   }
 
@@ -825,13 +699,10 @@ export class AgySessionWorker {
           }
           this.nativeSessionId =
             sessionRes?.sessionId || this.options.resumeSessionId;
-          const priorSteps = readConversationStepUsages(
+          this.usage.syncExistingConversation(
             this.account,
             this.nativeSessionId,
           );
-          if (priorSteps.length > 0) {
-            this.lastReportedStepIdx = priorSteps[priorSteps.length - 1]!.idx;
-          }
         } catch {
           this.resumedFromShelf = false;
         }
@@ -918,7 +789,7 @@ export class AgySessionWorker {
 
   private handleSessionUpdate(rawParams: any): void {
     if (!rawParams) return;
-    if (this.suppressingSteerCancel) {
+    if (this.turn.suppressingSteerCancel) {
       const update = rawParams?.update ?? rawParams;
       if (update?.sessionUpdate === "tool_call_update") {
         const callId = update.toolCallId ?? update.id;
@@ -945,8 +816,8 @@ export class AgySessionWorker {
       const chunk = update.content?.text ?? update.text ?? "";
       if (!chunk) return;
 
-      let text = this.heldText + chunk;
-      this.heldText = "";
+      let text = this.turn.heldText + chunk;
+      this.turn.heldText = "";
 
       const marker = text.lastIndexOf(AGENT_ERROR_CORE);
       if (
@@ -954,11 +825,9 @@ export class AgySessionWorker {
         !text.slice(marker + AGENT_ERROR_CORE.length).trim()
       ) {
         const start = text[marker - 1] === "\n" ? marker - 1 : marker;
-        this.heldText = text.slice(start);
+        this.turn.heldText = text.slice(start);
         text = text.slice(0, start);
-        if (this.activeTurnQueue && text) {
-          this.activeTurnQueue.push({ type: "text_delta", text });
-        }
+        if (text) this.turn.pushEvent({ type: "text_delta", text });
         return;
       }
 
@@ -968,24 +837,21 @@ export class AgySessionWorker {
         keep--
       ) {
         if (AGENT_ERROR_MARKER.startsWith(text.slice(-keep))) {
-          this.heldText = text.slice(-keep);
+          this.turn.heldText = text.slice(-keep);
           text = text.slice(0, -keep);
           break;
         }
       }
 
-      if (this.activeTurnQueue && text) {
-        this.activeTurnQueue.push({ type: "text_delta", text });
-      }
+      if (text) this.turn.pushEvent({ type: "text_delta", text });
     } else if (updateType === "agent_thought_chunk") {
       const thinking = update.content?.text ?? update.text ?? "";
       if (
         this.options.exposeThinking !== false &&
-        this.activeTurnQueue &&
+        this.turn.queueOpen &&
         thinking
       ) {
-        this.currentThinkingAccumulator += thinking;
-        this.activeTurnQueue.push({ type: "thinking_delta", thinking });
+        this.turn.appendThinking(thinking);
       }
     } else if (updateType === "tool_call") {
       const callId = update.toolCallId ?? update.id;
@@ -1144,7 +1010,7 @@ export class AgySessionWorker {
   }
 
   private handleFatalToolLoop(reason: string): void {
-    this.finishTurnQueueWith({
+    this.turn.finishWith({
       type: "error",
       status: 500,
       errorType: "api_error",
@@ -1153,39 +1019,23 @@ export class AgySessionWorker {
     void this.close("fatal_tool_loop");
   }
 
-  /**
-   * Pushes the turn's final event, then closes its queue.
-   *
-   * The queue is captured *before* the push because `push()` can overflow it: an
-   * overflow error-and-closes the queue and schedules worker teardown, so
-   * re-reading `this.activeTurnQueue` afterwards could observe `null` and throw
-   * from inside an unobserved `.then()` / `.catch()` chain.
-   */
-  private finishTurnQueueWith(event: TurnStreamEvent): void {
-    const q = this.activeTurnQueue;
-    if (!q) return;
-    q.push(event);
-    if (this.activeTurnQueue === q) this.activeTurnQueue = null;
-    q.close();
-  }
-
   private handleBatchReady(calls: ExposedToolCall[]): void {
-    const q = this.activeTurnQueue;
+    const q = this.turn.takeQueue();
     if (!q) return;
-    this.activeTurnQueue = null;
 
     // 1. If thinking accumulated, yield thinking signature
-    if (
-      this.options.exposeThinking !== false &&
-      this.currentThinkingAccumulator.length > 0
-    ) {
-      const signature = createSyntheticThinkingSignature(
-        this.sessionId,
-        this.currentThinkingAccumulator,
-      );
-      q.push({ type: "thinking_signature", signature });
+    if (this.options.exposeThinking !== false) {
+      const thinking = this.turn.consumeThinkingForSignature();
+      if (thinking.length > 0) {
+        const signature = createSyntheticThinkingSignature(
+          this.sessionId,
+          thinking,
+        );
+        q.push({ type: "thinking_signature", signature });
+      }
+    } else {
+      this.turn.resetThinking();
     }
-    this.currentThinkingAccumulator = "";
 
     // 2. Yield tool_use events
     for (const call of calls) {
@@ -1198,7 +1048,7 @@ export class AgySessionWorker {
     }
 
     // 3. Transition worker state: GENERATING -> AWAITING_TOOL_RESULTS
-    this.promptStepCount++;
+    this.usage.incrementPromptStepCount();
     this.setState("AWAITING_TOOL_RESULTS");
 
     // 4. Settle per-step usage from agy's SQLite WAL (with micro-backoff if the
@@ -1216,33 +1066,17 @@ export class AgySessionWorker {
       cacheCreationInputTokens: 0,
     };
     try {
-      let dbSteps = readConversationStepUsages(
+      const dbSteps = await this.usage.readUnseenStepsWithRetry(
         this.account,
         this.nativeSessionId,
-      ).filter((s) => s.idx > this.lastReportedStepIdx);
-
-      if (dbSteps.length === 0) {
-        const dbPath = resolveConversationDbPath(
-          this.account,
-          this.nativeSessionId,
-        );
-        if (dbPath && fs.existsSync(dbPath)) {
-          for (let attempt = 0; attempt < 3; attempt++) {
-            if (this._state === "CLOSED") break;
-            await new Promise((r) => setTimeout(r, 25));
-            dbSteps = readConversationStepUsages(
-              this.account,
-              this.nativeSessionId,
-            ).filter((s) => s.idx > this.lastReportedStepIdx);
-            if (dbSteps.length > 0) break;
-          }
-        }
-      }
-
+        3,
+        25,
+        { isClosed: () => this._state === "CLOSED" },
+      );
       if (dbSteps.length > 0) {
-        const latest = dbSteps[dbSteps.length - 1]!;
-        this.lastReportedStepIdx = latest.idx;
-        toolStepUsage = settleStepUsage(undefined, 1, [latest]);
+        toolStepUsage = settleStepUsage(undefined, 1, [
+          dbSteps[dbSteps.length - 1]!,
+        ]);
       }
     } catch {}
 
@@ -1391,11 +1225,8 @@ export class AgySessionWorker {
 
     this.broker.openTurnWindow();
     this.setState("GENERATING");
-    this.currentThinkingAccumulator = "";
-    this.heldText = "";
     this.markTurnDiagnosticsStart();
     const queue = this.createTurnQueue();
-    this.activeTurnQueue = queue;
 
     let abortHandler: (() => void) | null = null;
     if (signal) {
@@ -1411,10 +1242,9 @@ export class AgySessionWorker {
       }
     }
 
-    const seq = ++this.promptSeq;
-    this.activePromptSeq = seq;
+    const seq = this.turn.nextPromptEpoch();
 
-    this.pendingPromptPromise = this.conn.request(
+    const promptPromise = this.conn.request(
       "session/prompt",
       {
         sessionId: this.nativeSessionId,
@@ -1422,8 +1252,9 @@ export class AgySessionWorker {
       },
       30 * 60 * 1000, // 30-minute generation watchdog (matches claude_subscription.go)
     );
+    this.turn.pendingPrompt = promptPromise;
 
-    this.pendingPromptPromise
+    promptPromise
       .then((result) => {
         this.handlePromptSuccess(result, seq);
       })
@@ -1450,42 +1281,29 @@ export class AgySessionWorker {
   }
 
   private handlePromptSuccess(result: any, seq?: number): void {
-    if (
-      this.suppressingSteerCancel ||
-      (seq !== undefined && seq !== this.activePromptSeq)
-    ) {
-      try {
-        const stepUsages = readConversationStepUsages(
-          this.account,
-          this.nativeSessionId,
-        );
-        const settledUsage = settleStepUsage(
-          result?.usage,
-          this.promptStepCount,
-          stepUsages.length > 0 ? stepUsages : undefined,
-        );
-        this.unreportedUsage.inputTokens += settledUsage.inputTokens;
-        this.unreportedUsage.outputTokens += settledUsage.outputTokens;
-        this.unreportedUsage.cacheReadInputTokens +=
-          settledUsage.cacheReadInputTokens;
-        this.unreportedUsage.cacheCreationInputTokens +=
-          settledUsage.cacheCreationInputTokens;
-      } catch {}
+    if (this.turn.isSuppressedOrStale(seq)) {
+      // A cancelled steer turn still spent tokens; bank them so the next
+      // reported turn carries them exactly once.
+      this.usage.bankSuppressedPromptTurn(
+        this.account,
+        this.nativeSessionId,
+        result?.usage,
+      );
       return;
     }
 
-    if (this.heldText.includes(AGENT_ERROR_CORE)) {
-      this.heldText = "";
+    if (this.turn.heldText.includes(AGENT_ERROR_CORE)) {
+      this.turn.heldText = "";
       const errorEvent = this.diagnoseTerminationError();
-      this.finishTurnQueueWith(errorEvent);
+      this.turn.finishWith(errorEvent);
       this.setState("IDLE");
-      this.pendingPromptPromise = null;
+      this.turn.pendingPrompt = null;
       return;
     }
 
-    if (this.heldText && this.activeTurnQueue) {
-      this.activeTurnQueue.push({ type: "text_delta", text: this.heldText });
-      this.heldText = "";
+    if (this.turn.heldText) {
+      this.turn.pushEvent({ type: "text_delta", text: this.turn.heldText });
+      this.turn.heldText = "";
     }
 
     if (result?.stopReason === "refusal") {
@@ -1494,64 +1312,37 @@ export class AgySessionWorker {
         diag.type === "error" &&
         (diag.status === 400 || diag.status === 401 || diag.status === 429)
       ) {
-        this.finishTurnQueueWith(diag);
+        this.turn.finishWith(diag);
         this.setState("IDLE");
-        this.pendingPromptPromise = null;
+        this.turn.pendingPrompt = null;
         return;
       }
     }
 
-    const allDbSteps = readConversationStepUsages(
+    const promptUsage: TokenUsageSummary = this.usage.settlePromptTurn(
       this.account,
       this.nativeSessionId,
-    );
-    const unseenDbSteps = allDbSteps.filter(
-      (s) => s.idx > this.lastReportedStepIdx,
-    );
-    if (unseenDbSteps.length > 0) {
-      this.lastReportedStepIdx = unseenDbSteps[unseenDbSteps.length - 1]!.idx;
-    }
-    const settledUsage = settleStepUsage(
       result?.usage,
-      this.promptStepCount,
-      unseenDbSteps.length > 0 ? unseenDbSteps : undefined,
     );
-    this.promptStepCount = 1;
-
-    const promptUsage: TokenUsageSummary = settledUsage;
 
     if (this._state === "GENERATING") {
       this.broker.markHttpTurnClosed();
 
-      if (
-        this.options.exposeThinking !== false &&
-        this.currentThinkingAccumulator.length > 0 &&
-        this.activeTurnQueue
-      ) {
-        const signature = createSyntheticThinkingSignature(
-          this.sessionId,
-          this.currentThinkingAccumulator,
-        );
-        this.activeTurnQueue.push({ type: "thinking_signature", signature });
+      if (this.options.exposeThinking !== false) {
+        const thinking = this.turn.consumeThinkingForSignature();
+        if (thinking.length > 0) {
+          const signature = createSyntheticThinkingSignature(
+            this.sessionId,
+            thinking,
+          );
+          this.turn.pushEvent({ type: "thinking_signature", signature });
+        }
+      } else {
+        this.turn.resetThinking();
       }
-      this.currentThinkingAccumulator = "";
 
-      const usage: TokenUsageSummary = {
-        inputTokens: promptUsage.inputTokens + this.unreportedUsage.inputTokens,
-        outputTokens: promptUsage.outputTokens + this.unreportedUsage.outputTokens,
-        cacheReadInputTokens:
-          promptUsage.cacheReadInputTokens +
-          this.unreportedUsage.cacheReadInputTokens,
-        cacheCreationInputTokens:
-          promptUsage.cacheCreationInputTokens +
-          this.unreportedUsage.cacheCreationInputTokens,
-      };
-      this.unreportedUsage = {
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheReadInputTokens: 0,
-        cacheCreationInputTokens: 0,
-      };
+      const usage: TokenUsageSummary =
+        this.usage.drainWithUnreported(promptUsage);
 
       let stopReason: TurnStopReason = "end_turn";
       if (result?.stopReason === "refusal") {
@@ -1562,8 +1353,8 @@ export class AgySessionWorker {
         stopReason = "stop_sequence";
       }
 
-      if (this.activeTurnQueue && result?.stopReason !== "cancelled") {
-        this.finishTurnQueueWith({
+      if (this.turn.queueOpen && result?.stopReason !== "cancelled") {
+        this.turn.finishWith({
           type: "finish",
           stopReason,
           usage,
@@ -1573,21 +1364,13 @@ export class AgySessionWorker {
       this.setState("IDLE");
     } else {
       this.broker.markHttpTurnClosed();
-      this.unreportedUsage.inputTokens += promptUsage.inputTokens;
-      this.unreportedUsage.outputTokens += promptUsage.outputTokens;
-      this.unreportedUsage.cacheReadInputTokens +=
-        promptUsage.cacheReadInputTokens;
-      this.unreportedUsage.cacheCreationInputTokens +=
-        promptUsage.cacheCreationInputTokens;
+      this.usage.bankUnreported(promptUsage);
     }
-    this.pendingPromptPromise = null;
+    this.turn.pendingPrompt = null;
   }
 
   private handlePromptError(err: any, seq?: number): void {
-    if (
-      this.suppressingSteerCancel ||
-      (seq !== undefined && seq !== this.activePromptSeq)
-    ) {
+    if (this.turn.isSuppressedOrStale(seq)) {
       return;
     }
     this.broker.markHttpTurnClosed();
@@ -1603,10 +1386,10 @@ export class AgySessionWorker {
               message: redactSecrets(err?.message || "ACP prompt failed"),
             };
 
-      this.finishTurnQueueWith(eventToSend);
+      this.turn.finishWith(eventToSend);
       this.setState("IDLE");
     }
-    this.pendingPromptPromise = null;
+    this.turn.pendingPrompt = null;
   }
 
   private async handleClientAbort(): Promise<void> {
@@ -1622,10 +1405,11 @@ export class AgySessionWorker {
     } catch {}
 
     let settled = false;
-    if (this.pendingPromptPromise) {
+    const promptPromise = this.turn.pendingPrompt;
+    if (promptPromise) {
       try {
         await Promise.race([
-          this.pendingPromptPromise.then(
+          promptPromise.then(
             () => {
               settled = true;
             },
@@ -1640,11 +1424,7 @@ export class AgySessionWorker {
       settled = true;
     }
 
-    if (this.activeTurnQueue) {
-      const q = this.activeTurnQueue;
-      this.activeTurnQueue = null;
-      q.close();
-    }
+    this.turn.closeQueue();
 
     if (!settled) {
       await this.close("cancel_timeout");
@@ -1734,7 +1514,7 @@ export class AgySessionWorker {
     // 3. All pending resolved:
     // Case A: No steering prompt parts
     if (steeringPromptParts.length === 0) {
-      if (!this.pendingPromptPromise) {
+      if (!this.turn.pendingPrompt) {
         if (!this.conn || this.isClosed) {
           throw new SteerReplayNeededError(
             "Worker closed while awaiting tool results",
@@ -1771,7 +1551,6 @@ export class AgySessionWorker {
 
       this.setState("GENERATING");
       const queue = this.createTurnQueue();
-      this.activeTurnQueue = queue;
 
       let abortHandler: (() => void) | null = null;
       if (signal) {
@@ -1807,8 +1586,8 @@ export class AgySessionWorker {
     }
 
     // Case B: Steering prompt parts present
-    this.suppressingSteerCancel = true;
-    this.activePromptSeq = ++this.promptSeq;
+    this.turn.suppressingSteerCancel = true;
+    this.turn.nextPromptEpoch();
 
     try {
       await this.waitForActiveToolCallsCommit(
@@ -1819,7 +1598,7 @@ export class AgySessionWorker {
     } catch (err) {
       // The barrier already closed the worker; continuing would talk to a dead
       // connection. Surface a replay request so the coordinator cold-replays.
-      this.suppressingSteerCancel = false;
+      this.turn.suppressingSteerCancel = false;
       throw new SteerReplayNeededError(
         err instanceof Error
           ? err.message
@@ -1827,8 +1606,8 @@ export class AgySessionWorker {
       );
     }
 
-    const oldPromptPromise = this.pendingPromptPromise;
-    this.pendingPromptPromise = null;
+    const oldPromptPromise = this.turn.pendingPrompt;
+    this.turn.pendingPrompt = null;
 
     if (this.conn) {
       try {
@@ -1868,7 +1647,7 @@ export class AgySessionWorker {
       );
     }
 
-    this.suppressingSteerCancel = false;
+    this.turn.suppressingSteerCancel = false;
     this.setState("IDLE");
 
     if (modelSelection) {
@@ -1935,12 +1714,9 @@ export class AgySessionWorker {
       this.unsubscribeSessionUpdate = undefined;
     }
 
-    if (this.activeTurnQueue) {
-      this.activeTurnQueue.errorAndClose(
-        new BridgeHttpError(502, "api_error", `Worker closed: ${reason}`),
-      );
-      this.activeTurnQueue = null;
-    }
+    this.turn.failQueue(
+      new BridgeHttpError(502, "api_error", `Worker closed: ${reason}`),
+    );
 
     for (const waiter of this.toolCommitWaiters) {
       waiter();

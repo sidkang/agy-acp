@@ -1,6 +1,6 @@
 {
   "name": "agy-acp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Multi-account Antigravity CLI (agy acp) model provider plugin for Magpie and OpenCode",
   "type": "module",
   "main": "./opencode.mjs",
@@ -35,7 +35,9 @@
   },
   "scripts": {
     "typecheck": "bun x tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "check": "bun scripts/check-release.mjs",
+    "prepack": "bun x tsc --noEmit && bun scripts/check-release.mjs"
   },
   "devDependencies": {
     "@types/bun": "latest",

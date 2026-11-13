@@ -14,8 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - run: bun install --frozen-lockfile || bun install
       - name: typecheck
         run: HOME=$(mktemp -d) bun x tsc --noEmit
       - name: test
         run: HOME=$(mktemp -d) bun test
+      # The packaging rules the community repository applies, plus the plugin
+      # contracts and the tarball npm would ship (scripts/check-release.mjs).
+      - name: check (release gate)
+        run: HOME=$(mktemp -d) bun scripts/check-release.mjs

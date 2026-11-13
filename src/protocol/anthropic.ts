@@ -1103,9 +1103,16 @@ class PeekedTurnSource {
   readonly ready: Promise<PeekOutcome>;
   private claimed = false;
   private closed = false;
+  private closedPromise: Promise<void> | null = null;
   private drainedAfterFinish = false;
   private drainTimedOut = false;
   private detachPreClaimAbort: (() => void) | null = null;
+  /**
+   * `"sync"` while the caller holds the Response this class was wrapped in and
+   * has not awaited the call; `"async"` once it has, at which point the
+   * finalized Response owns the turn and the synchronous body is detached.
+   */
+  private mode: "sync" | "async" = "sync";
 
   constructor(
     events: AsyncIterable<TurnStreamEvent>,
@@ -1148,6 +1155,19 @@ class PeekedTurnSource {
     return true;
   }
 
+  get isAsync(): boolean {
+    return this.mode === "async";
+  }
+
+  get isClaimed(): boolean {
+    return this.claimed;
+  }
+
+  /** Irreversible: from here on only the finalized Response drives the turn. */
+  promoteToAsync(): void {
+    this.mode = "async";
+  }
+
   /**
    * Steps the upstream one more time after `finish` so a generator that commits
    * its ledger *after* `yield finish` (the session coordinator does) can run to
@@ -1174,23 +1194,30 @@ class PeekedTurnSource {
     }
   }
 
-  /** Releases the upstream turn exactly once. */
-  async close(): Promise<void> {
+  /**
+   * Releases the upstream turn exactly once. Single-flight: `iterator.return()`
+   * and the caller's `onBodyCancel` hook run for the first caller only, however
+   * many bodies, aborts and pumps race to tear the turn down.
+   */
+  close(): Promise<void> {
+    if (this.closedPromise !== null) return this.closedPromise;
     this.clearPreClaimAbort();
-    if (this.closed) return;
     this.closed = true;
-    try {
-      const pending = this.iterator.return?.();
-      // If the drain guard fired, a `next()` is still outstanding and a queued
-      // `return()` would only settle when it does: never block teardown on it.
-      if (this.drainTimedOut) {
-        void Promise.resolve(pending).catch(() => {});
-        return;
+    this.closedPromise = (async (): Promise<void> => {
+      try {
+        const pending = this.iterator.return?.();
+        // If the drain guard fired, a `next()` is still outstanding and a queued
+        // `return()` would only settle when it does: never block teardown on it.
+        if (this.drainTimedOut) {
+          void Promise.resolve(pending).catch(() => {});
+          return;
+        }
+        await pending;
+      } catch {
+        // Upstream teardown failures are not actionable for the caller.
       }
-      await pending;
-    } catch {
-      // Upstream teardown failures are not actionable for the caller.
-    }
+    })();
+    return this.closedPromise;
   }
 
   private async peek(signal?: AbortSignal): Promise<PeekOutcome> {
@@ -1624,28 +1651,24 @@ async function pumpTurnEvents(
 
 interface SseTwin {
   response: Response;
-  /** Takes the turn for this body (and wires abort) unless the twin drives it. */
+  /** Takes the turn for this body (and wires abort) unless it is detached. */
   claim(): void;
 }
 
 /**
- * Tracks which of the two bodies produced by `encodeAnthropicSseResponse` the
- * caller actually holds: `await`ing the call hands back the *finalized* twin,
- * while a purely synchronous caller keeps the placeholder. Only the body the
- * caller holds may claim (and therefore release) the upstream turn.
+ * Builds one Response over the turn.
+ *
+ * `owns` decides whether this body may claim (and therefore release) the turn.
+ * A purely synchronous caller holds the body built for it; once the caller
+ * awaits the call the source is promoted to async and that first body reports
+ * `owns()` false for good, so it can neither drive nor cancel the turn the
+ * finalized body now owns.
  */
-interface TwinBinding {
-  /** The caller invoked `.then`, so it awaits and uses the finalized twin. */
-  awaited: boolean;
-  /** Claims the finalized twin; set once that twin exists. */
-  claimAwaited: (() => void) | null;
-}
-
 function createSseResponse(
   model: string,
   source: PeekedTurnSource,
   signal: AbortSignal | undefined,
-  mayClaim: () => boolean,
+  owns: () => boolean,
   onBodyCancel?: () => void,
 ): SseTwin {
   const channel = createSseChannel();
@@ -1653,8 +1676,8 @@ function createSseResponse(
   let ownsSource = false;
   let released = false;
 
-  // Only a body that claimed the turn may release it: an unclaimed twin must
-  // never cancel a source another body is driving.
+  // Only a body that claimed the turn may release it: a detached body must never
+  // cancel a source another body is driving.
   const releaseSource = (): void => {
     if (!ownsSource || released) return;
     released = true;
@@ -1665,12 +1688,13 @@ function createSseResponse(
     void source.close();
   };
 
-  /** Claims the turn for this body. False when the twin already drives it. */
+  /** Claims the turn for this body. False when it is detached or already taken. */
   const claimSource = (): boolean => {
     if (ownsSource) return true;
+    if (!owns()) return false;
     if (!source.claim()) return false;
     ownsSource = true;
-    // Abort wiring happens here, after the claim: an unclaimed body therefore
+    // Abort wiring happens here, after the claim: a detached body therefore
     // registers zero AbortSignal listeners and can never cancel the live one.
     channel.bindAbort(signal, releaseSource);
     return true;
@@ -1693,7 +1717,7 @@ function createSseResponse(
         if (pumping) return;
         pumping = true;
         if (!claimSource()) {
-          // The other body already drives this turn.
+          // Detached, or the other body already drives this turn.
           channel.finish();
           return;
         }
@@ -1707,14 +1731,15 @@ function createSseResponse(
         channel.finish();
         // A body cancelled before its first `pull()` never claimed the turn, so
         // an unread response would leak the upstream generator (and the session
-        // lock it holds). Claiming here releases it; `mayClaim` keeps the twin
-        // the caller is not holding from cancelling the live one.
-        if (mayClaim()) claim();
+        // lock it holds). Claiming here releases it; a detached body returns
+        // without touching the turn the caller's awaited Response owns.
+        if (!owns()) return;
+        claim();
         releaseSource();
       },
     },
-    // High-water mark 0 keeps the pump lazy: an unused Response (e.g. the
-    // placeholder below) never consumes the upstream iterator.
+    // High-water mark 0 keeps the pump lazy: an unused Response never consumes
+    // the upstream iterator.
     { highWaterMark: 0 },
   );
 
@@ -1727,30 +1752,28 @@ type ResponseThen = (
 ) => Promise<unknown>;
 
 /**
- * Makes an already-usable `Response` also awaitable, resolving to the finalized
- * response (which carries the real status for pre-stream failures).
+ * Makes an already-usable `Response` also awaitable.
  *
  * Both usage styles are supported:
  *   const res = await encodeAnthropicSseResponse(...); // exact status
  *   const res = encodeAnthropicSseResponse(...);       // 200 SSE immediately
  *
- * `onAwait` runs on the first `.then`, which is how the two styles are told
- * apart (`await` calls `.then`; a synchronous caller never does).
+ * The finalized response — the only one that can report a pre-stream failure as
+ * a real HTTP status — is built on the first `.then`, which is exactly what an
+ * `await` does. A purely synchronous caller therefore never pays for a second
+ * Response, and no unattended promise ever tears down the turn it is streaming.
  */
 function asAwaitableResponse(
   response: Response,
-  finalized: Promise<Response>,
-  onAwait: () => void,
+  finalize: () => Promise<Response>,
 ): Response {
   try {
     Object.defineProperty(response, "then", {
       configurable: true,
       enumerable: false,
       writable: true,
-      value: ((onFulfilled, onRejected) => {
-        onAwait();
-        return finalized.then(onFulfilled, onRejected);
-      }) as ResponseThen,
+      value: ((onFulfilled, onRejected) =>
+        finalize().then(onFulfilled, onRejected)) as ResponseThen,
     });
   } catch {
     // A non-extensible Response still streams correctly, it just cannot be awaited.
@@ -1771,48 +1794,55 @@ export function encodeAnthropicSseResponse(
     return jsonErrorResponse(err);
   }
 
-  const binding: TwinBinding = { awaited: false, claimAwaited: null };
-  const claimAwaited = (): void => {
-    if (binding.awaited) binding.claimAwaited?.();
-  };
-  const onAwait = (): void => {
-    binding.awaited = true;
-    claimAwaited();
-  };
-
-  // The placeholder is returned synchronously, so it must not claim the turn on
-  // behalf of a caller that is only going to `await` and use the twin below.
+  // The body a synchronous caller holds. It drives the turn unless the caller
+  // awaits the call, which promotes the source to async mode (see `finalize`).
   const placeholder = createSseResponse(
     model,
     source,
     signal,
-    () => !binding.awaited,
+    () => !source.isAsync,
     onBodyCancel,
   );
 
-  const finalized = source.ready
-    .then(async (outcome) => {
-      if (outcome.kind === "error") {
-        // Release the upstream turn before answering with a real HTTP error:
-        // a coordinator generator suspended at its `yield` would otherwise hold
-        // its session lock forever (`encodeAnthropicSseResponse` is awaited by
-        // every caller, so nobody else will ever pull the stream).
+  let finalized: Promise<Response> | null = null;
+  const finalize = (): Promise<Response> => {
+    if (finalized !== null) return finalized;
+    if (source.isClaimed) {
+      // The caller has already started reading the synchronous body and only now
+      // awaits the call. That body owns the turn, so promoting the source would
+      // detach it mid-stream (`owns()` would turn false and a later `cancel()`
+      // would stop releasing the turn). Answer with the body the caller holds —
+      // after removing its own `then`: resolving a promise with a thenable whose
+      // `then` finalizes back into this same promise would unwrap forever.
+      delete (placeholder.response as { then?: unknown }).then;
+      finalized = Promise.resolve(placeholder.response);
+      return finalized;
+    }
+    // Irreversible: the synchronous body is detached from here on.
+    source.promoteToAsync();
+    finalized = source.ready
+      .then(async (outcome) => {
+        if (outcome.kind === "error") {
+          // Release the upstream turn before answering with a real HTTP error:
+          // a coordinator generator suspended at its `yield` would otherwise
+          // hold its session lock forever.
+          await source.close();
+          return jsonErrorResponse(outcome.error);
+        }
+        const twin = createSseResponse(model, source, signal, () => true, onBodyCancel);
+        // Claim (and arm abort) before `finalized` resolves, so a cancelled or
+        // aborted response still releases the turn before its first `pull()`.
+        twin.claim();
+        return twin.response;
+      })
+      .catch(async (err: unknown) => {
         await source.close();
-        return jsonErrorResponse(outcome.error);
-      }
-      const twin = createSseResponse(model, source, signal, () => true, onBodyCancel);
-      // Claim before `finalized` resolves: an awaited response that is cancelled
-      // or aborted before its first `pull()` must still release the turn.
-      binding.claimAwaited = twin.claim;
-      claimAwaited();
-      return twin.response;
-    })
-    .catch(async (err: unknown) => {
-      await source.close();
-      return jsonErrorResponse(err);
-    });
+        return jsonErrorResponse(err);
+      });
+    return finalized;
+  };
 
-  return asAwaitableResponse(placeholder.response, finalized, onAwait);
+  return asAwaitableResponse(placeholder.response, finalize);
 }
 
 // ---------------------------------------------------------------------------

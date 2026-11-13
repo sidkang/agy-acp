@@ -1,0 +1,161 @@
+# Ships a tagged version of the plugin two ways, from GitHub Actions.
+#
+# - GitHub release: the npm tarball is attached to the tag's release, which is
+#   what `https://github.com/sidkang/agy-acp` installs from (`magpie plugin add
+#   github:sidkang/agy-acp`).
+# - npm: published when this repository is set up to. npm's OIDC Trusted
+#   Publishing needs no secret (`npm trust github agy-acp --file release.yml
+#   --repo sidkang/agy-acp --allow-publish`), and a granular `NPM_TOKEN` secret
+#   is the fallback. While neither exists the npm job says so on the run's
+#   summary and the tag's release still ships, so a tag is never half-done.
+#
+# Every check `ci` runs runs again here against the tagged commit, and the tag
+# must name the version in package.json (`scripts/check-release.mjs --tag`).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (v<major>.<minor>.<patch>); empty for a dry run"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency: release
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      # Empty for a dry run: the jobs that publish key off this, never off the
+      # trigger, so a dispatch either names a tag or ships nothing.
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - name: resolve release tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          tag=""
+          if [ -n "${INPUT_TAG}" ]; then
+            if ! printf '%s' "${INPUT_TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+              echo "::error::tag '${INPUT_TAG}' is not v<major>.<minor>.<patch>" >&2
+              exit 1
+            fi
+            tag="${INPUT_TAG}"
+            ref="refs/tags/${tag}"
+          elif [ "${REF_TYPE}" = "tag" ] && [ "${REF_NAME#v}" != "${REF_NAME}" ]; then
+            tag="${REF_NAME}"
+            ref="refs/tags/${tag}"
+          else
+            # Not a tag: check out what we were given and ship nothing.
+            ref="${DEFAULT_REF}"
+          fi
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "releasing '${tag:-<dry run>}' from ${ref}"
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.meta.outputs.checkout_ref }}
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile || bun install
+      - name: typecheck
+        run: HOME=$(mktemp -d) bun x tsc --noEmit
+      - name: test
+        run: HOME=$(mktemp -d) bun test
+      - name: check (release gate)
+        env:
+          TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          if [ -n "$TAG" ]; then
+            HOME=$(mktemp -d) bun scripts/check-release.mjs --tag "$TAG"
+          else
+            HOME=$(mktemp -d) bun scripts/check-release.mjs
+          fi
+      - name: pack
+        run: npm pack --ignore-scripts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: agy-acp-*.tgz
+          if-no-files-found: error
+
+  github-release:
+    needs: verify
+    if: needs.verify.outputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # creates the tag's release
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ needs.verify.outputs.release_tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-tarball
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.release_tag }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            && gh release upload "$TAG" agy-acp-*.tgz --clobber \
+            || gh release create "$TAG" agy-acp-*.tgz --generate-notes --title "$TAG"
+
+  npm-publish:
+    needs: verify
+    if: needs.verify.outputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # npm's OIDC trusted-publishing exchange
+      contents: read
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # npm 11.5+, which speaks trusted publishing
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-tarball
+      - name: publish
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set +e
+          if [ -n "$NPM_TOKEN" ]; then
+            NODE_AUTH_TOKEN="$NPM_TOKEN" npm publish agy-acp-*.tgz --access public --provenance
+            status=$?
+          else
+            npm publish agy-acp-*.tgz --access public --provenance
+            status=$?
+          fi
+          if [ $status -ne 0 ]; then
+            {
+              echo "### npm publish did not run"
+              echo
+              echo "The tag's GitHub release shipped the tarball, which is what"
+              echo "\`magpie plugin add github:sidkang/agy-acp\` installs. To also"
+              echo "publish on npm, either name this workflow as the package's"
+              echo "Trusted Publisher:"
+              echo
+              echo '```sh'
+              echo "npx npm@latest trust github agy-acp --file release.yml --repo sidkang/agy-acp --allow-publish -y"
+              echo '```'
+              echo
+              echo "or add a granular \`NPM_TOKEN\` repository secret."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "npm publish was skipped or refused (exit $status); the GitHub release is unaffected."
+            exit 0
+          fi

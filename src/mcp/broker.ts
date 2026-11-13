@@ -14,6 +14,7 @@ import { randomBytes } from "node:crypto"
 
 import { BridgeHttpError } from "../types"
 import type { NormalizedAnthropicRequest, NormalizedToolDef, ToolChoiceSpec } from "../types"
+import { fitInlineImage } from "../protocol/images"
 import { normalizeToolDefinitions } from "./schema/sanitizer"
 
 export interface ExposedToolCall {
@@ -124,10 +125,14 @@ function toExposedCall(call: ParkedCall): ExposedToolCall {
 
 function toMcpResult(delivery: ToolResultDelivery): McpCallToolResult {
   const content: McpContent[] = delivery.content.length
-    ? delivery.content.map((part) =>
-      part.type === "text"
-        ? { type: "text", text: part.text }
-        : { type: "image", data: part.data, mimeType: part.mediaType })
+    ? delivery.content.map((part) => {
+      if (part.type === "text") return { type: "text", text: part.text }
+      // A tool can return a screenshot straight from disk: an oversized image is
+      // re-encoded the way Magpie's Claude bridge does, and one that already fits
+      // (or cannot be read) comes back byte for byte.
+      const fitted = fitInlineImage(part.mediaType, part.data)
+      return { type: "image", data: fitted.data, mimeType: fitted.mediaType }
+    })
     : [{ type: "text", text: "" }]
   const result: McpCallToolResult = { content }
   if (delivery.isError) result.isError = true
