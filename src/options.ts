@@ -79,7 +79,7 @@ export function buildProviderOptionSchemas(
       key: "minimal_agent",
       label: "Minimal agent system prompt",
       description:
-        "Set excludeDefaultComponents on the bridge agent to save ~7-8K native prompt tokens; requests look less like default agy CLI.",
+        "Set excludeDefaultComponents on the bridge agent to trim ~1.6K native prompt tokens (1,991 -> 389); requests look slightly less like default agy CLI.",
       default: initialDefault(
         "minimal_agent",
         "AGY_MAGPIE_MINIMAL_AGENT",
@@ -90,7 +90,7 @@ export function buildProviderOptionSchemas(
         zh: "精简内置系统提示词",
       },
       descriptions: {
-        zh: "开启 excludeDefaultComponents 可省去约 7-8K 内置提示词 Token，但上游看到的请求形态不再与默认 agy 完全一致。",
+        zh: "开启 excludeDefaultComponents 可再省约 1.6K 内置提示词 Token（从 1,991 降至 389），但上游请求形态与默认 agy 略有差异。",
       },
     },
     {
