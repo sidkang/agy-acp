@@ -461,10 +461,13 @@ export class AgySessionWorker {
       if (
         this.options.workDir &&
         path.isAbsolute(this.options.workDir) &&
-        !/[\r\n\0]/.test(this.options.workDir) &&
-        fs.existsSync(this.options.workDir)
+        !/[\r\n\0]/.test(this.options.workDir)
       ) {
-        args.push("--add-dir", this.options.workDir);
+        try {
+          if (fs.statSync(this.options.workDir).isDirectory()) {
+            args.push("--add-dir", this.options.workDir);
+          }
+        } catch {}
       }
 
       if (this.options.spawnFn) {
@@ -1101,7 +1104,7 @@ export class AgySessionWorker {
         sessionId: this.nativeSessionId,
         prompt,
       },
-      0,
+      30 * 60 * 1000, // 30-minute generation watchdog (matches claude_subscription.go)
     );
 
     this.pendingPromptPromise
@@ -1112,13 +1115,20 @@ export class AgySessionWorker {
         this.handlePromptError(err, seq);
       });
 
+    let completedTurn = false;
     try {
       for await (const event of queue) {
+        if (event.type === "finish" || event.type === "error") {
+          completedTurn = true;
+        }
         yield event;
       }
     } finally {
       if (signal && abortHandler) {
         signal.removeEventListener("abort", abortHandler);
+      }
+      if (!completedTurn && this.state === "GENERATING") {
+        await this.handleClientAbort();
       }
     }
   }
@@ -1479,13 +1489,20 @@ export class AgySessionWorker {
         }
       }
 
+      let completedTurn = false;
       try {
         for await (const event of queue) {
+          if (event.type === "finish" || event.type === "error") {
+            completedTurn = true;
+          }
           yield event;
         }
       } finally {
         if (signal && abortHandler) {
           signal.removeEventListener("abort", abortHandler);
+        }
+        if (!completedTurn && this.state === "GENERATING") {
+          await this.handleClientAbort();
         }
       }
       return;

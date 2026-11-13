@@ -963,10 +963,19 @@ export function parseAnthropicRequest(
   const sessionId = sessionIdHeader === null ? null : nonEmptyString(sessionIdHeader);
 
   // Subagent / workdir are Claude Code tool-loop context: forwarded, never required.
+  // Magpie percent-encodes `X-Magpie-Work-Dir` (`url.PathEscape(dir)`); decode once here.
   const subagentId =
     nonEmptyString(headerValue(SUBAGENT_HEADER)) ??
     nonEmptyString(headerValue(ALT_SUBAGENT_HEADER));
-  const workDir = nonEmptyString(headerValue(WORKDIR_HEADER));
+  const rawWorkDir = nonEmptyString(headerValue(WORKDIR_HEADER));
+  let workDir: string | null = null;
+  if (rawWorkDir !== null) {
+    try {
+      workDir = nonEmptyString(decodeURIComponent(rawWorkDir));
+    } catch {
+      workDir = rawWorkDir;
+    }
+  }
 
   const metadata = isPlainObject(body.metadata) ? body.metadata : undefined;
   const userId = typeof metadata?.user_id === "string" ? metadata.user_id : undefined;
@@ -1563,6 +1572,7 @@ function createSseResponse(
   model: string,
   source: PeekedTurnSource,
   signal: AbortSignal | undefined,
+  onBodyCancel?: () => void,
 ): Response {
   const channel = createSseChannel();
   let pumping = false;
@@ -1572,6 +1582,9 @@ function createSseResponse(
   // never cancel a source another body is driving.
   const releaseSource = (): void => {
     if (!ownsSource) return;
+    try {
+      onBodyCancel?.();
+    } catch {}
     void source.close();
   };
 
@@ -1644,6 +1657,7 @@ export function encodeAnthropicSseResponse(
   model: string,
   events: AsyncIterable<TurnStreamEvent>,
   signal?: AbortSignal,
+  onBodyCancel?: () => void,
 ): Response {
   let source: PeekedTurnSource;
   try {
@@ -1662,14 +1676,17 @@ export function encodeAnthropicSseResponse(
         await source.close();
         return jsonErrorResponse(outcome.error);
       }
-      return createSseResponse(model, source, signal);
+      return createSseResponse(model, source, signal, onBodyCancel);
     })
     .catch(async (err: unknown) => {
       await source.close();
       return jsonErrorResponse(err);
     });
 
-  return asAwaitableResponse(createSseResponse(model, source, signal), finalized);
+  return asAwaitableResponse(
+    createSseResponse(model, source, signal, onBodyCancel),
+    finalized,
+  );
 }
 
 // ---------------------------------------------------------------------------

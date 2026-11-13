@@ -2313,4 +2313,81 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(w2?.minimalAgent).toBe(true);
     await w2?.close("test_done");
   });
+
+  test("32. Matching-prefix side requests (tools:[] or tool_choice:none) never close or pollute the main tool-bearing worker", async () => {
+    const sideSched = new GlobalScheduler({
+      maxGlobalWorkers: 4,
+      maxPerAccountWorkers: 3,
+      idleTimeoutMs: 60_000,
+    });
+    const sideCoord = new SessionCoordinator({
+      scheduler: sideSched,
+      mcpServer,
+      spawnFn: spawnFakeAcp,
+    });
+    const sessionId = `test-side-prefix-${Date.now()}`;
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+    const tools = [
+      {
+        name: "read",
+        description: "Read file",
+        inputSchema: { type: "object", properties: { path: { type: "string" } } },
+      },
+    ];
+
+    const mainReq: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Main coding session",
+      messages: [{ role: "user", content: [{ type: "text", text: "Hello main" }] }],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    let mainReply = "";
+    for await (const ev of sideCoord.executeTurn(testAccount, mainReq, sel)) {
+      if (ev.type === "text_delta") mainReply += ev.text;
+    }
+    const mainWorker = sideCoord.getActiveWorker(`${testAccount.slotKey}::${sessionId}`);
+    expect(mainWorker).toBeDefined();
+    const committedBefore = mainWorker!.committedMessages.length;
+
+    // Case A: Side request with matching prefix AND tools: []
+    const sideMatchingNoTools: NormalizedAnthropicRequest = {
+      ...mainReq,
+      messages: [
+        ...mainReq.messages,
+        { role: "assistant", content: [{ type: "text", text: mainReply }] },
+        { role: "user", content: [{ type: "text", text: "Generate a 3-word title" }] },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+    };
+    for await (const _ of sideCoord.executeTurn(testAccount, sideMatchingNoTools, sel)) {
+      // consume
+    }
+    expect(sideCoord.getActiveWorker(`${testAccount.slotKey}::${sessionId}`)).toBe(mainWorker);
+    expect(mainWorker!.state).toBe("IDLE");
+    expect(mainWorker!.committedMessages.length).toBe(committedBefore);
+
+    // Case B: Side request with matching prefix, tools kept for cache, and tool_choice: none
+    const sideToolChoiceNone: NormalizedAnthropicRequest = {
+      ...sideMatchingNoTools,
+      tools,
+      toolChoice: { type: "none" },
+    };
+    for await (const _ of sideCoord.executeTurn(testAccount, sideToolChoiceNone, sel)) {
+      // consume
+    }
+    expect(sideCoord.getActiveWorker(`${testAccount.slotKey}::${sessionId}`)).toBe(mainWorker);
+    expect(mainWorker!.state).toBe("IDLE");
+    expect(mainWorker!.committedMessages.length).toBe(committedBefore);
+
+    await sideSched.closeAll("test_done");
+    sideSched.destroy();
+  });
 });

@@ -874,22 +874,52 @@ export class SessionCoordinator {
       this.activeWorkers.get(baseSessionKey) ??
       (existingWorker && !req.subagentId ? existingWorker : undefined);
 
-    const isSideRequest = Boolean(
-      req.tools.length === 0 &&
-        baseWorker &&
-        baseWorker.registeredTools.length > 0 &&
-        !isPrefixMatch(baseWorker.committedMessages, req.messages),
+    const lastMessage = req.messages[req.messages.length - 1];
+    const answersPendingTool = Boolean(
+      baseWorker &&
+        baseWorker.state === "AWAITING_TOOL_RESULTS" &&
+        lastMessage?.role === "user" &&
+        lastMessage.content.some((p) => p.type === "tool_result"),
     );
 
-    if (isSideRequest) {
+    const isSideRequest = Boolean(
+      baseWorker &&
+        baseWorker.registeredTools.length > 0 &&
+        !answersPendingTool &&
+        (req.tools.length === 0 || req.toolChoice.type === "none"),
+    );
+
+    if (isSideRequest && baseWorker) {
       validateNoOrphanToolResults(req.messages);
-      yield* this.executeStatelessTurn(
-        account,
-        req,
-        modelSelection,
-        options,
-        signal,
+      const prevPinned = baseWorker.pinned;
+      // Prefer evicting any OTHER idle session before evicting the parent session
+      // whose title/classifier side request is currently running.
+      const active = this.scheduler.getActiveWorkers();
+      const acctWorkers = active.filter(
+        (w) =>
+          w.account.accountRef === account.accountRef &&
+          w.account.slotKey === account.slotKey,
       );
+      const canSpareAccountSlot =
+        acctWorkers.length < this.scheduler.maxPerAccountWorkers ||
+        acctWorkers.some((w) => w !== baseWorker && !w.pinned && w.state === "IDLE");
+      const canSpareGlobalSlot =
+        active.length < this.scheduler.maxGlobalWorkers ||
+        active.some((w) => w !== baseWorker && !w.pinned && w.state === "IDLE");
+      if (canSpareAccountSlot && canSpareGlobalSlot) {
+        baseWorker.pinned = true;
+      }
+      try {
+        yield* this.executeStatelessTurn(
+          account,
+          req,
+          modelSelection,
+          options,
+          signal,
+        );
+      } finally {
+        baseWorker.pinned = prevPinned;
+      }
       return;
     }
 
@@ -1155,18 +1185,25 @@ export class SessionCoordinator {
       }> = [];
       let fullAnswerText = "";
 
+      let sawError = false;
       for await (const event of worker.startPromptTurn(promptParts, signal)) {
         if (event.type === "tool_use") {
           generatedToolCalls.push(event);
         } else if (event.type === "text_delta") {
           fullAnswerText += event.text;
+        } else if (event.type === "error") {
+          sawError = true;
         } else if (event.type === "finish") {
           commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
         }
         yield event;
       }
 
-      commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+      if (sawError) {
+        this.activeWorkers.delete(sessionKey);
+        this.scheduler.unregisterWorker(worker);
+        await worker.close("turn_error");
+      }
     } finally {
       worker.pinned = false;
     }
@@ -1214,18 +1251,27 @@ export class SessionCoordinator {
       }> = [];
       let fullAnswerText = "";
 
+      let sawError = false;
       for await (const event of worker.startPromptTurn(promptParts, signal)) {
         if (event.type === "tool_use") {
           generatedToolCalls.push(event);
         } else if (event.type === "text_delta") {
           fullAnswerText += event.text;
+        } else if (event.type === "error") {
+          sawError = true;
         } else if (event.type === "finish") {
           commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
         }
         yield event;
       }
 
-      commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+      if (sawError) {
+        for (const [k, w] of this.activeWorkers) {
+          if (w === worker) this.activeWorkers.delete(k);
+        }
+        this.scheduler.unregisterWorker(worker);
+        await worker.close("turn_error");
+      }
     } finally {
       worker.pinned = false;
     }
@@ -1378,6 +1424,7 @@ export class SessionCoordinator {
       let fullAnswerText = "";
 
       let yieldedAny = false;
+      let sawError = false;
       try {
         for await (const event of worker.continueWithToolResults(
           toolResults,
@@ -1390,6 +1437,8 @@ export class SessionCoordinator {
             generatedToolCalls.push(event);
           } else if (event.type === "text_delta") {
             fullAnswerText += event.text;
+          } else if (event.type === "error") {
+            sawError = true;
           } else if (event.type === "finish") {
             commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
           }
@@ -1413,7 +1462,11 @@ export class SessionCoordinator {
         throw err;
       }
 
-      commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
+      if (sawError) {
+        this.activeWorkers.delete(sessionKey);
+        this.scheduler.unregisterWorker(worker);
+        await worker.close("turn_error");
+      }
     } finally {
       worker.pinned = false;
     }
@@ -1426,8 +1479,6 @@ export class SessionCoordinator {
     options: TurnExecutionOptions | undefined,
     signal?: AbortSignal,
   ): AsyncGenerator<TurnStreamEvent> {
-    await this.scheduler.ensureCapacity(account);
-
     const ephemeralSessionId = `ephemeral-${crypto.randomUUID()}`;
     const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
     const worker = new AgySessionWorker(

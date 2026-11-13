@@ -2094,4 +2094,16 @@ describe("cloak.ts", () => {
     expect(texts).toContain("Structured output requirement:");
     expect(texts).toContain('"ok":{"type":"boolean"}');
   });
+
+  test("parseAnthropicRequest percent-decodes X-Magpie-Work-Dir header", () => {
+    const parsed = parseAnthropicRequest(
+      JSON.stringify({
+        model: "agy-acp/gemini-3.8-flash",
+        messages: [{ role: "user", content: "pwd" }],
+      }),
+      new Headers({ "x-magpie-work-dir": "%2FUsers%2Fsid%2FMy%20Project" }),
+      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false },
+    );
+    expect(parsed.workDir).toBe("/Users/sid/My Project");
+  });
 });

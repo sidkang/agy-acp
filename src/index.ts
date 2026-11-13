@@ -215,48 +215,71 @@ async function AntigravityMagpiePlugin(
                     ? fetchInput.headers
                     : undefined),
               );
-              const signal = init.signal ?? undefined;
-
-              const req = parseAnthropicRequest(
-                rawBody,
-                headers,
-                providerOptions,
-              );
-
-              const modelSelection = await catalogService.resolveModel(
-                account,
-                req.model,
-                req.effortOverride,
-                signal,
-              );
-              if (!modelSelection) {
-                throw new BridgeHttpError(
-                  400,
-                  "invalid_request_error",
-                  `Unknown or unavailable Antigravity model: '${req.model}'`,
-                );
+              const callerSignal =
+                init.signal ??
+                (typeof Request !== "undefined" && fetchInput instanceof Request
+                  ? fetchInput.signal
+                  : undefined);
+              const turnAbort = new AbortController();
+              const onCallerAbort = () => turnAbort.abort();
+              if (callerSignal) {
+                if (callerSignal.aborted) {
+                  turnAbort.abort();
+                } else {
+                  callerSignal.addEventListener("abort", onCallerAbort, {
+                    once: true,
+                  });
+                }
               }
+              const signal = turnAbort.signal;
 
-              const events = getCoordinator().executeTurn(
-                account,
-                req,
-                modelSelection,
-                { providerOptions },
-                signal,
-              );
+              try {
+                const req = parseAnthropicRequest(
+                  rawBody,
+                  headers,
+                  providerOptions,
+                );
 
-              if (req.stream) {
-                return await encodeAnthropicSseResponse(
+                const modelSelection = await catalogService.resolveModel(
+                  account,
+                  req.model,
+                  req.effortOverride,
+                  signal,
+                );
+                if (!modelSelection) {
+                  throw new BridgeHttpError(
+                    400,
+                    "invalid_request_error",
+                    `Unknown or unavailable Antigravity model: '${req.model}'`,
+                  );
+                }
+
+                const events = getCoordinator().executeTurn(
+                  account,
+                  req,
+                  modelSelection,
+                  { providerOptions },
+                  signal,
+                );
+
+                if (req.stream) {
+                  return await encodeAnthropicSseResponse(
+                    req.model,
+                    events,
+                    signal,
+                    () => turnAbort.abort(),
+                  );
+                }
+                return await collectAnthropicJsonResponse(
                   req.model,
                   events,
                   signal,
                 );
+              } finally {
+                if (callerSignal && turnAbort.signal.aborted) {
+                  callerSignal.removeEventListener("abort", onCallerAbort);
+                }
               }
-              return await collectAnthropicJsonResponse(
-                req.model,
-                events,
-                signal,
-              );
             } catch (err) {
               return jsonErrorResponse(err);
             }

@@ -63,7 +63,9 @@
 
 ### 已完成对齐项
 - **`tool_choice` 缓存稳定性**：与 `claude_subscription`（`TestClaudeToolChoiceNoneKeepsTheTools`）一致，`tool_choice: none / tool / any` 时保持 `tools/list` 工具目录不变以保护 Prompt Cache 前缀，在 Broker 层做调用拦截与约束提醒。
-- **子代理与标题旁路请求隔离**：识别 `X-Magpie-Subagent` 独立分桶；客户端发来的无工具标题生成 / 摘要旁路请求自动走无状态短会话，绝不挤占或踢掉正在热运行的工具主会话。
+- **工作目录透传与环境消歧**：自动对 Magpie 网关发来的百分号编码头 `X-Magpie-Work-Dir` 执行 `decodeURIComponent` 解码，仅对本机真实存在的绝对目录传递 `--add-dir`，并在系统提示词中追加与 `envElsewhereLeanNote` 对齐的工具运行环境消歧说明。
+- **子代理与标题/分类器旁路请求保护（对齐 `aside()`）**：识别 `X-Magpie-Subagent` 独立分桶；当同一会话已有带工具的主进程时，客户端发来的 `tools: []`（无论是否匹配历史前缀）或 `tool_choice: none` 旁路请求一律走无状态短会话，绝不挤占、污染或误关正在热运行的工具主会话。
+- **仅在完整终态提交会话账本与端到端取消联动**：仅当流正常收到 `finish` 终态事件时才更新 `committedMessages`，中途错误或客户端中断（含 `ReadableStream.cancel()`）会立即触发 `AbortController` 取消底层 ACP 回合并淘汰状态存疑的半截 Worker；同时为 `session/prompt` 配置 30 分钟看门狗超时。
 - **Pi / Claude Code 交互边界恢复**：支持工具执行中途 `steer` 打断（带 `promptSeq` 纪元隔离与取消超时自动重放）、`followUp` 续跑、工具后自动 `/compact` 压缩重开，以及 112 KiB 预算下保头保尾裁剪 `<conversation>`。
 - **结构化输出（`output_config.format` / `response_format`）**：支持 `json_schema` 与 `json_object` 格式约束注入（兼容 Claude Code Prompt Hooks）。
 - **WAL SQLite 逐 Step 用量与缓存读取**：通过只读 URI（Checkpointed WAL 自动走 `?immutable=1`）读取 `gen_metadata`，在 `tool_use` 与 `end_turn` 每一步精确上报 `input_tokens`、`output_tokens` 与 `cache_read_input_tokens`。

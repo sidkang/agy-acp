@@ -155,7 +155,6 @@ export class SessionToolBroker {
   private exposedPending = new Map<string, ParkedCall>()
   /** Late parallel siblings that arrived after the previous HTTP turn closed. */
   private queuedUnexposed: ParkedCall[] = []
-  private resolvedIds = new Set<string>()
 
   private batchTimer: ReturnType<typeof setTimeout> | null = null
   private turnOutputOpen = true
@@ -250,7 +249,6 @@ export class SessionToolBroker {
       if (!call) continue
       this.clearDeadline(call)
       this.exposedPending.delete(delivery.toolUseId)
-      this.resolvedIds.add(delivery.toolUseId)
       call.resolve(toMcpResult(delivery))
     }
 
