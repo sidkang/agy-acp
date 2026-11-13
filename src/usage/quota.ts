@@ -178,12 +178,19 @@ export function parseUsageReport(
       }
 
       const windowName = windowPool ? period.name : `${pool} · ${period.name}`;
+      // A pool with no catalog model to gate can never be an account-wide
+      // routing block: Magpie would otherwise mark every model exhausted.
+      const aside = !quotaRouting || !matchedModels || matchedModels.length === 0;
       if (isKnown) {
-        const used = Math.max(0, Math.min(100, Math.round((1 - fraction!) * 100)));
+        const rawUsed = (1 - fraction!) * 100;
+        const used =
+          fraction! <= 0
+            ? 100
+            : Math.min(99.9, Math.max(0, Math.round(rawUsed * 10) / 10));
         windows.push({
           name: windowName,
           pool: windowPool,
-          aside: !quotaRouting,
+          aside,
           used,
           ...(period.span ? { span: period.span } : {}),
           ...(resetsAt ? { resetsAt } : {}),

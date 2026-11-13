@@ -261,6 +261,57 @@ describe("src/accounts/env.ts", () => {
     delete process.env.ANTIGRAVITY_CONFIG_REL_DIR;
   });
 
+  test("buildAgyEnvAndArgs keeps loopback out of proxies and applies Magpie proxy fallbacks", () => {
+    const isolatedAccount: AccountDescriptor = {
+      slotKey: `agy-isolated:${OTHER_UUID}`,
+      accountRef: OTHER_UUID,
+      mode: "isolated",
+      label: "proxy-test",
+      isolatedHomeDir: resolveIsolatedHomeDir(OTHER_UUID),
+    };
+
+    const prev = {
+      NO_PROXY: process.env.NO_PROXY,
+      no_proxy: process.env.no_proxy,
+      HTTPS_PROXY: process.env.HTTPS_PROXY,
+      https_proxy: process.env.https_proxy,
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      http_proxy: process.env.http_proxy,
+      ALL_PROXY: process.env.ALL_PROXY,
+      all_proxy: process.env.all_proxy,
+      MAGPIE_HTTPS_PROXY: process.env.MAGPIE_HTTPS_PROXY,
+      MAGPIE_HTTP_PROXY: process.env.MAGPIE_HTTP_PROXY,
+      MAGPIE_ALL_PROXY: process.env.MAGPIE_ALL_PROXY,
+    };
+    try {
+      process.env.NO_PROXY = "example.com,localhost";
+      delete process.env.no_proxy;
+      delete process.env.HTTPS_PROXY;
+      delete process.env.https_proxy;
+      delete process.env.HTTP_PROXY;
+      delete process.env.http_proxy;
+      delete process.env.ALL_PROXY;
+      delete process.env.all_proxy;
+      process.env.MAGPIE_HTTPS_PROXY = "http://proxy.example:8443";
+      process.env.MAGPIE_HTTP_PROXY = "http://proxy.example:8080";
+      process.env.MAGPIE_ALL_PROXY = "socks5://proxy.example:1080";
+
+      const result = buildAgyEnvAndArgs(isolatedAccount, ["models"]);
+
+      expect(result.env.NO_PROXY).toBe("example.com,localhost,127.0.0.1,::1");
+      expect(result.env.no_proxy).toBe("127.0.0.1,localhost,::1");
+      expect(result.env.HTTPS_PROXY).toBe("http://proxy.example:8443");
+      expect(result.env.HTTP_PROXY).toBe("http://proxy.example:8080");
+      expect(result.env.ALL_PROXY).toBe("socks5://proxy.example:1080");
+      expect(result.env.USERPROFILE).toBe(isolatedAccount.isolatedHomeDir!);
+    } finally {
+      for (const [key, value] of Object.entries(prev)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   test("buildAgyEnvAndArgs preserves host settings for host accounts", () => {
     const hostAccount: AccountDescriptor = {
       slotKey: "agy",
@@ -406,6 +457,7 @@ exit 1
       if (cbResult.type === "success") {
         expect(cbResult.metadata.mode).toBe("isolated");
         expect(cbResult.metadata.label).toBe("test-auth-user");
+        expect(cbResult.metadata.email).toMatch(/^test-auth-user \([0-9a-f]{8}\)$/);
       }
 
       // Verify single-use callback guard
@@ -590,6 +642,14 @@ describe("src/usage/catalog.ts", () => {
     expect(gptFamily?.rawModelId).toBe("gpt-oss-120b-medium");
     const gptRaw = resolveRequestedModel("gpt-oss-120b-medium", catalog);
     expect(gptRaw?.rawModelId).toBe("gpt-oss-120b-medium");
+
+    // Magpie's 1M-context suffix is not part of the agy model id.
+    const opus1m = resolveRequestedModel("claude-opus-5-5-low[1m]", catalog);
+    expect(opus1m?.rawModelId).toBe("claude-opus-5-5-low");
+    const orchestrator1m = resolveRequestedModel("gemini-pro-orchestrator[1m]", catalog);
+    expect(orchestrator1m?.rawModelId).toBe("gemini-pro-orchestrator");
+    const flashFamily1m = resolveRequestedModel("gemini-3.8-flash[1m]", catalog, "low");
+    expect(flashFamily1m?.rawModelId).toBe("gemini-3.8-flash-low");
   });
 
   test("closestEffort picks closest effort in EFFORT_ORDER", () => {
@@ -624,6 +684,24 @@ describe("src/usage/catalog.ts", () => {
     // gpt-oss-120b-medium entry
     const gptRaw = providerModels["gpt-oss-120b-medium"];
     expect(gptRaw).toBeDefined();
+  });
+
+  test("buildProviderModels marks fallback catalogs with Magpie's non-enumerable fellBack symbol", () => {
+    const rawList = parseAgyModelsOutput(REAL_AGY_MODELS_OUTPUT);
+    const fellBackKey = Symbol.for("magpie.fellBack");
+    const fresh = buildProviderModels(buildCatalog(rawList)) as unknown as Record<string | symbol, unknown>;
+    expect(fresh[fellBackKey]).toBeUndefined();
+
+    const marked = buildProviderModels(buildCatalog(rawList), { fellBack: true }) as unknown as Record<
+      string | symbol,
+      unknown
+    >;
+    expect(marked[fellBackKey]).toBe(true);
+    const descriptor = Object.getOwnPropertyDescriptor(marked, fellBackKey);
+    expect(descriptor?.enumerable).toBe(false);
+
+    const staticModels = buildProviderModels(getStaticFallbackCatalog()) as unknown as Record<string | symbol, unknown>;
+    expect(staticModels[fellBackKey]).toBe(true);
   });
 
   test("CatalogService returns fallback catalog when CLI is uninitialized or times out", async () => {
@@ -728,11 +806,11 @@ describe("src/usage/quota.ts", () => {
     expect(resNoQr.windows.length).toBe(4);
     expect(resNoQr.windows.every((w) => w.aside === true)).toBe(true);
 
-    // Check Gemini 5h bucket: remaining 0.77066 -> used = round((1 - 0.77066) * 100) = 23%
+    // Check Gemini 5h bucket: remaining 0.77066 -> used = (1 - 0.77066) * 100 = 22.9%
     const gemini5h = resNoQr.windows.find((w) => w.pool === "Gemini" && w.name === "5 hours");
     expect(gemini5h).toBeDefined();
     expect(gemini5h?.pool).toBe("Gemini");
-    expect(gemini5h?.used).toBe(23);
+    expect(gemini5h?.used).toBe(22.9);
     expect(gemini5h?.span).toBe(18000);
     expect(gemini5h?.resetsAt).toBe("2026-11-13T04:25:05.000Z");
     expect(gemini5h?.models).toEqual(["gemini-3.8-flash", "gemini-3.8-flash-low", "gemini-4-hydrogen"]);
@@ -792,6 +870,71 @@ describe("src/usage/quota.ts", () => {
     expect(unmeasured.used).toBeNull();
     expect(unmeasured.display).toBe("Limits not available");
     expect(unmeasured.aside).toBe(true); // Always true for unmeasured
+  });
+
+  test("parseUsageReport keeps fractional precision and never rounds a partially exhausted bucket to 100", () => {
+    const report = {
+      status: "SUCCESS",
+      command: {
+        name: "usage",
+        data: {
+          groups: [
+            {
+              name: "Gemini Models",
+              buckets: [
+                {
+                  id: "gemini-nearly-empty",
+                  name: "Five Hour Limit Remaining",
+                  window: "5h",
+                  remaining_fraction: 0.004,
+                },
+                {
+                  id: "gemini-empty",
+                  name: "Weekly Limit Remaining",
+                  window: "weekly",
+                  remaining_fraction: 0,
+                },
+              ],
+            },
+          ],
+        },
+      },
+    };
+
+    const res = parseUsageReport(report, ["gemini-3.8-flash"], { quotaRouting: true });
+    const nearlyEmpty = res.windows.find((w) => w.name === "5 hours");
+    expect(nearlyEmpty?.used).toBe(99.6);
+    expect(nearlyEmpty?.used).toBeLessThan(100);
+    expect(res.windows.find((w) => w.name === "7 days")?.used).toBe(100);
+  });
+
+  test("parseUsageReport leaves a pool with no matching catalog models aside even with quotaRouting", () => {
+    const report = {
+      status: "SUCCESS",
+      command: {
+        name: "usage",
+        data: {
+          groups: [
+            {
+              name: "Comet Models",
+              buckets: [
+                {
+                  id: "comet-5h",
+                  name: "Five Hour Limit Remaining",
+                  window: "5h",
+                  remaining_fraction: 0,
+                },
+              ],
+            },
+          ],
+        },
+      },
+    };
+
+    const res = parseUsageReport(report, ["gemini-3.8-flash"], { quotaRouting: true });
+    expect(res.windows).toHaveLength(1);
+    expect(res.windows[0]?.models).toBeUndefined();
+    expect(res.windows[0]?.aside).toBe(true);
   });
 
   test("queryAccountUsage single-flights and caches results for 30 seconds", async () => {

@@ -17,8 +17,8 @@ import {
   SESSION_ID_HEADER,
 } from "./protocol/anthropic";
 import {
+  buildProviderOptionSchemas,
   PROVIDER_ID,
-  PROVIDER_OPTION_SCHEMAS,
   readProviderOptions,
 } from "./options";
 
@@ -51,11 +51,56 @@ async function readRequestBody(
   return "";
 }
 
+function requestUrlOf(fetchInput: RequestInfo | URL): string {
+  if (typeof fetchInput === "string") return fetchInput;
+  if (fetchInput instanceof URL) return fetchInput.href;
+  if (typeof Request !== "undefined" && fetchInput instanceof Request) {
+    return fetchInput.url;
+  }
+  return String(fetchInput);
+}
+
+function readHeaderValue(headers: unknown, name: string): string | undefined {
+  if (!headers) return undefined;
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    const value = headers.get(name);
+    return value && value.trim() ? value.trim() : undefined;
+  }
+  if (typeof headers === "object") {
+    const lower = name.toLowerCase();
+    for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+      if (key.toLowerCase() === lower && typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+  }
+  return undefined;
+}
+
+function subagentOf(hookInput: Record<string, any> | undefined): string | undefined {
+  if (!hookInput) return undefined;
+  const direct =
+    hookInput.subagentID ??
+    hookInput.subagentId ??
+    hookInput.subagent ??
+    hookInput.model?.subagentID ??
+    hookInput.model?.subagentId ??
+    hookInput.model?.subagent ??
+    hookInput.message?.subagentID ??
+    hookInput.message?.subagentId ??
+    hookInput.message?.subagent;
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  return (
+    readHeaderValue(hookInput.headers, "x-magpie-subagent") ??
+    readHeaderValue(hookInput.header, "x-magpie-subagent")
+  );
+}
+
 async function AntigravityMagpiePlugin(
   input?: MagpiePluginInput,
   pkgOptions?: Record<string, unknown>,
 ) {
-  const scheduler = new GlobalScheduler();
+  const scheduler = new GlobalScheduler({ installSignalHandlers: true });
   const mcpServer = getSharedMcpServer();
   const catalogService = new CatalogService();
   const coordinator = new SessionCoordinator({
@@ -71,12 +116,10 @@ async function AntigravityMagpiePlugin(
   return {
     config: async (cfg: Record<string, any>) => {
       cfg.provider ??= {};
-      cfg.provider[PROVIDER_ID] = {
-        ...(cfg.provider[PROVIDER_ID] ?? {}),
-        name: "Antigravity ACP",
-        npm: "@ai-sdk/anthropic",
-        api: "agy://local",
-      };
+      const entry = (cfg.provider[PROVIDER_ID] ??= {});
+      entry.name ??= "Antigravity ACP";
+      entry.npm ??= "@ai-sdk/anthropic";
+      entry.api ??= "agy://local";
     },
 
     auth: {
@@ -84,7 +127,7 @@ async function AntigravityMagpiePlugin(
       single: false,
       maxConcurrency: 16,
       maxAccounts: 0,
-      options: PROVIDER_OPTION_SCHEMAS,
+      options: buildProviderOptionSchemas(pkgOptions),
       methods: createAuthMethods(),
 
       usage: async (
@@ -122,6 +165,26 @@ async function AntigravityMagpiePlugin(
             init: RequestInit = {},
           ): Promise<Response> => {
             try {
+              const requestUrl = requestUrlOf(fetchInput);
+              const rawBody = await readRequestBody(fetchInput, init);
+
+              // Token counting never needs a real agy session. Answer it
+              // locally so Magpie/Claude Code's count_tokens probe is cheap and
+              // cannot race a model probe by spawning `agy acp`.
+              if (/\/count[_-]tokens(?:$|[/?#])/i.test(requestUrl)) {
+                try {
+                  JSON.parse(rawBody);
+                } catch {
+                  throw new BridgeHttpError(
+                    400,
+                    "invalid_request_error",
+                    "Invalid JSON request body",
+                  );
+                }
+                const input_tokens = Math.max(1, Math.ceil(rawBody.length / 4));
+                return Response.json({ input_tokens });
+              }
+
               const rawAuth = await getAuth();
               const account = resolveAccountDescriptor(boundSlotKey, rawAuth);
               const providerOptions = readProviderOptions(input, pkgOptions);
@@ -133,7 +196,6 @@ async function AntigravityMagpiePlugin(
                     ? fetchInput.headers
                     : undefined),
               );
-              const rawBody = await readRequestBody(fetchInput, init);
               const signal = init.signal ?? undefined;
 
               const req = parseAnthropicRequest(
@@ -146,6 +208,7 @@ async function AntigravityMagpiePlugin(
                 account,
                 req.model,
                 req.effortOverride,
+                signal,
               );
               if (!modelSelection) {
                 throw new BridgeHttpError(
@@ -196,20 +259,53 @@ async function AntigravityMagpiePlugin(
         }
         const slotKey = currentSlotKey();
         const account = resolveAccountDescriptor(slotKey, ctx.auth);
-        const catalog = await catalogService.getCatalog(account, {
+        return await catalogService.getModels(account, {
           signal: ctx.signal,
+          includeRawIds: true,
         });
-        return buildProviderModels(catalog, { includeRawIds: true });
       },
     },
 
     "chat.headers": async (
-      hookInput: { sessionID?: string } | undefined,
+      hookInput:
+        | {
+            sessionID?: string;
+            model?: {
+              providerID?: string;
+              subagentID?: string;
+              subagentId?: string;
+              subagent?: string;
+            };
+            provider?: { info?: { id?: string } };
+            message?: {
+              model?: { providerID?: string };
+              subagentID?: string;
+              subagentId?: string;
+              subagent?: string;
+            };
+            subagentID?: string;
+            subagentId?: string;
+            subagent?: string;
+            headers?: Headers | Record<string, string>;
+            header?: Headers | Record<string, string>;
+          }
+        | undefined,
       output: { headers: Record<string, string> },
     ) => {
+      const pid =
+        hookInput?.model?.providerID ??
+        hookInput?.message?.model?.providerID ??
+        hookInput?.provider?.info?.id;
+      if (pid && pid !== PROVIDER_ID) return;
+
       if (hookInput?.sessionID && hookInput.sessionID.trim()) {
         output.headers[SESSION_ID_HEADER] = hookInput.sessionID.trim();
       }
+
+      // Magpie tells the plugin's fetch which subagent asked (X-Magpie-Subagent).
+      // Forward it when the host exposes it through the hook input as well.
+      const subagent = subagentOf(hookInput as Record<string, any> | undefined);
+      if (subagent) output.headers["x-magpie-subagent"] = subagent;
     },
   };
 }

@@ -147,6 +147,50 @@ export interface SpawnAgyOptions {
   extraEnv?: Record<string, string>;
 }
 
+const LOOPBACK_NO_PROXY_HOSTS = ["127.0.0.1", "localhost", "::1"] as const;
+
+/**
+ * Appends the loopback hosts to a NO_PROXY-style string, preserving existing
+ * comma-separated entries and never duplicating one (case-insensitively).
+ */
+function withLoopbackNoProxy(current: string | undefined): string {
+  const existing = typeof current === "string" ? current : "";
+  const seen = new Set(
+    existing
+      .split(",")
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const missing = LOOPBACK_NO_PROXY_HOSTS.filter((host) => !seen.has(host));
+  if (missing.length === 0) return existing;
+  const base = existing.replace(/[\s,]+$/, "");
+  return base ? `${base},${missing.join(",")}` : missing.join(",");
+}
+
+/**
+ * Copies MAGPIE_* proxy variables into the conventional proxy variables when
+ * neither the upper- nor lower-case form is set. This lets background work
+ * outside Magpie's `via` proxy context (usage refreshes, model probes) use the
+ * proxy configured for the plugin.
+ */
+function applyMagpieProxyFallbacks(env: NodeJS.ProcessEnv): void {
+  const pairs: Array<[string, string, string]> = [
+    ["HTTPS_PROXY", "https_proxy", "MAGPIE_HTTPS_PROXY"],
+    ["HTTP_PROXY", "http_proxy", "MAGPIE_HTTP_PROXY"],
+    ["ALL_PROXY", "all_proxy", "MAGPIE_ALL_PROXY"],
+  ];
+  for (const [upper, lower, magpieKey] of pairs) {
+    const upperValue = env[upper];
+    const lowerValue = env[lower];
+    if (typeof upperValue === "string" && upperValue.trim() !== "") continue;
+    if (typeof lowerValue === "string" && lowerValue.trim() !== "") continue;
+    const fallback = process.env[magpieKey];
+    if (typeof fallback === "string" && fallback.trim() !== "") {
+      env[upper] = fallback;
+    }
+  }
+}
+
 /**
  * Builds the environment and arguments for spawning `agy`.
  * - Resolves `bin = resolveAgyBinary()` before modifying PATH.
@@ -166,12 +210,42 @@ export function buildAgyEnvAndArgs(
 
   const env: NodeJS.ProcessEnv = { ...process.env };
 
+  // Bun exposes proxy variables as non-enumerable process.env accessors, so a
+  // plain spread drops them. Copy them explicitly before applying defaults.
+  for (const key of [
+    "NO_PROXY",
+    "no_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+  ]) {
+    const value = process.env[key];
+    if (typeof value === "string") env[key] = value;
+  }
+
   // Delete cross-contaminating vars
   delete env.GEMINI_API_KEY;
   delete env.GOOGLE_API_KEY;
   delete env.GOOGLE_APPLICATION_CREDENTIALS;
   delete env.ANTIGRAVITY_APP_DATA_DIR;
   delete env.ANTIGRAVITY_CONFIG_REL_DIR;
+
+  // Windows environment variables are case-insensitive, while Node exposes
+  // whichever spelling the parent used. Collapse every `Path` spelling into the
+  // canonical `PATH` before the browser shim is prepended.
+  if (account.mode === "isolated" && process.platform === "win32") {
+    const pathValues: string[] = [];
+    for (const key of Object.keys(env)) {
+      if (key.toUpperCase() !== "PATH") continue;
+      const value = env[key];
+      if (typeof value === "string" && value) pathValues.push(value);
+      delete env[key];
+    }
+    if (pathValues.length > 0) env.PATH = pathValues[0];
+  }
 
   // Browser suppression & auto-update
   env.PATH = `${shimDir}${path.delimiter}${env.PATH ?? HOST_PATH}`;
@@ -184,6 +258,8 @@ export function buildAgyEnvAndArgs(
   if (account.mode === "isolated") {
     const home = account.isolatedHomeDir ?? resolveIsolatedHomeDir(account.accountRef);
     env.HOME = home;
+    // Windows resolves the user's home from USERPROFILE, not HOME.
+    env.USERPROFILE = home;
     // SSH_CONNECTION triggers agy's file-based token storage, bypassing Keychain / SecretService
     env.SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 22";
     env.XDG_CONFIG_HOME = path.join(home, ".config");
@@ -212,6 +288,14 @@ export function buildAgyEnvAndArgs(
   if (options?.extraEnv) {
     Object.assign(env, options.extraEnv);
   }
+
+  applyMagpieProxyFallbacks(env);
+
+  // agy reaches the bridge's MCP server over loopback; a host HTTP proxy must
+  // never intercept those calls. Apply this last so an extraEnv NO_PROXY still
+  // keeps the required loopback entries.
+  env.NO_PROXY = withLoopbackNoProxy(env.NO_PROXY);
+  env.no_proxy = withLoopbackNoProxy(env.no_proxy);
 
   return { bin, finalArgs, env, cwd };
 }

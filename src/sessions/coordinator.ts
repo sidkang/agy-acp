@@ -7,8 +7,13 @@ import {
   type NormalizedContentPart,
   type NormalizedMessage,
   type ProviderOptionsState,
+  type ToolChoiceSpec,
   type TurnStreamEvent,
 } from "../types";
+import {
+  stripVolatileSystem,
+  stripVolatileMessageText,
+} from "../protocol/cloak";
 import {
   AgySessionWorker,
   type ModelSelection,
@@ -37,6 +42,86 @@ export interface SessionCoordinatorOptions {
     opts?: SpawnAgyOptions,
   ) => ChildProcessWithoutNullStreams;
   providerOptions?: ProviderOptionsState;
+}
+
+function stableJson(val: any): string {
+  if (val === null || typeof val !== "object") {
+    return JSON.stringify(val);
+  }
+  if (Array.isArray(val)) {
+    return `[${val.map(stableJson).join(",")}]`;
+  }
+  const keys = Object.keys(val).sort();
+  const pairs = keys.map((k) => `${JSON.stringify(k)}:${stableJson(val[k])}`);
+  return `{${pairs.join(",")}}`;
+}
+
+function getOpeningUserText(messages: NormalizedMessage[]): string {
+  const firstUser = messages.find((m) => m.role === "user");
+  if (!firstUser) return "";
+  const raw = firstUser.content
+    .filter((p) => p.type === "text")
+    .map((p) => (p as any).text)
+    .join(" ");
+  return stripVolatileMessageText(raw).trim();
+}
+
+function getToolChoiceReminder(toolChoice?: ToolChoiceSpec): string | null {
+  if (!toolChoice) return null;
+  if (toolChoice.type === "any") {
+    return "<system-reminder>\nYou must call at least one tool in this turn.\n</system-reminder>";
+  }
+  if (toolChoice.type === "tool") {
+    return `<system-reminder>\nYou must call the '${toolChoice.name}' tool in this turn.\n</system-reminder>`;
+  }
+  return null;
+}
+
+function commitAssistantTurn(
+  worker: AgySessionWorker,
+  req: NormalizedAnthropicRequest,
+  fullAnswerText: string,
+  generatedToolCalls: Array<{
+    type: "tool_use";
+    id: string;
+    name: string;
+    input: Record<string, unknown>;
+  }>,
+): void {
+  const hasPrefill =
+    req.messages.length > 0 &&
+    req.messages[req.messages.length - 1]!.role === "assistant";
+
+  if (hasPrefill) {
+    const lastMsg = req.messages[req.messages.length - 1]!;
+    const mergedContent: NormalizedContentPart[] = [
+      ...lastMsg.content,
+      ...(fullAnswerText
+        ? [{ type: "text" as const, text: fullAnswerText }]
+        : []),
+      ...generatedToolCalls,
+    ];
+    worker.committedMessages = [
+      ...req.messages.slice(0, -1),
+      {
+        role: "assistant",
+        content: mergedContent,
+      },
+    ];
+  } else {
+    worker.committedMessages = [
+      ...req.messages,
+      {
+        role: "assistant",
+        content: [
+          ...(fullAnswerText
+            ? [{ type: "text" as const, text: fullAnswerText }]
+            : []),
+          ...generatedToolCalls,
+        ],
+      },
+    ];
+  }
 }
 
 function validateNoOrphanToolResults(messages: NormalizedMessage[]): void {
@@ -90,25 +175,81 @@ function isToolSetCompatible(
     inputSchema: Record<string, unknown>;
   }>,
 ): boolean {
-  if (registered.length !== incoming.length) return false;
   const regMap = new Map(
-    registered.map((t) => [t.name, JSON.stringify(t.inputSchema)]),
+    registered.map((t) => [t.name, stableJson(t.inputSchema)]),
   );
   for (const t of incoming) {
     const existing = regMap.get(t.name);
-    if (!existing || existing !== JSON.stringify(t.inputSchema)) {
+    if (!existing || existing !== stableJson(t.inputSchema)) {
       return false;
     }
   }
   return true;
 }
 
-function canonicalPartsForLedger(parts: NormalizedContentPart[]): NormalizedContentPart[] {
-  return parts.filter((p) => {
+function canonicalPartsForLedger(
+  parts: NormalizedContentPart[],
+): NormalizedContentPart[] {
+  const filtered = parts.filter((p) => {
     if (p.type === "thinking") return false;
-    if (p.type === "text" && p.text === "" && parts.length > 1) return false;
     return true;
   });
+
+  const merged: NormalizedContentPart[] = [];
+  for (const p of filtered) {
+    if (p.type === "text") {
+      const stripped = stripVolatileMessageText(p.text);
+      if (merged.length > 0 && merged[merged.length - 1]!.type === "text") {
+        (merged[merged.length - 1] as { type: "text"; text: string }).text +=
+          stripped;
+      } else {
+        merged.push({ type: "text", text: stripped });
+      }
+    } else {
+      merged.push(p);
+    }
+  }
+
+  return merged.filter((p) => {
+    if (p.type === "text" && p.text === "" && merged.length > 1) return false;
+    return true;
+  });
+}
+
+function sameToolUseIdentities(
+  pParts: NormalizedContentPart[],
+  fParts: NormalizedContentPart[],
+): boolean {
+  const pTools = pParts.filter(
+    (
+      p,
+    ): p is {
+      type: "tool_use";
+      id: string;
+      name: string;
+      input: Record<string, unknown>;
+    } => p.type === "tool_use",
+  );
+  const fTools = fParts.filter(
+    (
+      p,
+    ): p is {
+      type: "tool_use";
+      id: string;
+      name: string;
+      input: Record<string, unknown>;
+    } => p.type === "tool_use",
+  );
+  if (pTools.length !== fTools.length) return false;
+  for (let i = 0; i < pTools.length; i++) {
+    if (
+      pTools[i]!.id !== fTools[i]!.id ||
+      pTools[i]!.name !== fTools[i]!.name
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function isPrefixMatch(
@@ -120,14 +261,76 @@ function isPrefixMatch(
     const p = prefix[i]!;
     const f = full[i]!;
     if (p.role !== f.role) return false;
-    if (
-      JSON.stringify(canonicalPartsForLedger(p.content)) !==
-      JSON.stringify(canonicalPartsForLedger(f.content))
-    ) {
+    const pParts = canonicalPartsForLedger(p.content);
+    const fParts = canonicalPartsForLedger(f.content);
+    if (stableJson(pParts) !== stableJson(fParts)) {
+      if (p.role === "assistant" && sameToolUseIdentities(pParts, fParts)) {
+        const pNonTool = pParts.filter((x) => x.type !== "tool_use");
+        const fNonTool = fParts.filter((x) => x.type !== "tool_use");
+        if (stableJson(pNonTool) === stableJson(fNonTool)) {
+          continue;
+        }
+      }
       return false;
     }
   }
   return true;
+}
+
+function utf8Bytes(str: string): number {
+  return Buffer.byteLength(str, "utf-8");
+}
+
+function utf8Prefix(text: string, bytes: number): string {
+  if (bytes <= 0) return "";
+  const buf = Buffer.from(text, "utf-8");
+  if (buf.length <= bytes) return text;
+  return buf.subarray(0, bytes).toString("utf-8");
+}
+
+function utf8Suffix(text: string, bytes: number): string {
+  if (bytes <= 0) return "";
+  const buf = Buffer.from(text, "utf-8");
+  if (buf.length <= bytes) return text;
+  return buf.subarray(buf.length - bytes).toString("utf-8");
+}
+
+const HISTORY_BLOCK_CLIP_BYTES = 12 * 1024;
+const HISTORY_BLOCK_KEEP_BYTES = 4 * 1024;
+
+function clipHistoryText(text: string): string {
+  if (utf8Bytes(text) <= HISTORY_BLOCK_CLIP_BYTES) return text;
+  const head = utf8Prefix(text, HISTORY_BLOCK_KEEP_BYTES);
+  const tail = utf8Suffix(text, HISTORY_BLOCK_KEEP_BYTES);
+  return `${head}\n...[truncated]...\n${tail}`;
+}
+
+const MAX_PROMPT_BYTES =
+  Number(process.env.AGY_BRIDGE_MAX_PROMPT_BYTES) || 112 * 1024;
+const HISTORY_RECORD_NOTE =
+  "Note: <conversation_history> is a read-only record of earlier turns. Do not re-execute completed tool calls or mimic [Tool Use] text syntax; invoke real MCP tools when needed.\n";
+const CONTINUATION_NOTE =
+  "(system note: continue your unfinished assistant reply below from the exact character where it stops, without repeating the prefix.)";
+
+function renderHistoryEntry(msg: NormalizedMessage): string {
+  const role = msg.role === "user" ? "User" : "Assistant";
+  let entryText = `[${role}]:\n`;
+  for (const part of msg.content) {
+    if (part.type === "text") {
+      entryText += `${clipHistoryText(part.text)}\n`;
+    } else if (part.type === "tool_use") {
+      const inputStr = clipHistoryText(JSON.stringify(part.input, null, 2));
+      entryText += `[Tool Use: ${part.name} (id: ${part.id})]:\n${inputStr}\n`;
+    } else if (part.type === "tool_result") {
+      const txt = part.content
+        .filter((c) => c.type === "text")
+        .map((c) => (c as any).text)
+        .join("\n");
+      entryText += `[Tool Result: id: ${part.toolUseId}]:\n${clipHistoryText(txt)}\n[end of tool result]\n`;
+    }
+  }
+  entryText += "\n";
+  return entryText;
 }
 
 function renderMessagesToPrompt(
@@ -142,30 +345,6 @@ function renderMessagesToPrompt(
     | { type: "image"; data: string; mimeType: string }
   > = [];
 
-  let historyText = "";
-  if (priorMessages.length > 0) {
-    historyText += "<conversation_history>\n";
-    for (const msg of priorMessages) {
-      const role = msg.role === "user" ? "User" : "Assistant";
-      historyText += `[${role}]:\n`;
-      for (const part of msg.content) {
-        if (part.type === "text") {
-          historyText += `${part.text}\n`;
-        } else if (part.type === "tool_use") {
-          historyText += `[Tool Use: ${part.name} (id: ${part.id})]:\n${JSON.stringify(part.input, null, 2)}\n`;
-        } else if (part.type === "tool_result") {
-          const txt = part.content
-            .filter((c) => c.type === "text")
-            .map((c) => (c as any).text)
-            .join("\n");
-          historyText += `[Tool Result: id: ${part.toolUseId}]:\n${txt}\n`;
-        }
-      }
-      historyText += "\n";
-    }
-    historyText += "</conversation_history>\n\n";
-  }
-
   const hasPrefill =
     currentMessages.length > 0 &&
     currentMessages[currentMessages.length - 1]!.role === "assistant";
@@ -177,9 +356,13 @@ function renderMessagesToPrompt(
     ? currentMessages[currentMessages.length - 1]
     : undefined;
 
-  let turnText = "<current_turn>\n";
-  for (const msg of userMessages) {
-    for (const part of msg.content) {
+  const isSingleWarmMessage =
+    priorMessages.length === 0 && !hasPrefill && userMessages.length === 1;
+
+  let turnText = "";
+  if (isSingleWarmMessage) {
+    const singleMsg = userMessages[0]!;
+    for (const part of singleMsg.content) {
       if (part.type === "text") {
         turnText += `${part.text}\n`;
       } else if (part.type === "tool_result") {
@@ -187,21 +370,88 @@ function renderMessagesToPrompt(
           .filter((c) => c.type === "text")
           .map((c) => (c as any).text)
           .join("\n");
-        turnText += `[Tool Result: id: ${part.toolUseId}]:\n${txt}\n`;
+        turnText += `[Tool Result: id: ${part.toolUseId}]:\n${txt}\n[end of tool result]\n`;
       }
     }
+  } else {
+    turnText = "<current_turn>\n";
+    for (const msg of userMessages) {
+      for (const part of msg.content) {
+        if (part.type === "text") {
+          turnText += `${part.text}\n`;
+        } else if (part.type === "tool_result") {
+          const txt = part.content
+            .filter((c) => c.type === "text")
+            .map((c) => (c as any).text)
+            .join("\n");
+          turnText += `[Tool Result: id: ${part.toolUseId}]:\n${txt}\n[end of tool result]\n`;
+        }
+      }
+    }
+    turnText += "</current_turn>\n";
   }
-  turnText += "</current_turn>\n";
 
   let prefillText = "";
   if (prefillMessage) {
-    prefillText = "\n<assistant_prefill>\n";
+    let prefillContent = "";
     for (const part of prefillMessage.content) {
       if (part.type === "text") {
-        prefillText += `${part.text}\n`;
+        prefillContent += part.text;
       }
     }
-    prefillText += "</assistant_prefill>\n";
+    prefillText = `\n<assistant_prefill>\n${prefillContent}\n${CONTINUATION_NOTE}\n</assistant_prefill>\n`;
+  }
+
+  const currentBytes = utf8Bytes(turnText + prefillText);
+  let historyText = "";
+
+  if (priorMessages.length > 0) {
+    const historyHeader = "<conversation_history>\n";
+    const historyFooter = HISTORY_RECORD_NOTE + "</conversation_history>\n\n";
+    const frameBytes = utf8Bytes(historyHeader + historyFooter);
+    const availableForHistory = Math.max(
+      0,
+      MAX_PROMPT_BYTES - currentBytes - frameBytes,
+    );
+
+    const historyEntries = priorMessages.map((m) => renderHistoryEntry(m));
+    const totalHistBytes = historyEntries.reduce(
+      (sum, e) => sum + utf8Bytes(e),
+      0,
+    );
+
+    if (totalHistBytes <= availableForHistory) {
+      historyText =
+        historyHeader + historyEntries.join("") + historyFooter;
+    } else {
+      let omittedCount = 0;
+      let startIndex = 0;
+      while (startIndex < historyEntries.length) {
+        const omitNote = `[... omitted ${omittedCount + 1} earlier messages ...]\n`;
+        const omitBytes = utf8Bytes(omitNote);
+        const remainingBytes = historyEntries
+          .slice(startIndex + 1)
+          .reduce((sum, e) => sum + utf8Bytes(e), 0);
+        if (remainingBytes + omitBytes <= availableForHistory) {
+          startIndex++;
+          omittedCount++;
+          historyText =
+            historyHeader +
+            omitNote +
+            historyEntries.slice(startIndex).join("") +
+            historyFooter;
+          break;
+        }
+        startIndex++;
+        omittedCount++;
+      }
+      if (!historyText && omittedCount > 0) {
+        historyText =
+          historyHeader +
+          `[... omitted ${priorMessages.length} earlier messages ...]\n` +
+          historyFooter;
+      }
+    }
   }
 
   const combinedText = `${historyText}${turnText}${prefillText}`.trim();
@@ -235,6 +485,20 @@ function renderMessagesToPrompt(
   return parts;
 }
 
+interface ParkedSession {
+  nativeSessionId: string;
+  committedMessages: NormalizedMessage[];
+  systemPrompt?: string;
+  registeredTools: Array<{
+    name: string;
+    description?: string;
+    inputSchema: Record<string, unknown>;
+  }>;
+  workDir?: string;
+  resumeSupported: boolean;
+  parkedAt: number;
+}
+
 export class SessionCoordinator {
   readonly scheduler: GlobalScheduler;
   readonly mcpServer: LoopbackMcpServer;
@@ -247,12 +511,49 @@ export class SessionCoordinator {
 
   private readonly sessionLocks = new Map<string, Promise<void>>();
   private readonly activeWorkers = new Map<string, AgySessionWorker>();
+  private readonly parkedSessions = new Map<string, ParkedSession>();
 
   constructor(options: SessionCoordinatorOptions) {
     this.scheduler = options.scheduler;
     this.mcpServer = options.mcpServer;
     this.defaultSpawnFn = options.spawnFn;
     this.providerOptions = options.providerOptions;
+
+    const prevEvict = this.scheduler.onBeforeEvictIdle;
+    (this.scheduler as any).onBeforeEvictIdle = (worker: AgySessionWorker) => {
+      try {
+        prevEvict?.(worker);
+      } catch {}
+      this.parkSession(worker);
+    };
+  }
+
+  private parkSession(worker: AgySessionWorker): void {
+    let foundKey: string | null = null;
+    for (const [key, w] of this.activeWorkers) {
+      if (w === worker) {
+        foundKey = key;
+        break;
+      }
+    }
+    if (!foundKey) {
+      foundKey = `${worker.account.slotKey}::${worker.account.accountRef}::${worker.sessionId}`;
+    }
+    if (worker.nativeSessionId) {
+      this.parkedSessions.set(foundKey, {
+        nativeSessionId: worker.nativeSessionId,
+        committedMessages: [...worker.committedMessages],
+        systemPrompt: worker.systemPrompt,
+        registeredTools: [...worker.registeredTools],
+        workDir: worker.workDir,
+        resumeSupported: worker.resumeSupported,
+        parkedAt: Date.now(),
+      });
+      if (this.parkedSessions.size > 64) {
+        const oldestKey = this.parkedSessions.keys().next().value;
+        if (oldestKey) this.parkedSessions.delete(oldestKey);
+      }
+    }
   }
 
   getActiveWorker(sessionKey: string): AgySessionWorker | undefined {
@@ -275,12 +576,20 @@ export class SessionCoordinator {
     signal?: AbortSignal,
   ): AsyncGenerator<TurnStreamEvent> {
     const sessionKey = req.sessionId
-      ? `${account.slotKey}::${account.accountRef}::${req.sessionId}`
+      ? `${account.slotKey}::${account.accountRef}::${req.sessionId}${req.subagentId ? "::sub:" + req.subagentId : ""}`
       : null;
 
     let unlock: (() => void) | null = null;
     let tailPromise: Promise<void> | null = null;
     if (sessionKey) {
+      if (signal?.aborted) {
+        throw new BridgeHttpError(
+          499,
+          "invalid_request_error",
+          "Request was aborted before execution could start",
+        );
+      }
+
       let resolveLock!: () => void;
       const currentLock = new Promise<void>((r) => {
         resolveLock = r;
@@ -288,9 +597,27 @@ export class SessionCoordinator {
       unlock = resolveLock;
 
       const prevLock = this.sessionLocks.get(sessionKey) || Promise.resolve();
-      tailPromise = prevLock.then(() => currentLock);
+      tailPromise = prevLock.then(
+        () => currentLock,
+        () => currentLock,
+      );
       this.sessionLocks.set(sessionKey, tailPromise);
-      await prevLock;
+
+      try {
+        await prevLock;
+      } catch {}
+
+      if (signal?.aborted) {
+        unlock();
+        if (this.sessionLocks.get(sessionKey) === tailPromise) {
+          this.sessionLocks.delete(sessionKey);
+        }
+        throw new BridgeHttpError(
+          499,
+          "invalid_request_error",
+          "Request was aborted while waiting for session lock",
+        );
+      }
     }
 
     try {
@@ -335,8 +662,9 @@ export class SessionCoordinator {
       return;
     }
 
+    const baseSessionKey = `${account.slotKey}::${account.accountRef}::${req.sessionId}`;
     let existingWorker = this.activeWorkers.get(sessionKey);
-    if (!existingWorker && req.sessionId) {
+    if (!existingWorker && !req.subagentId) {
       for (const [key, worker] of this.activeWorkers) {
         const parts = key.split("::");
         if (
@@ -348,6 +676,29 @@ export class SessionCoordinator {
           break;
         }
       }
+    }
+
+    const baseWorker =
+      this.activeWorkers.get(baseSessionKey) ??
+      (existingWorker && !req.subagentId ? existingWorker : undefined);
+
+    const isSideRequest = Boolean(
+      req.tools.length === 0 &&
+        baseWorker &&
+        baseWorker.registeredTools.length > 0 &&
+        !isPrefixMatch(baseWorker.committedMessages, req.messages),
+    );
+
+    if (isSideRequest) {
+      validateNoOrphanToolResults(req.messages);
+      yield* this.executeStatelessTurn(
+        account,
+        req,
+        modelSelection,
+        options,
+        signal,
+      );
+      return;
     }
 
     if (
@@ -362,6 +713,32 @@ export class SessionCoordinator {
       this.scheduler.unregisterWorker(existingWorker);
       await existingWorker.close("account_mismatch");
       existingWorker = undefined;
+    }
+
+    // Fork detection when parent is in AWAITING_TOOL_RESULTS
+    if (
+      existingWorker &&
+      existingWorker.state === "AWAITING_TOOL_RESULTS" &&
+      !req.subagentId
+    ) {
+      const diffSystem =
+        stripVolatileSystem(req.system) !==
+        stripVolatileSystem(existingWorker.systemPrompt);
+      const diffOpening =
+        getOpeningUserText(req.messages) !==
+        getOpeningUserText(existingWorker.committedMessages);
+
+      if (diffSystem && diffOpening) {
+        validateNoOrphanToolResults(req.messages);
+        yield* this.executeStatelessTurn(
+          account,
+          req,
+          modelSelection,
+          options,
+          signal,
+        );
+        return;
+      }
     }
 
     // Case 3: Session in AWAITING_TOOL_RESULTS
@@ -379,7 +756,8 @@ export class SessionCoordinator {
     if (
       existingWorker &&
       existingWorker.state === "IDLE" &&
-      existingWorker.systemPrompt === (req.system || undefined) &&
+      stripVolatileSystem(existingWorker.systemPrompt) ===
+        stripVolatileSystem(req.system) &&
       isToolSetCompatible(existingWorker.registeredTools, req.tools) &&
       isPrefixMatch(existingWorker.committedMessages, req.messages)
     ) {
@@ -420,6 +798,19 @@ export class SessionCoordinator {
   ): AsyncGenerator<TurnStreamEvent> {
     validateNoOrphanToolResults(req.messages);
 
+    const parked = this.parkedSessions.get(sessionKey);
+    let resumeSessionId: string | undefined = undefined;
+    if (
+      parked &&
+      Date.now() - parked.parkedAt < 6 * 3600 * 1000 &&
+      stripVolatileSystem(parked.systemPrompt) ===
+        stripVolatileSystem(req.system) &&
+      isToolSetCompatible(parked.registeredTools, req.tools) &&
+      isPrefixMatch(parked.committedMessages, req.messages)
+    ) {
+      resumeSessionId = parked.nativeSessionId;
+    }
+
     const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
     const workerOptions: WorkerOptions = {
       spawnFn,
@@ -428,6 +819,12 @@ export class SessionCoordinator {
         this.providerOptions?.minimalAgent ??
         false,
       exposeThinking: req.thinkingEnabled,
+      cloakPrompts:
+        options?.providerOptions?.cloakPrompts ??
+        this.providerOptions?.cloakPrompts ??
+        true,
+      workDir: req.workDir,
+      resumeSessionId,
       systemPrompt: req.system,
       tools: req.tools,
       toolChoice: req.toolChoice,
@@ -450,12 +847,24 @@ export class SessionCoordinator {
     this.activeWorkers.set(sessionKey, worker);
 
     try {
-      await worker.start();
+      await worker.start(signal);
     } catch (err) {
       this.activeWorkers.delete(sessionKey);
       this.scheduler.unregisterWorker(worker);
       await worker.close("start_failed");
       throw err;
+    }
+
+    if (worker.resumedFromShelf && parked) {
+      worker.committedMessages = [...parked.committedMessages];
+      this.parkedSessions.delete(sessionKey);
+      yield* this.executeWarmIdleTurn(
+        worker,
+        req,
+        modelSelection,
+        signal,
+      );
+      return;
     }
 
     if (requestHasImages(req.messages) && !worker.imageSupported) {
@@ -467,7 +876,7 @@ export class SessionCoordinator {
       );
     }
 
-    await worker.applyModelSelection(modelSelection);
+    await worker.applyModelSelection(modelSelection, signal);
 
     // Determine prior messages vs current turn
     let priorMessages: NormalizedMessage[] = [];
@@ -486,6 +895,18 @@ export class SessionCoordinator {
     }
 
     const promptParts = renderMessagesToPrompt(priorMessages, currentMessages);
+    const tcReminder = getToolChoiceReminder(req.toolChoice);
+    if (tcReminder) {
+      if (
+        promptParts.length > 0 &&
+        promptParts[promptParts.length - 1]!.type === "text"
+      ) {
+        (promptParts[promptParts.length - 1] as any).text += `\n\n${tcReminder}`;
+      } else {
+        promptParts.push({ type: "text", text: tcReminder });
+      }
+    }
+
     if (req.system && !worker.appendSystemSupported) {
       const sysPrompt = `<system_instructions>\n${req.system}\n</system_instructions>\n\n`;
       if (promptParts.length > 0 && promptParts[0]!.type === "text") {
@@ -512,54 +933,12 @@ export class SessionCoordinator {
       } else if (event.type === "text_delta") {
         fullAnswerText += event.text;
       } else if (event.type === "finish") {
-        if (event.stopReason === "tool_use") {
-          worker.committedMessages = [
-            ...req.messages,
-            {
-              role: "assistant",
-              content: [
-                ...(fullAnswerText
-                  ? [{ type: "text" as const, text: fullAnswerText }]
-                  : []),
-                ...generatedToolCalls,
-              ],
-            },
-          ];
-        } else {
-          worker.committedMessages = [
-            ...req.messages,
-            {
-              role: "assistant",
-              content: [{ type: "text" as const, text: fullAnswerText }],
-            },
-          ];
-        }
+        commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
       }
       yield event;
     }
 
-    if (worker.state === "AWAITING_TOOL_RESULTS") {
-      worker.committedMessages = [
-        ...req.messages,
-        {
-          role: "assistant",
-          content: [
-            ...(fullAnswerText
-              ? [{ type: "text" as const, text: fullAnswerText }]
-              : []),
-            ...generatedToolCalls,
-          ],
-        },
-      ];
-    } else if (worker.state === "IDLE") {
-      worker.committedMessages = [
-        ...req.messages,
-        {
-          role: "assistant",
-          content: [{ type: "text", text: fullAnswerText }],
-        },
-      ];
-    }
+    commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
   }
 
   private async *executeWarmIdleTurn(
@@ -577,11 +956,22 @@ export class SessionCoordinator {
     }
 
     worker.setExposeThinking(req.thinkingEnabled);
-    await worker.applyModelSelection(modelSelection);
+    await worker.applyModelSelection(modelSelection, signal);
     worker.broker.setToolChoice(req.toolChoice);
 
     const deltaMessages = req.messages.slice(worker.committedMessages.length);
     const promptParts = renderMessagesToPrompt([], deltaMessages);
+    const tcReminder = getToolChoiceReminder(req.toolChoice);
+    if (tcReminder) {
+      if (
+        promptParts.length > 0 &&
+        promptParts[promptParts.length - 1]!.type === "text"
+      ) {
+        (promptParts[promptParts.length - 1] as any).text += `\n\n${tcReminder}`;
+      } else {
+        promptParts.push({ type: "text", text: tcReminder });
+      }
+    }
 
     const generatedToolCalls: Array<{
       type: "tool_use";
@@ -597,54 +987,12 @@ export class SessionCoordinator {
       } else if (event.type === "text_delta") {
         fullAnswerText += event.text;
       } else if (event.type === "finish") {
-        if (event.stopReason === "tool_use") {
-          worker.committedMessages = [
-            ...req.messages,
-            {
-              role: "assistant",
-              content: [
-                ...(fullAnswerText
-                  ? [{ type: "text" as const, text: fullAnswerText }]
-                  : []),
-                ...generatedToolCalls,
-              ],
-            },
-          ];
-        } else {
-          worker.committedMessages = [
-            ...req.messages,
-            {
-              role: "assistant",
-              content: [{ type: "text" as const, text: fullAnswerText }],
-            },
-          ];
-        }
+        commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
       }
       yield event;
     }
 
-    if (worker.state === "AWAITING_TOOL_RESULTS") {
-      worker.committedMessages = [
-        ...req.messages,
-        {
-          role: "assistant",
-          content: [
-            ...(fullAnswerText
-              ? [{ type: "text" as const, text: fullAnswerText }]
-              : []),
-            ...generatedToolCalls,
-          ],
-        },
-      ];
-    } else if (worker.state === "IDLE") {
-      worker.committedMessages = [
-        ...req.messages,
-        {
-          role: "assistant",
-          content: [{ type: "text", text: fullAnswerText }],
-        },
-      ];
-    }
+    commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
   }
 
   private async *executeAwaitingToolsTurn(
@@ -686,11 +1034,75 @@ export class SessionCoordinator {
         toolResults.push({
           toolUseId: part.toolUseId,
           isError: part.isError,
-          content: part.content,
+          content: [...part.content],
         });
-      } else {
+      }
+    }
+
+    const TELEMETRY_NOISE_RE =
+      /^\s*<system-reminder>\s*(?:Token usage:|USD budget:|<total_tokens>|Output tokens \u2014 turn:)[\s\S]*?<\/system-reminder>\s*$/i;
+    const QUEUED_USER_RE =
+      /The user sent (?:a new message while you were working|the following message):\s*([\s\S]*?)(?:<\/system-reminder>|$)/i;
+    const COMPANION_RE =
+      /^(?:<system-reminder\b|<task-notification\b|Tools? loaded\b|Base directory for this skill:|ARGUMENTS:|Skill arguments:)/i;
+
+    for (const part of lastMsg.content) {
+      if (part.type === "tool_result") continue;
+
+      if (part.type === "image") {
+        steeringParts.push(part);
+        continue;
+      }
+
+      if (part.type === "text") {
+        const text = part.text.trim();
+        if (!text) continue;
+
+        if (TELEMETRY_NOISE_RE.test(part.text)) {
+          continue;
+        }
+
+        const queuedMatch = QUEUED_USER_RE.exec(part.text);
+        if (queuedMatch) {
+          const inner = queuedMatch[1]!
+            .replace(
+              /\n\n(?:This is how Claude Code surfaces[\s\S]*|IMPORTANT:[\s\S]*|Please address this message[\s\S]*)$/i,
+              "",
+            )
+            .trim();
+          steeringParts.push({ type: "text", text: inner });
+          continue;
+        }
+
+        if (
+          COMPANION_RE.test(text) ||
+          /^\[MESSAGE FROM NON-USER SOURCE/i.test(text) ||
+          /hook (?:additional context|success|blocking error|feedback)/i.test(
+            text,
+          )
+        ) {
+          if (toolResults.length > 0) {
+            toolResults[toolResults.length - 1]!.content.push({
+              type: "text",
+              text: part.text,
+            });
+          }
+          continue;
+        }
+
         steeringParts.push(part);
       }
+    }
+
+    const regNames = new Set(worker.registeredTools.map((t) => t.name));
+    const hasNewTools = req.tools.some((t) => !regNames.has(t.name));
+    if (hasNewTools) {
+      worker.broker.setTools(req.tools);
+      worker.registeredTools = [...req.tools];
+      steeringParts.push({
+        type: "text",
+        text: "Continue with the newly loaded tools.",
+      });
     }
 
     worker.setExposeThinking(req.thinkingEnabled);
@@ -714,54 +1126,12 @@ export class SessionCoordinator {
       } else if (event.type === "text_delta") {
         fullAnswerText += event.text;
       } else if (event.type === "finish") {
-        if (event.stopReason === "tool_use") {
-          worker.committedMessages = [
-            ...req.messages,
-            {
-              role: "assistant",
-              content: [
-                ...(fullAnswerText
-                  ? [{ type: "text" as const, text: fullAnswerText }]
-                  : []),
-                ...generatedToolCalls,
-              ],
-            },
-          ];
-        } else {
-          worker.committedMessages = [
-            ...req.messages,
-            {
-              role: "assistant",
-              content: [{ type: "text" as const, text: fullAnswerText }],
-            },
-          ];
-        }
+        commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
       }
       yield event;
     }
 
-    if (worker.state === "AWAITING_TOOL_RESULTS") {
-      worker.committedMessages = [
-        ...req.messages,
-        {
-          role: "assistant",
-          content: [
-            ...(fullAnswerText
-              ? [{ type: "text" as const, text: fullAnswerText }]
-              : []),
-            ...generatedToolCalls,
-          ],
-        },
-      ];
-    } else if (worker.state === "IDLE") {
-      worker.committedMessages = [
-        ...req.messages,
-        {
-          role: "assistant",
-          content: [{ type: "text", text: fullAnswerText }],
-        },
-      ];
-    }
+    commitAssistantTurn(worker, req, fullAnswerText, generatedToolCalls);
   }
 
   private async *executeStatelessTurn(
@@ -795,7 +1165,7 @@ export class SessionCoordinator {
     await this.scheduler.reserveAndRegister(worker);
 
     try {
-      await worker.start();
+      await worker.start(signal);
     } catch (err) {
       this.scheduler.unregisterWorker(worker);
       await worker.close("start_failed");
@@ -811,7 +1181,7 @@ export class SessionCoordinator {
         );
       }
 
-      await worker.applyModelSelection(modelSelection);
+      await worker.applyModelSelection(modelSelection, signal);
 
       let priorMessages: NormalizedMessage[] = [];
       let currentMessages: NormalizedMessage[] = [];

@@ -147,6 +147,7 @@ export class SessionToolBroker {
   private originalToMcp = new Map<string, string>()
   private toolChoice: ToolChoiceSpec = { type: "auto" }
   private rejectedNoneCount = 0
+  private rejectedChoiceCount = 0
 
   /** Calls the current HTTP turn is allowed to expose to the caller. */
   private currentBatch: ParkedCall[] = []
@@ -189,6 +190,7 @@ export class SessionToolBroker {
    */
   setToolChoice(choice: ToolChoiceSpec): void {
     this.rejectedNoneCount = 0
+    this.rejectedChoiceCount = 0
     this.toolChoice = choice
   }
 
@@ -222,20 +224,28 @@ export class SessionToolBroker {
   }
 
   deliverToolResults(results: ToolResultDelivery[]): DeliverToolResultsOutcome {
-    const resolvedThisInvocation = new Set<string>()
+    const resolvedPayloads = new Map<string, string>()
+    const accepted: ToolResultDelivery[] = []
 
     // Validate everything before mutating so a bad sibling cannot half-resolve.
     for (const result of results) {
-      if (resolvedThisInvocation.has(result.toolUseId)) {
-        throw new BridgeHttpError(409, "invalid_request_error", `Duplicate tool_result for ${result.toolUseId}`)
+      const payload = JSON.stringify({ isError: Boolean(result.isError), content: result.content })
+      if (resolvedPayloads.has(result.toolUseId)) {
+        // A retry may repeat the same result byte for byte; that is idempotent.
+        // Only a conflicting payload for one id is an error.
+        if (resolvedPayloads.get(result.toolUseId) !== payload) {
+          throw new BridgeHttpError(409, "invalid_request_error", `Duplicate tool_result for ${result.toolUseId}`)
+        }
+        continue
       }
       if (!this.exposedPending.has(result.toolUseId)) {
         throw new BridgeHttpError(400, "invalid_request_error", `Unknown or unexposed tool_use_id: ${result.toolUseId}`)
       }
-      resolvedThisInvocation.add(result.toolUseId)
+      resolvedPayloads.set(result.toolUseId, payload)
+      accepted.push(result)
     }
 
-    for (const delivery of results) {
+    for (const delivery of accepted) {
       const call = this.exposedPending.get(delivery.toolUseId)
       if (!call) continue
       this.clearDeadline(call)
@@ -370,6 +380,21 @@ export class SessionToolBroker {
       return { status: 200, body: { jsonrpc: "2.0", id, result: errorResult(TOOL_DISABLED_TEXT) } }
     }
 
+    if (this.toolChoice.type === "tool" && originalName !== this.toolChoice.name) {
+      this.rejectedChoiceCount += 1
+      if (this.rejectedChoiceCount > this.maxRejectedNoneCalls) this.onFatalToolLoop?.(TOOL_LOOP_REASON)
+      return {
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id,
+          result: errorResult(
+            `Tool choice requires calling '${this.toolChoice.name}' in this turn, not '${originalName}'.`,
+          ),
+        },
+      }
+    }
+
     const call = this.parkCall(originalName, mcpName, ensureObject(params.arguments))
     try {
       const result = await call.promise
@@ -387,10 +412,21 @@ export class SessionToolBroker {
       this.currentBatch.push(call)
       // The window opens on the *first* call and is never extended by later ones.
       if (this.batchTimer === null && this.currentBatch.length === 1) this.startBatchTimer()
+      // With parallel tool use disabled, the first call alone closes the turn:
+      // siblings that arrive afterwards queue instead of joining this batch.
+      if (this.currentBatch.length === 1 && this.disablesParallelToolUse()) {
+        this.flushCurrentBatchNow()
+      }
     } else {
       this.queuedUnexposed.push(call)
     }
     return call
+  }
+
+  private disablesParallelToolUse(): boolean {
+    const choice = this.toolChoice
+    if (choice.type !== "auto" && choice.type !== "any" && choice.type !== "tool") return false
+    return choice.disableParallelToolUse === true
   }
 
   private startBatchTimer(): void {

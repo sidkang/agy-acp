@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  ALT_SUBAGENT_HEADER,
   collectAnthropicJsonResponse,
   createSyntheticThinkingSignature,
   EFFORT_HEADER,
@@ -8,7 +9,16 @@ import {
   jsonErrorResponse,
   parseAnthropicRequest,
   SESSION_ID_HEADER,
+  SIGN_IN_HEADER,
+  SUBAGENT_HEADER,
+  WORKDIR_HEADER,
 } from "../src/protocol/anthropic";
+import {
+  cloakSystemPrompt,
+  stripVolatileMessageText,
+  stripVolatileSystem,
+  turnsAway,
+} from "../src/protocol/cloak";
 import {
   BridgeHttpError,
   type ProviderOptionsState,
@@ -26,6 +36,7 @@ const DEFAULT_OPTIONS: ProviderOptionsState = {
   quotaRouting: true,
   minimalAgent: false,
   exposeThinking: true,
+  cloakPrompts: true,
 };
 
 const USAGE: TokenUsageSummary = {
@@ -282,6 +293,23 @@ describe("parseAnthropicRequest: model & streaming honesty", () => {
     expect(parsed.effortOverride).toBe("xhigh");
   });
 
+  test("[1m] context suffix is stripped from the model id", () => {
+    // Trailing marker (Claude Code's 1M-context opt-in) and the variant that sits
+    // just before a `:effort` suffix must both survive normalization.
+    expect(parse(requestBody({ model: "agy-acp/claude-opus-5-5-low[1m]" })).model).toBe(
+      "claude-opus-5-5-low",
+    );
+    const withEffort = parse(requestBody({ model: "agy-acp/gemini-3.8-flash[1m]:high" }));
+    expect(withEffort.model).toBe(MODEL);
+    expect(withEffort.effortOverride).toBe("high");
+    expect(parse(requestBody({ model: "claude-opus-5-5-low[1M]" })).model).toBe(
+      "claude-opus-5-5-low",
+    );
+    const trailingEffort = parse(requestBody({ model: "gemini-3.8-flash:low[1m]" }));
+    expect(trailingEffort.model).toBe(MODEL);
+    expect(trailingEffort.effortOverride).toBe("low");
+  });
+
   test("output_config.effort and reasoning_effort are honored; model suffix wins", () => {
     expect(parse(requestBody({ output_config: { effort: "medium" } })).effortOverride).toBe(
       "medium",
@@ -402,7 +430,7 @@ describe("parseAnthropicRequest: unsupported parameters are rejected", () => {
     expectInvalid(() => parse(requestBody({ stop_sequences: "stop" })), "stop_sequences");
   });
 
-  test("tool_choice auto/none is accepted, forced variants are rejected", () => {
+  test("tool_choice auto/none is accepted", () => {
     expect(parse(requestBody()).toolChoice).toEqual({ type: "auto" });
     expect(parse(requestBody({ tool_choice: { type: "auto" } })).toolChoice).toEqual({
       type: "auto",
@@ -413,20 +441,78 @@ describe("parseAnthropicRequest: unsupported parameters are rejected", () => {
       parse(requestBody({ tool_choice: { type: "auto", disable_parallel_tool_use: true } }))
         .toolChoice,
     ).toEqual({ type: "auto", disableParallelToolUse: true });
-
-    const forced = "Forced tool_choice (any/tool) is not natively enforced";
-    for (const toolChoice of [
-      { type: "any" },
-      "any",
-      "required",
-      { type: "tool", name: "search" },
-    ]) {
-      const err = expectInvalid(() => parse(requestBody({ tool_choice: toolChoice })), forced);
-      expect(err.message).toBe(
-        "Forced tool_choice (any/tool) is not natively enforced by Antigravity ACP; use auto or none",
-      );
-    }
     expectInvalid(() => parse(requestBody({ tool_choice: { type: "bogus" } })), "tool_choice");
+  });
+});
+
+describe("parseAnthropicRequest: forced tool_choice", () => {
+  const TOOLS = [
+    { name: "search", input_schema: { type: "object" } },
+    { name: "browse", input_schema: { type: "object" } },
+  ];
+
+  test("any/required force a tool and need a declared catalog", () => {
+    for (const type of ["any", "required", { type: "any" }]) {
+      expect(parse(requestBody({ tools: TOOLS, tool_choice: type })).toolChoice).toEqual({
+        type: "any",
+      });
+    }
+    expect(
+      parse(
+        requestBody({
+          tools: TOOLS,
+          tool_choice: { type: "any", disable_parallel_tool_use: true },
+        }),
+      ).toolChoice,
+    ).toEqual({ type: "any", disableParallelToolUse: true });
+
+    // "call some tool" with nothing to call is a caller bug, not a no-op.
+    expectInvalid(
+      () => parse(requestBody({ tool_choice: "any" })),
+      'tool_choice "any" requires at least one declared tool',
+    );
+    expectInvalid(
+      () => parse(requestBody({ tools: [], tool_choice: { type: "required" } })),
+      "requires at least one declared tool",
+    );
+  });
+
+  test("tool_choice tool names a declared tool (Anthropic and OpenAI shapes)", () => {
+    expect(
+      parse(requestBody({ tools: TOOLS, tool_choice: { type: "tool", name: "search" } }))
+        .toolChoice,
+    ).toEqual({ type: "tool", name: "search" });
+    expect(
+      parse(
+        requestBody({
+          tools: TOOLS,
+          tool_choice: { type: "tool", name: " search ", disable_parallel_tool_use: true },
+        }),
+      ).toolChoice,
+    ).toEqual({ type: "tool", name: "search", disableParallelToolUse: true });
+    // OpenAI Responses translators emit { type: "function", function: { name } }.
+    expect(
+      parse(
+        requestBody({ tools: TOOLS, tool_choice: { type: "function", function: { name: "browse" } } }),
+      ).toolChoice,
+    ).toEqual({ type: "tool", name: "browse" });
+
+    expectInvalid(
+      () => parse(requestBody({ tools: TOOLS, tool_choice: { type: "tool" } })),
+      'requires a non-empty tool "name"',
+    );
+    expectInvalid(
+      () => parse(requestBody({ tools: TOOLS, tool_choice: { type: "tool", name: "   " } })),
+      'requires a non-empty tool "name"',
+    );
+    expectInvalid(
+      () => parse(requestBody({ tools: TOOLS, tool_choice: { type: "tool", name: "missing" } })),
+      'names unknown tool "missing"',
+    );
+    expectInvalid(
+      () => parse(requestBody({ tool_choice: { type: "tool", name: "search" } })),
+      'names unknown tool "search"',
+    );
   });
 });
 
@@ -464,19 +550,83 @@ describe("parseAnthropicRequest: system prompt", () => {
     expect(parsed.messages[0]?.role).toBe("user");
   });
 
-  test("system messages in the middle of the conversation are rejected", () => {
-    expectInvalid(
-      () =>
-        parse(
-          requestBody({
-            messages: [
-              { role: "user", content: "hi" },
-              { role: "system", content: "late" },
-            ],
-          }),
-        ),
-      "system messages are only supported at the start",
+  test("leading developer messages are absorbed like system messages", () => {
+    const parsed = parse(
+      requestBody({
+        system: "top",
+        messages: [
+          { role: "system", content: "from a translated client" },
+          { role: "developer", content: [{ type: "text", text: "developer instructions" }] },
+          { role: "user", content: "hi" },
+        ],
+      }),
     );
+    expect(parsed.system).toBe("top\n\nfrom a translated client\n\ndeveloper instructions");
+    expect(parsed.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hi" }] }]);
+  });
+
+  test("mid-conversation system/developer messages become reminder-shaped user parts", () => {
+    const parsed = parse(
+      requestBody({
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "hello" },
+          { role: "system", content: "cwd changed to /tmp" },
+          {
+            role: "developer",
+            content: [{ type: "text", text: "<task-notification>done</task-notification>" }],
+          },
+          { role: "user", content: "next" },
+        ],
+      }),
+    );
+    expect(parsed.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+    // Adjacent user turns merge, so the reminders ride the trailing user message.
+    expect(parsed.messages[2]?.content).toEqual([
+      { type: "text", text: "<system-reminder>\ncwd changed to /tmp\n</system-reminder>" },
+      {
+        type: "text",
+        text: "<system-reminder>\n<task-notification>done</task-notification>\n</system-reminder>",
+      },
+      { type: "text", text: "next" },
+    ]);
+  });
+
+  test("reminders are not double-wrapped and queued user messages are unwrapped", () => {
+    const wrapped = "<system-reminder>\nUse tabs.\n</system-reminder>";
+    const parsed = parse(
+      requestBody({
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "system", content: wrapped },
+          {
+            role: "developer",
+            content:
+              "<system-reminder>\nThe user sent a new message while you were working:\nplease also fix the tests\n</system-reminder>",
+          },
+        ],
+      }),
+    );
+    expect(parsed.messages).toHaveLength(1);
+    expect(parsed.messages[0]?.content).toEqual([
+      { type: "text", text: "hi" },
+      { type: "text", text: wrapped },
+      // Genuine steering: the envelope is stripped so the coordinator sees the
+      // user's own words instead of an anonymous reminder.
+      { type: "text", text: "please also fix the tests" },
+    ]);
+  });
+
+  test("an empty mid-conversation system message contributes nothing", () => {
+    const parsed = parse(
+      requestBody({
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "system", content: "   " },
+        ],
+      }),
+    );
+    expect(parsed.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hi" }] }]);
   });
 
   test("a conversation made only of system messages has no user turn", () => {
@@ -779,6 +929,99 @@ describe("parseAnthropicRequest: messages & content parts", () => {
   });
 });
 
+describe("parseAnthropicRequest: Claude Code ToolSearch & server-tool blocks", () => {
+  test("tool_reference in tool_result content becomes readable text", () => {
+    const parsed = parse(
+      requestBody({
+        messages: [
+          { role: "user", content: "find a tool" },
+          {
+            role: "assistant",
+            content: [{ type: "server_tool_use", name: "tool_search", input: { query: "jira" } }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_search",
+                content: [
+                  { type: "tool_reference", tool_name: "jira_create_issue" },
+                  { type: "tool_reference" },
+                  { type: "tool_addition", tool_name: "jira" },
+                  { type: "tool_removal", tool_name: "obsolete" },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.messages[1]?.content).toEqual([
+      { type: "text", text: 'Tool call: tool_search {"query":"jira"}' },
+    ]);
+    // tool_addition/tool_removal are no-ops: they only describe catalog deltas.
+    expect(parsed.messages[2]?.content).toEqual([
+      {
+        type: "tool_result",
+        toolUseId: "toolu_search",
+        isError: false,
+        content: [
+          { type: "text", text: "Loaded tool: jira_create_issue" },
+          { type: "text", text: "Loaded tool: unknown" },
+        ],
+      },
+    ]);
+  });
+
+  test("search and server-tool result blocks render as text in message content", () => {
+    const parsed = parse(
+      requestBody({
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "search_result",
+                title: "Docs",
+                source: "https://example.com",
+                content: [{ type: "text", text: "Snippet" }],
+              },
+              { type: "web_search_tool_result", content: [{ type: "text", text: "Result A" }] },
+              { type: "mcp_tool_result", content: "mcp says hi" },
+              { type: "code_execution_tool_result", content: [{ type: "text", text: "42" }] },
+              { type: "tool_removal", tool_name: "gone" },
+              { type: "text", text: "after" },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.messages[0]?.content).toEqual([
+      { type: "text", text: "Search result: Docs\nSource: https://example.com\nSnippet" },
+      { type: "text", text: "Web search results:\nResult A" },
+      { type: "text", text: "MCP tool result:\nmcp says hi" },
+      { type: "text", text: "Code execution result:\n42" },
+      { type: "text", text: "after" },
+    ]);
+  });
+
+  test("a search_result without title/source still renders its content", () => {
+    const parsed = parse(
+      requestBody({
+        messages: [
+          { role: "user", content: [{ type: "search_result", content: "just text" }] },
+        ],
+      }),
+    );
+    expect(parsed.messages[0]?.content).toEqual([
+      { type: "text", text: "Search result\njust text" },
+    ]);
+  });
+});
+
 describe("parseAnthropicRequest: tools", () => {
   test("tool schemas come from input_schema, parameters, or the empty object schema", () => {
     const parsed = parse(
@@ -834,6 +1077,41 @@ describe("parseAnthropicRequest: session & metadata", () => {
     expect(parse(requestBody()).userId).toBeUndefined();
     expect(parse(requestBody({ max_tokens: "many" })).maxTokens).toBeUndefined();
   });
+
+  test("subagent and workdir headers are forwarded, blanks become undefined", () => {
+    expect(SUBAGENT_HEADER).toBe("x-magpie-subagent");
+    expect(ALT_SUBAGENT_HEADER).toBe("x-claude-code-agent-id");
+    expect(WORKDIR_HEADER).toBe("x-magpie-work-dir");
+
+    const both = parse(
+      requestBody(),
+      {},
+      { [SUBAGENT_HEADER]: "  agent-7  ", [WORKDIR_HEADER]: " /tmp/repo " },
+    );
+    expect(both.subagentId).toBe("agent-7");
+    expect(both.workDir).toBe("/tmp/repo");
+
+    // Claude Code's own header is the fallback; the magpie header wins.
+    expect(
+      parse(requestBody(), {}, { [ALT_SUBAGENT_HEADER]: "agent-9" }).subagentId,
+    ).toBe("agent-9");
+    expect(
+      parse(
+        requestBody(),
+        {},
+        { [SUBAGENT_HEADER]: "primary", [ALT_SUBAGENT_HEADER]: "fallback" },
+      ).subagentId,
+    ).toBe("primary");
+
+    const blank = parse(
+      requestBody(),
+      {},
+      { [SUBAGENT_HEADER]: "   ", [ALT_SUBAGENT_HEADER]: " ", [WORKDIR_HEADER]: "  " },
+    );
+    expect(blank.subagentId).toBeUndefined();
+    expect(blank.workDir).toBeUndefined();
+    expect(parse(requestBody()).subagentId).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -878,6 +1156,38 @@ describe("jsonErrorResponse", () => {
     const opaque = jsonErrorResponse("just a string");
     expect(opaque.status).toBe(502);
     expect(asRecord((await readJson(opaque)).error).type).toBe("api_error");
+  });
+
+  test("a 401 authentication error marks the account sign-in expired", async () => {
+    expect(SIGN_IN_HEADER).toBe("x-magpie-sign-in");
+    const response = jsonErrorResponse(
+      new BridgeHttpError(401, "authentication_error", "token expired"),
+    );
+    expect(response.status).toBe(401);
+    expect(response.headers.get(SIGN_IN_HEADER)).toBe("expired");
+    expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+  });
+
+  test("an explicit signInExpired flag is honoured off 401 too", () => {
+    const response = jsonErrorResponse(
+      new BridgeHttpError(403, "permission_error", "account revoked", { signInExpired: true }),
+    );
+    expect(response.status).toBe(403);
+    expect(response.headers.get(SIGN_IN_HEADER)).toBe("expired");
+  });
+
+  test("ordinary errors carry no sign-in header", () => {
+    expect(
+      jsonErrorResponse(new BridgeHttpError(429, "rate_limit_error", "slow down")).headers.get(
+        SIGN_IN_HEADER,
+      ),
+    ).toBe(null);
+    expect(jsonErrorResponse(new Error("kaboom")).headers.get(SIGN_IN_HEADER)).toBe(null);
+    expect(
+      jsonErrorResponse(new BridgeHttpError(400, "invalid_request_error", "bad")).headers.get(
+        SIGN_IN_HEADER,
+      ),
+    ).toBe(null);
   });
 });
 
@@ -925,6 +1235,42 @@ describe("encodeAnthropicSseResponse: pre-stream failures keep their HTTP status
     );
     expect(response.status).toBe(502);
     expect(asRecord((await readJson(response)).error).message).toBe("socket exploded");
+  });
+
+  test("a pre-stream auth error event adds x-magpie-sign-in: expired", async () => {
+    const response = await encodeAnthropicSseResponse(
+      MODEL,
+      streamOf([
+        {
+          type: "error",
+          status: 401,
+          errorType: "authentication_error",
+          message: "please sign in again",
+          signInExpired: true,
+        },
+      ]),
+    );
+    expect(response.status).toBe(401);
+    expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(response.headers.get(SIGN_IN_HEADER)).toBe("expired");
+    expect(asRecord((await readJson(response)).error).type).toBe("authentication_error");
+  });
+
+  test("a non-401 signInExpired event still marks the sign-in expired", async () => {
+    const response = await encodeAnthropicSseResponse(
+      MODEL,
+      streamOf([
+        {
+          type: "error",
+          status: 500,
+          errorType: "api_error",
+          message: "credential rejected upstream",
+          signInExpired: true,
+        },
+      ]),
+    );
+    expect(response.status).toBe(500);
+    expect(response.headers.get(SIGN_IN_HEADER)).toBe("expired");
   });
 });
 
@@ -1532,5 +1878,167 @@ describe("collectAnthropicJsonResponse", () => {
     const body = await readJson(response);
     expect(body.type).toBe("error");
     expect(asRecord(body.error).type).toBe("api_error");
+  });
+
+  test("auth failures mark the sign-in expired", async () => {
+    const response = await collectAnthropicJsonResponse(
+      MODEL,
+      streamOf([
+        {
+          type: "error",
+          status: 401,
+          errorType: "authentication_error",
+          message: "re-auth required",
+          signInExpired: true,
+        },
+      ]),
+    );
+    expect(response.status).toBe(401);
+    expect(response.headers.get(SIGN_IN_HEADER)).toBe("expired");
+    expect(asRecord((await readJson(response)).error).message).toBe("re-auth required");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// encodeAnthropicSseResponse: downstream backpressure
+// ---------------------------------------------------------------------------
+
+describe("encodeAnthropicSseResponse: backpressure", () => {
+  test("a reader that stops reading parks the pump instead of buffering the turn", async () => {
+    let produced = 0;
+    async function* chatty(): AsyncGenerator<TurnStreamEvent> {
+      for (let index = 0; index < 100; index += 1) {
+        produced += 1;
+        yield { type: "text_delta", text: `chunk-${index};` };
+      }
+      yield { type: "finish", stopReason: "end_turn", usage: USAGE };
+    }
+
+    const response = encodeAnthropicSseResponse(MODEL, chatty());
+    const reader = response.body?.getReader();
+    if (reader === undefined) throw new Error("expected a streaming body");
+
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+
+    // No further reads: the pump must stop pulling the upstream generator.
+    for (let tick = 0; tick < 20; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(produced).toBeLessThanOrEqual(5);
+
+    const decoder = new TextDecoder();
+    let payload = decoder.decode(first.value);
+    for (;;) {
+      const next = await reader.read();
+      if (next.done === true) break;
+      payload += decoder.decode(next.value);
+    }
+
+    // Draining releases the turn: every delta and a clean completion arrive.
+    expect(produced).toBe(100);
+    const frames = parseSseFrames(payload);
+    expect(frames[0]?.event).toBe("message_start");
+    expect(frames[frames.length - 1]?.event).toBe("message_stop");
+    const textDeltas = frames.filter(
+      (frame) =>
+        frame.event === "content_block_delta" && asRecord(frame.data.delta).type === "text_delta",
+    );
+    expect(textDeltas).toHaveLength(100);
+    expect(textDeltas.map((frame) => asRecord(frame.data.delta).text)).toContain("chunk-99;");
+  });
+
+  test("cancelling a parked stream releases the upstream instead of hanging", async () => {
+    const state = { finalized: false };
+    async function* endless(): AsyncGenerator<TurnStreamEvent> {
+      try {
+        for (let index = 0; index < 200; index += 1) {
+          yield { type: "text_delta", text: "x" };
+        }
+        yield { type: "finish", stopReason: "end_turn", usage: USAGE };
+      } finally {
+        state.finalized = true;
+      }
+    }
+
+    const response = encodeAnthropicSseResponse(MODEL, endless());
+    const reader = response.body?.getReader();
+    if (reader === undefined) throw new Error("expected a streaming body");
+    await reader.read();
+
+    // Cancelling a parked stream must complete promptly, not await a pull that
+    // will never arrive.
+    const outcome = await Promise.race([
+      reader.cancel().then(() => "cancelled" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 500)),
+    ]);
+    expect(outcome).toBe("cancelled");
+
+    for (let tick = 0; tick < 50 && !state.finalized; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    // The parked emit must be woken by teardown, not left awaiting a pull forever.
+    expect(state.finalized).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cloak.ts prompt cloaking
+// ---------------------------------------------------------------------------
+
+describe("cloak.ts", () => {
+  test("turnsAway flags known third-party harness trigger phrases only", () => {
+    expect(turnsAway("X-Anthropic-Billing-Header: cch=abc")).toBe(true);
+    expect(turnsAway("You are Codex, an agent based on GPT-5.")).toBe(true);
+    expect(turnsAway("RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL.")).toBe(
+      true,
+    );
+    expect(turnsAway("You are a helpful assistant.")).toBe(false);
+    expect(turnsAway(undefined)).toBe(false);
+    expect(turnsAway(null)).toBe(false);
+  });
+
+  test("cloakSystemPrompt strips the billing header and breaks up trigger phrases", () => {
+    expect(cloakSystemPrompt("X-Anthropic-Billing-Header: cch=deadbeef\nBe terse.")).toBe(
+      "Be terse.",
+    );
+
+    const cloaked = cloakSystemPrompt("You are Codex, an agent based on GPT-5. Help me.");
+    // Zero-width breaks defuse the trigger phrase without changing what a reader sees.
+    expect(cloaked).toContain("\u200B");
+    expect(cloaked).toContain("Help me.");
+    expect(turnsAway(cloaked)).toBe(false);
+
+    // Disabled cloaking still normalizes the billing header, but leaves triggers intact.
+    const raw = "You are Codex, an agent based on GPT-5.";
+    expect(cloakSystemPrompt(raw, false)).toBe(raw);
+    expect(turnsAway(cloakSystemPrompt(raw, false))).toBe(true);
+
+    expect(cloakSystemPrompt(undefined)).toBe("");
+  });
+
+  test("stripVolatileSystem drops billing headers and agent clock lines", () => {
+    const text =
+      "X-Anthropic-Billing-Header: cch=deadbeef\nCurrent date: 2026-02-13\n# Current time: 09:31\nBe brief.";
+    expect(stripVolatileSystem(text)).toBe("Be brief.");
+    expect(stripVolatileSystem("  Be brief. " )).toBe("Be brief.");
+    expect(stripVolatileSystem(undefined)).toBe("");
+  });
+
+  test("stripVolatileMessageText only scrubs clock lines inside system reminders", () => {
+    const text =
+      "<system-reminder>\nCurrent time: 12:00\nRun the tests.\n</system-reminder>\nCurrent time: 12:00";
+    const stripped = stripVolatileMessageText(text);
+
+    // Inside the reminder the timestamp is dropped so warm sessions stay warm…
+    expect(stripped).toContain("Run the tests.");
+    expect(stripped).toBe(
+      "<system-reminder>\n\nRun the tests.\n</system-reminder>\nCurrent time: 12:00",
+    );
+    // …but text outside a reminder is left untouched, and billing lines go away.
+    expect(stripVolatileMessageText("x-anthropic-billing-header: cch=1\nkeep me")).toBe(
+      "keep me",
+    );
+    expect(stripVolatileMessageText(undefined)).toBe("");
   });
 });

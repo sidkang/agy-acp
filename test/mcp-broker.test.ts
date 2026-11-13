@@ -693,7 +693,7 @@ describe("batch window and parked tools/call", () => {
     const duplicate = captureError(() =>
       bridge.broker.deliverToolResults([
         { toolUseId: id, isError: false, content: [] },
-        { toolUseId: id, isError: false, content: [] },
+        { toolUseId: id, isError: false, content: [{ type: "text", text: "conflicting result" }] },
       ]))
     expect(duplicate.status).toBe(409)
     expect(duplicate.message).toBe(`Duplicate tool_result for ${id}`)
@@ -706,6 +706,24 @@ describe("batch window and parked tools/call", () => {
     const replayed = captureError(() =>
       bridge.broker.deliverToolResults([{ toolUseId: id, isError: false, content: [] }]))
     expect(replayed.status).toBe(400)
+  })
+
+  test("deliverToolResults ignores byte-identical duplicate results in one batch", async () => {
+    const bridge = startBridge()
+    bridge.broker.setTools([{ name: "echo_tool", inputSchema: echoToolSchema }])
+    bridge.broker.openTurnWindow()
+
+    const pending = callTool(bridge.url, "echo_tool", {}, 1)
+    const batch = await waitFor(() => bridge.batches[0])
+    const id = batch[0]!.id
+    const result = { toolUseId: id, isError: false, content: [{ type: "text" as const, text: "same result" }] }
+
+    const outcome = bridge.broker.deliverToolResults([result, { ...result, content: [...result.content] }])
+    expect(outcome).toEqual({ allPendingResolved: true, remainingExposedIds: [], newlyExposedCalls: [] })
+    expect(bridge.broker.hasPendingWork()).toBe(false)
+
+    const body = await readBody(await pending)
+    expect(body.result).toEqual({ content: [{ type: "text", text: "same result" }] })
   })
 
   test("cancelAll resolves parked calls so the HTTP client does not hang", async () => {
@@ -767,5 +785,69 @@ describe("tool_choice none", () => {
     // Still no tool_use was ever exposed.
     expect(bridge.batches).toHaveLength(0)
     expect(bridge.broker.getExposedPendingIds()).toEqual([])
+  })
+})
+
+describe("tool_choice tool and disable_parallel_tool_use", () => {
+  test("a named tool choice rejects other tools without exposing a tool_use", async () => {
+    const bridge = startBridge()
+    bridge.broker.setTools([
+      { name: "echo_tool", description: "echo", inputSchema: echoToolSchema },
+      { name: "second_tool", inputSchema: echoToolSchema },
+    ])
+    bridge.broker.setToolChoice({ type: "tool", name: "echo_tool" })
+    bridge.broker.openTurnWindow()
+
+    const rejected = await readBody(await callTool(bridge.url, "second_tool", { text: "wrong" }))
+    const rejection = rejected.result as { isError: boolean; content: Array<{ text: string }> }
+    expect(rejection.isError).toBe(true)
+    expect(rejection.content[0]?.text).toBe(
+      "Tool choice requires calling 'echo_tool' in this turn, not 'second_tool'.",
+    )
+    expect(bridge.batches).toHaveLength(0)
+    expect(bridge.broker.hasPendingWork()).toBe(false)
+
+    // tools/list still advertises every tool, preserving the upstream prompt cache.
+    const list = await readBody(await rpc(bridge.url, { jsonrpc: "2.0", id: 2, method: "tools/list" }))
+    expect((list.result?.tools as unknown[]).length).toBe(2)
+
+    const pending = callTool(bridge.url, "echo_tool", { text: "right" }, 3)
+    const batch = await waitFor(() => bridge.batches[0])
+    expect(batch).toHaveLength(1)
+    bridge.broker.deliverToolResults([
+      { toolUseId: batch[0]!.id, isError: false, content: [{ type: "text", text: "ok" }] },
+    ])
+    expect((await readBody(await pending)).result).toEqual({ content: [{ type: "text", text: "ok" }] })
+  })
+
+  test("disable_parallel_tool_use exposes only the first call and queues its sibling", async () => {
+    const bridge = startBridge({ batchWindowMs: 5_000 })
+    bridge.broker.setTools([{ name: "echo_tool", inputSchema: echoToolSchema }])
+    bridge.broker.setToolChoice({ type: "auto", disableParallelToolUse: true })
+    bridge.broker.openTurnWindow()
+
+    const first = callTool(bridge.url, "echo_tool", { text: "one" }, 1)
+    const firstBatch = await waitFor(() => bridge.batches[0])
+    expect(firstBatch).toHaveLength(1)
+
+    const second = callTool(bridge.url, "echo_tool", { text: "two" }, 2)
+    await sleep(60)
+    expect(bridge.batches).toHaveLength(1)
+    expect(bridge.broker.hasPendingWork()).toBe(true)
+
+    const afterFirst = bridge.broker.deliverToolResults([
+      { toolUseId: firstBatch[0]!.id, isError: false, content: [{ type: "text", text: "one done" }] },
+    ])
+    expect(afterFirst.newlyExposedCalls).toHaveLength(1)
+    const late = afterFirst.newlyExposedCalls[0]!
+    expect(late.input).toEqual({ text: "two" })
+
+    const afterLate = bridge.broker.deliverToolResults([
+      { toolUseId: late.id, isError: false, content: [{ type: "text", text: "two done" }] },
+    ])
+    expect(afterLate).toEqual({ allPendingResolved: true, remainingExposedIds: [], newlyExposedCalls: [] })
+
+    expect((await readBody(await first)).result).toEqual({ content: [{ type: "text", text: "one done" }] })
+    expect((await readBody(await second)).result).toEqual({ content: [{ type: "text", text: "two done" }] })
   })
 })

@@ -12,9 +12,19 @@ import {
   type NormalizedMessage,
   type TokenUsageSummary,
   type ToolChoiceSpec,
+  type TurnStopReason,
   type TurnStreamEvent,
 } from "../types";
 import { AcpConnection } from "./acp-connection";
+import {
+  turnsAway,
+  refusalHint,
+  cloakSystemPrompt,
+} from "../protocol/cloak";
+import {
+  settleStepUsage,
+  readConversationStepUsages,
+} from "../usage/step-usage";
 import {
   spawnAgy,
   killProcessTree,
@@ -49,6 +59,9 @@ export interface WorkerOptions {
   ) => ChildProcessWithoutNullStreams;
   minimalAgent?: boolean;
   exposeThinking?: boolean;
+  cloakPrompts?: boolean;
+  workDir?: string;
+  resumeSessionId?: string;
   systemPrompt?: string;
   tools?: Array<{
     name: string;
@@ -62,6 +75,22 @@ export interface WorkerOptions {
     oldState: WorkerState,
     newState: WorkerState,
   ) => void;
+  onEvict?: () => void;
+}
+
+const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n";
+const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim();
+
+function flattenOptions(opts: any[]): any[] {
+  const result: any[] = [];
+  for (const opt of opts) {
+    if (opt && Array.isArray(opt.options)) {
+      result.push(...flattenOptions(opt.options));
+    } else {
+      result.push(opt);
+    }
+  }
+  return result;
 }
 
 export function createSyntheticThinkingSignature(
@@ -138,6 +167,8 @@ export class AgySessionWorker {
   readonly account: AccountDescriptor;
   readonly sessionId: string;
   readonly workspaceDir: string;
+  readonly workDir?: string;
+  readonly onEvict?: () => void;
   private readonly mcpServer: LoopbackMcpServer;
   private readonly options: WorkerOptions;
 
@@ -153,6 +184,8 @@ export class AgySessionWorker {
   nativeSessionId!: string;
   imageSupported: boolean = false;
   appendSystemSupported: boolean = false;
+  resumeSupported: boolean = false;
+  resumedFromShelf: boolean = false;
   configOptions: any[] = [];
   currentModelSelection?: ModelSelection;
 
@@ -179,6 +212,9 @@ export class AgySessionWorker {
     cacheReadInputTokens: 0,
     cacheCreationInputTokens: 0,
   };
+  private turnLogOffset: number = 0;
+  private heldText: string = "";
+  private promptStepCount: number = 1;
 
   constructor(
     account: AccountDescriptor,
@@ -190,6 +226,8 @@ export class AgySessionWorker {
     this.sessionId = sessionId;
     this.mcpServer = mcpServer;
     this.options = options ?? {};
+    this.workDir = this.options.workDir;
+    this.onEvict = this.options.onEvict;
 
     if (this.options.workspaceDir) {
       this.workspaceDir = this.options.workspaceDir;
@@ -222,146 +260,287 @@ export class AgySessionWorker {
     this.options.onStateChange?.(this, oldState, newState);
   }
 
-  async start(): Promise<void> {
-    // 1. Write agent manifest
-    const agentDir = path.join(
-      this.workspaceDir,
-      ".agents",
-      "agents",
-      "magpie-bridge",
-    );
-    fs.mkdirSync(agentDir, { recursive: true });
-
-    const minimalAgent = Boolean(this.options.minimalAgent);
-    const agentContent = [
-      "---",
-      "name: magpie-bridge",
-      "description: Bridges only client-declared tools",
-      "mainAgent: true",
-      "subagent: false",
-      "tools: []",
-      "inheritMcp: false",
-      "inheritCustomizations: false",
-      `excludeDefaultComponents: ${minimalAgent ? "true" : "false"}`,
-      "---",
-      "Use only the provided MCP tools when tools are needed. Never output raw XML/JSON tool-call markup as text.",
-      "",
-    ].join("\n");
-    fs.writeFileSync(path.join(agentDir, "agent.md"), agentContent, "utf-8");
-
-    // 2. Initialize SessionToolBroker
-    this.broker = new SessionToolBroker({
-      batchWindowMs: 25,
-      callDeadlineMs: 120_000,
-      onBatchReady: (calls: ExposedToolCall[]) => {
-        this.handleBatchReady(calls);
-      },
-      onFatalToolLoop: (reason: string) => {
-        this.handleFatalToolLoop(reason);
-      },
-      onCallExpired: () => {
-        void this.close("tool_call_deadline_expired");
-      },
-    });
-
-    if (this.options.tools) {
-      this.registeredTools = [...this.options.tools];
-      this.broker.setTools(this.options.tools);
-    }
-    if (this.options.toolChoice) {
-      this.broker.setToolChoice(this.options.toolChoice);
-    }
-    if (this.options.systemPrompt) {
-      this.systemPrompt = this.options.systemPrompt;
+  async start(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      await this.close("aborted_startup");
+      throw new BridgeHttpError(
+        499,
+        "invalid_request_error",
+        "Request aborted during startup",
+      );
     }
 
-    // 3. Register broker on LoopbackMcpServer
-    const reg = this.mcpServer.registerSession(this.broker);
-    this.unregisterMcp = reg.unregister;
-    this.mcpUrl = reg.url;
-    if ((reg as any).token) {
-      this.mcpToken = (reg as any).token;
-    }
-
-    // 4. Spawn agy ACP
-    const logFile = path.join(this.workspaceDir, "agy-acp.log");
-    const args = [
-      "acp",
-      "--agent",
-      "magpie-bridge",
-      "--stdio",
-      "--process-per-session",
-      "--log-file",
-      logFile,
-    ];
-
-    if (this.options.spawnFn) {
-      this.child = this.options.spawnFn(this.account, args, {
-        cwd: this.workspaceDir,
-      });
-    } else {
-      this.child = spawnAgy(this.account, args, {
-        cwd: this.workspaceDir,
-      });
-    }
-
-    this.conn = new AcpConnection(this.child, {
-      redactor: redactSecrets,
-      onExit: () => {
-        if (!this.isClosed) {
-          void this.close("acp_process_exited");
-        }
-      },
-    });
-    this.setupAcpListeners();
-
-    // 5. ACP initialize
-    const initRes = await this.conn.request("initialize", {
-      protocolVersion: 1,
-      clientInfo: {
-        name: "agy-acp",
-        version: "0.1.0",
-      },
-      clientCapabilities: {
-        fs: {
-          readTextFile: false,
-          writeTextFile: false,
-        },
-        terminal: false,
-      },
-    });
-
-    this.imageSupported = Boolean(
-      (initRes as any)?.agentCapabilities?.promptCapabilities?.image,
-    );
-    this.appendSystemSupported = Boolean(
-      (initRes as any)?.agentCapabilities?._meta?.antigravity?.systemPrompt
-        ?.append,
-    );
-
-    // 6. ACP session/new
-    const newParams: Record<string, unknown> = {
-      cwd: this.workspaceDir,
-      mcpServers: [{ name: "magpie", type: "http", url: this.mcpUrl }],
-    };
-
-    if (this.appendSystemSupported && this.systemPrompt) {
-      newParams._meta = {
-        antigravity: {
-          systemPrompt: {
-            append: this.systemPrompt,
-          },
-        },
+    let abortHandler: (() => void) | null = null;
+    if (signal) {
+      abortHandler = () => {
+        void this.close("aborted_startup");
       };
+      signal.addEventListener("abort", abortHandler, { once: true });
     }
 
-    const sessionRes = await this.conn.request("session/new", newParams);
-    this.nativeSessionId = (sessionRes as any)?.sessionId || this.sessionId;
-    if (Array.isArray((sessionRes as any)?.configOptions)) {
-      this.configOptions = (sessionRes as any).configOptions;
-    }
+    try {
+      // 1. Write agent manifest
+      const agentDir = path.join(
+        this.workspaceDir,
+        ".agents",
+        "agents",
+        "magpie-bridge",
+      );
+      fs.mkdirSync(agentDir, { recursive: true });
 
-    this.setState("IDLE");
+      const minimalAgent = Boolean(this.options.minimalAgent);
+      const agentContent = [
+        "---",
+        "name: magpie-bridge",
+        "description: Bridges only client-declared tools",
+        "mainAgent: true",
+        "subagent: false",
+        "tools: []",
+        "inheritMcp: false",
+        "inheritCustomizations: false",
+        `excludeDefaultComponents: ${minimalAgent ? "true" : "false"}`,
+        "---",
+        "Use only the provided MCP tools when tools are needed. Never output raw XML/JSON tool-call markup as text.",
+        "",
+      ].join("\n");
+      fs.writeFileSync(path.join(agentDir, "agent.md"), agentContent, "utf-8");
+
+      // 2. Initialize SessionToolBroker
+      this.broker = new SessionToolBroker({
+        batchWindowMs: 25,
+        callDeadlineMs:
+          Number(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS) || 15 * 60 * 1000,
+        onBatchReady: (calls: ExposedToolCall[]) => {
+          this.handleBatchReady(calls);
+        },
+        onFatalToolLoop: (reason: string) => {
+          this.handleFatalToolLoop(reason);
+        },
+        onCallExpired: () => {
+          void this.close("tool_call_deadline_expired");
+        },
+      });
+
+      if (this.options.tools) {
+        this.registeredTools = [...this.options.tools];
+        this.broker.setTools(this.options.tools);
+      }
+      if (this.options.toolChoice) {
+        this.broker.setToolChoice(this.options.toolChoice);
+      }
+      if (this.options.systemPrompt) {
+        this.systemPrompt = this.options.systemPrompt;
+      }
+
+      // 3. Register broker on LoopbackMcpServer
+      const reg = this.mcpServer.registerSession(this.broker);
+      this.unregisterMcp = reg.unregister;
+      this.mcpUrl = reg.url;
+      if ((reg as any).token) {
+        this.mcpToken = (reg as any).token;
+      }
+
+      // 4. Spawn agy ACP
+      const logFile = path.join(this.workspaceDir, "agy-acp.log");
+      const args = [
+        "acp",
+        "--agent",
+        "magpie-bridge",
+        "--stdio",
+        "--process-per-session",
+        "--log-file",
+        logFile,
+      ];
+      if (this.options.workDir && fs.existsSync(this.options.workDir)) {
+        args.push("--add-dir", this.options.workDir);
+      }
+
+      if (this.options.spawnFn) {
+        this.child = this.options.spawnFn(this.account, args, {
+          cwd: this.workspaceDir,
+        });
+      } else {
+        this.child = spawnAgy(this.account, args, {
+          cwd: this.workspaceDir,
+        });
+      }
+
+      this.conn = new AcpConnection(this.child, {
+        redactor: redactSecrets,
+        onExit: () => {
+          if (!this.isClosed) {
+            void this.close("acp_process_exited");
+          }
+        },
+      });
+      this.setupAcpListeners();
+
+      if (signal?.aborted) {
+        await this.close("aborted_startup");
+        throw new BridgeHttpError(
+          499,
+          "invalid_request_error",
+          "Request aborted during startup",
+        );
+      }
+
+      // 5. ACP initialize
+      let initRes: any;
+      try {
+        initRes = await this.conn.request("initialize", {
+          protocolVersion: 1,
+          clientInfo: {
+            name: "agy-acp",
+            version: "0.1.0",
+          },
+          clientCapabilities: {
+            fs: {
+              readTextFile: false,
+              writeTextFile: false,
+            },
+            terminal: false,
+          },
+        });
+      } catch (err: any) {
+        const stderr = this.conn.getStderrTail();
+        const combined = `${err?.message || ""}\n${stderr}`;
+        if (
+          /please sign in|not (?:logged|signed) in|authentication expired|login required|unauthenticated/i.test(
+            combined,
+          )
+        ) {
+          await this.close("auth_expired");
+          throw new BridgeHttpError(
+            401,
+            "authentication_error",
+            "Antigravity CLI authentication expired. Please sign in again.",
+            { signInExpired: true },
+          );
+        }
+        throw err;
+      }
+
+      if (signal?.aborted) {
+        await this.close("aborted_startup");
+        throw new BridgeHttpError(
+          499,
+          "invalid_request_error",
+          "Request aborted during startup",
+        );
+      }
+
+      this.imageSupported = Boolean(
+        (initRes as any)?.agentCapabilities?.promptCapabilities?.image,
+      );
+      this.appendSystemSupported = Boolean(
+        (initRes as any)?.agentCapabilities?._meta?.antigravity?.systemPrompt
+          ?.append,
+      );
+      this.resumeSupported = Boolean(
+        (initRes as any)?.agentCapabilities?.loadSession ||
+          (initRes as any)?.agentCapabilities?.sessionCapabilities?.resume,
+      );
+
+      // Cloak system prompt
+      let effectiveSystem = "";
+      let systemWithWorkDir = this.options.systemPrompt ?? "";
+      if (this.options.workDir && fs.existsSync(this.options.workDir)) {
+        const dirNote = `Working directory: ${this.options.workDir}`;
+        systemWithWorkDir = systemWithWorkDir.trim()
+          ? `${systemWithWorkDir}\n\n${dirNote}`
+          : dirNote;
+      }
+      effectiveSystem = cloakSystemPrompt(
+        systemWithWorkDir,
+        this.options.cloakPrompts !== false,
+      );
+
+      // 6. ACP session/resume or session/new
+      let sessionRes: any = null;
+      if (this.options.resumeSessionId && this.resumeSupported) {
+        try {
+          const resumeParams: Record<string, unknown> = {
+            sessionId: this.options.resumeSessionId,
+            cwd: this.workspaceDir,
+            mcpServers: [{ name: "magpie", type: "http", url: this.mcpUrl }],
+          };
+          if (this.appendSystemSupported && effectiveSystem) {
+            resumeParams._meta = {
+              antigravity: {
+                systemPrompt: {
+                  append: effectiveSystem,
+                },
+              },
+            };
+          }
+          sessionRes = await this.conn.request("session/resume", resumeParams);
+          this.resumedFromShelf = true;
+          this.nativeSessionId =
+            sessionRes?.sessionId || this.options.resumeSessionId;
+        } catch {
+          this.resumedFromShelf = false;
+        }
+      }
+
+      if (!sessionRes) {
+        const newParams: Record<string, unknown> = {
+          cwd: this.workspaceDir,
+          mcpServers: [{ name: "magpie", type: "http", url: this.mcpUrl }],
+        };
+
+        if (this.appendSystemSupported && effectiveSystem) {
+          newParams._meta = {
+            antigravity: {
+              systemPrompt: {
+                append: effectiveSystem,
+              },
+            },
+          };
+        }
+
+        try {
+          sessionRes = await this.conn.request("session/new", newParams);
+          this.nativeSessionId =
+            (sessionRes as any)?.sessionId || this.sessionId;
+        } catch (err: any) {
+          const stderr = this.conn.getStderrTail();
+          const combined = `${err?.message || ""}\n${stderr}`;
+          if (
+            /please sign in|not (?:logged|signed) in|authentication expired|login required|unauthenticated/i.test(
+              combined,
+            )
+          ) {
+            await this.close("auth_expired");
+            throw new BridgeHttpError(
+              401,
+              "authentication_error",
+              "Antigravity CLI authentication expired. Please sign in again.",
+              { signInExpired: true },
+            );
+          }
+          throw err;
+        }
+      }
+
+      if (Array.isArray((sessionRes as any)?.configOptions)) {
+        this.configOptions = (sessionRes as any).configOptions;
+      }
+
+      if (signal?.aborted) {
+        await this.close("aborted_startup");
+        throw new BridgeHttpError(
+          499,
+          "invalid_request_error",
+          "Request aborted during startup",
+        );
+      }
+
+      this.setState("IDLE");
+    } finally {
+      if (signal && abortHandler) {
+        signal.removeEventListener("abort", abortHandler);
+      }
+    }
   }
 
   private setupAcpListeners(): void {
@@ -383,18 +562,38 @@ export class AgySessionWorker {
     const updateType = update.sessionUpdate;
 
     if (updateType === "agent_message_chunk") {
-      const text = update.content?.text ?? update.text ?? "";
-      if (text.includes("⚠ Agent execution terminated due to error.")) {
-        const errorEvent = this.diagnoseTerminationError();
-        if (this.activeTurnQueue) {
-          this.activeTurnQueue.push(errorEvent);
-          const q = this.activeTurnQueue;
-          this.activeTurnQueue = null;
-          q.close();
+      const chunk = update.content?.text ?? update.text ?? "";
+      if (!chunk) return;
+
+      let text = this.heldText + chunk;
+      this.heldText = "";
+
+      const marker = text.lastIndexOf(AGENT_ERROR_CORE);
+      if (
+        marker >= 0 &&
+        !text.slice(marker + AGENT_ERROR_CORE.length).trim()
+      ) {
+        const start = text[marker - 1] === "\n" ? marker - 1 : marker;
+        this.heldText = text.slice(start);
+        text = text.slice(0, start);
+        if (this.activeTurnQueue && text) {
+          this.activeTurnQueue.push({ type: "text_delta", text });
         }
-        this.setState("IDLE");
         return;
       }
+
+      for (
+        let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1);
+        keep > 0;
+        keep--
+      ) {
+        if (AGENT_ERROR_MARKER.startsWith(text.slice(-keep))) {
+          this.heldText = text.slice(-keep);
+          text = text.slice(0, -keep);
+          break;
+        }
+      }
+
       if (this.activeTurnQueue && text) {
         this.activeTurnQueue.push({ type: "text_delta", text });
       }
@@ -448,7 +647,20 @@ export class AgySessionWorker {
     try {
       const logPath = path.join(this.workspaceDir, "agy-acp.log");
       if (fs.existsSync(logPath)) {
-        logContent = fs.readFileSync(logPath, "utf-8");
+        const stat = fs.statSync(logPath);
+        const length = stat.size - this.turnLogOffset;
+        if (length > 0) {
+          const fd = fs.openSync(logPath, "r");
+          try {
+            const buf = Buffer.alloc(length);
+            fs.readSync(fd, buf, 0, length, this.turnLogOffset);
+            logContent = buf.toString("utf-8");
+          } finally {
+            try {
+              fs.closeSync(fd);
+            } catch {}
+          }
+        }
       }
     } catch {}
 
@@ -456,8 +668,30 @@ export class AgySessionWorker {
     const combined = `${logContent}\n${stderrTail}`;
 
     if (
+      /please sign in|not (?:logged|signed) in|authentication expired|login required|unauthenticated/i.test(
+        combined,
+      )
+    ) {
+      return {
+        type: "error",
+        status: 401,
+        errorType: "authentication_error",
+        message: "Antigravity CLI authentication expired. Please sign in again.",
+        signInExpired: true,
+      };
+    }
+
+    if (
       /429|RESOURCE_EXHAUSTED|exhausted your quota|quota/i.test(combined)
     ) {
+      if (turnsAway(this.systemPrompt) && !this.options.cloakPrompts) {
+        return {
+          type: "error",
+          status: 400,
+          errorType: "invalid_request_error",
+          message: refusalHint(this.systemPrompt),
+        };
+      }
       return {
         type: "error",
         status: 429,
@@ -523,6 +757,7 @@ export class AgySessionWorker {
     }
 
     // 3. Transition worker state: GENERATING -> AWAITING_TOOL_RESULTS
+    this.promptStepCount++;
     this.setState("AWAITING_TOOL_RESULTS");
 
     // 4. Yield finish(tool_use, zeroUsage)
@@ -543,8 +778,21 @@ export class AgySessionWorker {
     q.close();
   }
 
-  async applyModelSelection(selection: ModelSelection): Promise<void> {
-    const modelOpt = this.configOptions.find((o: any) => o.id === "model");
+  async applyModelSelection(
+    selection: ModelSelection,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted) {
+      throw new BridgeHttpError(
+        499,
+        "invalid_request_error",
+        "Request aborted during startup",
+      );
+    }
+
+    const modelOpt = this.configOptions.find(
+      (o: any) => o.id === "model" || o.category === "model",
+    );
     let modelConfigApplied = false;
 
     if (modelOpt) {
@@ -553,25 +801,39 @@ export class AgySessionWorker {
           this.currentModelSelection?.configModelValue !==
           selection.configModelValue
         ) {
-          await this.conn.request("session/set_config_option", {
+          const res: any = await this.conn.request("session/set_config_option", {
             sessionId: this.nativeSessionId,
-            configId: "model",
+            configId: modelOpt.id || "model",
             value: selection.configModelValue,
           });
+          if (Array.isArray(res?.configOptions)) {
+            this.configOptions = res.configOptions;
+          }
         }
-        modelConfigApplied = true;
+        const updatedModelOpt = this.configOptions.find(
+          (o: any) => o.id === "model" || o.category === "model",
+        );
+        if (
+          !updatedModelOpt ||
+          updatedModelOpt.currentValue === undefined ||
+          updatedModelOpt.currentValue === selection.configModelValue
+        ) {
+          modelConfigApplied = true;
+        }
 
         if (selection.effort) {
           const thoughtOpt = this.configOptions.find(
-            (o: any) => o.id === "thought_level",
+            (o: any) =>
+              o.id === "thought_level" || o.category === "thought_level",
           );
           if (thoughtOpt) {
             let chosenEffort: string = selection.effort;
-            const offered = Array.isArray(thoughtOpt.options)
-              ? thoughtOpt.options.map((opt: any) =>
-                  typeof opt === "string" ? opt : opt.id || opt.value,
-                )
+            const flattened = Array.isArray(thoughtOpt.options)
+              ? flattenOptions(thoughtOpt.options)
               : [];
+            const offered = flattened.map((opt: any) =>
+              typeof opt === "string" ? opt : opt.id || opt.value,
+            );
             if (offered.length > 0 && !offered.includes(chosenEffort)) {
               const effortLevels: EffortLevel[] = [
                 "minimal",
@@ -600,11 +862,17 @@ export class AgySessionWorker {
               chosenEffort = closest;
             }
 
-            await this.conn.request("session/set_config_option", {
-              sessionId: this.nativeSessionId,
-              configId: "thought_level",
-              value: chosenEffort,
-            });
+            const tRes: any = await this.conn.request(
+              "session/set_config_option",
+              {
+                sessionId: this.nativeSessionId,
+                configId: thoughtOpt.id || "thought_level",
+                value: chosenEffort,
+              },
+            );
+            if (Array.isArray(tRes?.configOptions)) {
+              this.configOptions = tRes.configOptions;
+            }
           }
         }
       } catch {
@@ -645,6 +913,13 @@ export class AgySessionWorker {
     this.broker.openTurnWindow();
     this.setState("GENERATING");
     this.currentThinkingAccumulator = "";
+    this.heldText = "";
+    const logPath = path.join(this.workspaceDir, "agy-acp.log");
+    try {
+      this.turnLogOffset = fs.statSync(logPath).size;
+    } catch {
+      this.turnLogOffset = 0;
+    }
     const queue = new AsyncEventQueue<TurnStreamEvent>();
     this.activeTurnQueue = queue;
 
@@ -691,18 +966,55 @@ export class AgySessionWorker {
   }
 
   private handlePromptSuccess(result: any): void {
-    const promptUsage: TokenUsageSummary = {
-      inputTokens: result?.usage?.inputTokens ?? 0,
-      outputTokens: result?.usage?.outputTokens ?? 0,
-      cacheReadInputTokens:
-        result?.usage?.cachedReadTokens ??
-        result?.usage?.cacheReadInputTokens ??
-        0,
-      cacheCreationInputTokens:
-        result?.usage?.cachedWriteTokens ??
-        result?.usage?.cacheCreationInputTokens ??
-        0,
-    };
+    if (this.heldText.includes(AGENT_ERROR_CORE)) {
+      this.heldText = "";
+      const errorEvent = this.diagnoseTerminationError();
+      if (this.activeTurnQueue) {
+        this.activeTurnQueue.push(errorEvent);
+        const q = this.activeTurnQueue;
+        this.activeTurnQueue = null;
+        q.close();
+      }
+      this.setState("IDLE");
+      this.pendingPromptPromise = null;
+      return;
+    }
+
+    if (this.heldText && this.activeTurnQueue) {
+      this.activeTurnQueue.push({ type: "text_delta", text: this.heldText });
+      this.heldText = "";
+    }
+
+    if (result?.stopReason === "refusal") {
+      const diag = this.diagnoseTerminationError();
+      if (
+        diag.type === "error" &&
+        (diag.status === 400 || diag.status === 401 || diag.status === 429)
+      ) {
+        if (this.activeTurnQueue) {
+          this.activeTurnQueue.push(diag);
+          const q = this.activeTurnQueue;
+          this.activeTurnQueue = null;
+          q.close();
+        }
+        this.setState("IDLE");
+        this.pendingPromptPromise = null;
+        return;
+      }
+    }
+
+    const stepUsages = readConversationStepUsages(
+      this.account,
+      this.nativeSessionId,
+    );
+    const settledUsage = settleStepUsage(
+      result?.usage,
+      this.promptStepCount,
+      stepUsages.length > 0 ? stepUsages : undefined,
+    );
+    this.promptStepCount = 1;
+
+    const promptUsage: TokenUsageSummary = settledUsage;
 
     if (this._state === "GENERATING") {
       this.broker.markHttpTurnClosed();
@@ -737,8 +1049,10 @@ export class AgySessionWorker {
         cacheCreationInputTokens: 0,
       };
 
-      let stopReason: "end_turn" | "max_tokens" | "stop_sequence" = "end_turn";
-      if (result?.stopReason === "max_tokens") {
+      let stopReason: TurnStopReason = "end_turn";
+      if (result?.stopReason === "refusal") {
+        stopReason = "refusal";
+      } else if (result?.stopReason === "max_tokens") {
         stopReason = "max_tokens";
       } else if (result?.stopReason === "stop_sequence") {
         stopReason = "stop_sequence";
@@ -958,7 +1272,17 @@ export class AgySessionWorker {
 
     // Transition to IDLE and start prompt turn with steeringPromptParts
     this.setState("IDLE");
-    yield* this.startPromptTurn(steeringPromptParts, signal);
+    const acpSteeringParts = steeringPromptParts.map((p: any) => {
+      if (p.type === "image") {
+        return {
+          type: "image",
+          mimeType: p.mediaType || p.mimeType,
+          data: p.data,
+        };
+      }
+      return p;
+    });
+    yield* this.startPromptTurn(acpSteeringParts, signal);
   }
 
   private async waitForActiveToolCallsCommit(timeoutMs: number): Promise<void> {

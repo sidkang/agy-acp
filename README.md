@@ -69,6 +69,7 @@ magpie quota agy-acp --json
 | 开关 Key | 默认值 | 说明 |
 |---|---|---|
 | `quota_routing` | `false` | **按配额自动多账号路由**：开启后将 5 小时 / 7 天配额窗口标记为活跃（`aside: false`），某个账号对应模型池耗尽时由 Magpie 自动路由到其他已登录账号。 |
+| `cloak_prompts` | `true` | **自动脱敏第三方客户端提示词**：剥离旋转计费头（`x-anthropic-billing-header`）并对 Claude Code / Codex / oh-my-pi 等会触发上游伪 429 拒绝的固定标识句插入零宽空格。 |
 | `minimal_agent` | `false` | **精简内置系统提示词**：在临时隔离桥接 Agent 中开启 `excludeDefaultComponents: true`，大幅减少每次请求的内置提示词 Token 开销（内置读写/终端工具无论开关与否始终强制禁用）。 |
 | `expose_thinking` | `false` | **输出思考摘要块**：将 ACP 返回的思考摘要编码为 Anthropic `thinking` 内容块输出。 |
 
@@ -81,9 +82,10 @@ magpie quota agy-acp --json
 | `AGY_PATH` | 按 `PATH` 自动查找 | 指定 `agy` 可执行文件路径 |
 | `AGY_ACP_DATA_DIR` | `$XDG_DATA_HOME/agy-acp` | 插件隔离账号数据与防弹窗垫片根目录 |
 | `AGY_BRIDGE_MAX_PROCS` | `16` | 全局活跃/挂起 `agy acp` 会话进程上限 |
-| `AGY_MAGPIE_QUOTA_ROUTING` | `false` | 环境变量方式覆盖 `quota_routing` 默认值 |
-| `AGY_MAGPIE_MINIMAL_AGENT` | `false` | 环境变量方式覆盖 `minimal_agent` 默认值 |
-| `AGY_MAGPIE_EXPOSE_THINKING` | `false` | 环境变量方式覆盖 `expose_thinking` 默认值 |
+| `AGY_MAGPIE_QUOTA_ROUTING` | `false` | 环境变量方式覆盖 `quota_routing` 初始默认值 |
+| `AGY_MAGPIE_CLOAK_PROMPTS` | `true` | 环境变量方式覆盖 `cloak_prompts` 初始默认值 |
+| `AGY_MAGPIE_MINIMAL_AGENT` | `false` | 环境变量方式覆盖 `minimal_agent` 初始默认值 |
+| `AGY_MAGPIE_EXPOSE_THINKING` | `false` | 环境变量方式覆盖 `expose_thinking` 初始默认值 |
 | `AGY_CLI_DISABLE_AUTO_UPDATE` | `true` | 默认禁止插件子进程并发自动更新二进制 |
 
 ---

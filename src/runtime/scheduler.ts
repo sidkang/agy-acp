@@ -8,6 +8,7 @@ export interface GlobalSchedulerOptions {
   reaperIntervalMs?: number;
   awaitingToolTimeoutMs?: number;
   installSignalHandlers?: boolean;
+  onBeforeEvictIdle?: (worker: AgySessionWorker) => void;
 }
 
 const globalActiveSchedulers = new Set<GlobalScheduler>();
@@ -40,9 +41,11 @@ export class GlobalScheduler {
   readonly idleTimeoutMs: number;
   readonly reaperIntervalMs: number;
   readonly awaitingToolTimeoutMs: number;
+  readonly onBeforeEvictIdle?: (worker: AgySessionWorker) => void;
 
   private readonly workers = new Set<AgySessionWorker>();
   private reaperTimer?: ReturnType<typeof setInterval>;
+  private admissionLock: Promise<void> = Promise.resolve();
 
   constructor(options?: GlobalSchedulerOptions) {
     const envMax = process.env.AGY_BRIDGE_MAX_PROCS
@@ -54,6 +57,7 @@ export class GlobalScheduler {
     this.idleTimeoutMs = options?.idleTimeoutMs ?? 10 * 60 * 1000; // 10 minutes
     this.awaitingToolTimeoutMs = options?.awaitingToolTimeoutMs ?? 10 * 60 * 1000; // 10 minutes
     this.reaperIntervalMs = options?.reaperIntervalMs ?? 60 * 1000; // 1 minute
+    this.onBeforeEvictIdle = options?.onBeforeEvictIdle;
 
     this.reaperTimer = setInterval(() => {
       void this.reapIdleWorkers();
@@ -97,8 +101,31 @@ export class GlobalScheduler {
   }
 
   async reserveAndRegister(worker: AgySessionWorker): Promise<void> {
-    await this.ensureCapacity(worker.account);
-    this.registerWorker(worker);
+    let unlockNext!: () => void;
+    const nextLock = new Promise<void>((resolve) => {
+      unlockNext = resolve;
+    });
+    const currentLock = this.admissionLock;
+    this.admissionLock = nextLock;
+
+    try {
+      await currentLock;
+      await this.ensureCapacity(worker.account);
+      this.registerWorker(worker);
+    } finally {
+      unlockNext();
+    }
+  }
+
+  private notifyEvictIdle(worker: AgySessionWorker): void {
+    if (worker.state === "IDLE") {
+      try {
+        worker.onEvict?.();
+      } catch {}
+      try {
+        this.onBeforeEvictIdle?.(worker);
+      } catch {}
+    }
   }
 
   async ensureCapacity(account: AccountDescriptor): Promise<void> {
@@ -132,6 +159,7 @@ export class GlobalScheduler {
 
       const victim = evictableAccountWorkers[0]!;
       this.workers.delete(victim);
+      this.notifyEvictIdle(victim);
       await victim.close("evicted_account_lru");
     }
 
@@ -155,6 +183,7 @@ export class GlobalScheduler {
 
       const victim = evictableWorkers[0]!;
       this.workers.delete(victim);
+      this.notifyEvictIdle(victim);
       await victim.close("evicted_global_lru");
     }
   }
@@ -170,6 +199,7 @@ export class GlobalScheduler {
 
     const victim = idleWorkers[0]!;
     this.workers.delete(victim);
+    this.notifyEvictIdle(victim);
     await victim.close("evicted_idle_lru");
     return victim;
   }
@@ -183,6 +213,7 @@ export class GlobalScheduler {
         now - worker.lastActivityAt >= this.idleTimeoutMs
       ) {
         this.workers.delete(worker);
+        this.notifyEvictIdle(worker);
         await worker.close("idle_timeout");
         count++;
       } else if (

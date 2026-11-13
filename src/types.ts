@@ -1,7 +1,7 @@
 export type AccountMode = "host" | "isolated";
 
 export interface AccountDescriptor {
-  /** Magpie slot key, e.g. "agy" or "agy#abc123" */
+  /** Magpie slot key, e.g. "agy-acp" or "agy-acp#abc123" */
   readonly slotKey: string;
   /** Immutable internal reference: "host" or validated UUID v4 */
   readonly accountRef: string;
@@ -24,6 +24,7 @@ export interface ProviderOptionsState {
   quotaRouting: boolean;
   minimalAgent: boolean;
   exposeThinking: boolean;
+  cloakPrompts: boolean;
 }
 
 export type EffortLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -90,6 +91,8 @@ export interface NormalizedAnthropicRequest {
   maxTokens?: number;
   thinkingEnabled: boolean;
   sessionId: string | null;
+  subagentId?: string;
+  workDir?: string;
   userId?: string;
 }
 
@@ -99,6 +102,13 @@ export interface TokenUsageSummary {
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
 }
+
+export type TurnStopReason =
+  | "end_turn"
+  | "tool_use"
+  | "max_tokens"
+  | "stop_sequence"
+  | "refusal";
 
 export type TurnStreamEvent =
   | { type: "text_delta"; text: string }
@@ -112,7 +122,7 @@ export type TurnStreamEvent =
     }
   | {
       type: "finish";
-      stopReason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
+      stopReason: TurnStopReason;
       usage: TokenUsageSummary;
     }
   | {
@@ -126,6 +136,7 @@ export type TurnStreamEvent =
         | "overloaded_error"
         | "api_error";
       message: string;
+      signInExpired?: boolean;
     };
 
 export class BridgeHttpError extends Error {
@@ -137,15 +148,20 @@ export class BridgeHttpError extends Error {
     | "rate_limit_error"
     | "overloaded_error"
     | "api_error";
+  readonly signInExpired: boolean;
 
   constructor(
     status: number,
     errorType: BridgeHttpError["errorType"],
     message: string,
+    opts?: { signInExpired?: boolean },
   ) {
     super(message);
     this.name = "BridgeHttpError";
     this.status = status;
     this.errorType = errorType;
+    this.signInExpired = Boolean(
+      opts?.signInExpired || (status === 401 && errorType === "authentication_error"),
+    );
   }
 }

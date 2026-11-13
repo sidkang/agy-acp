@@ -333,11 +333,17 @@ export function createAuthMethods() {
                 throw new Error("No .gemini directory created in isolated home dir");
               }
 
+              // Magpie's `settle()` dedupes accounts by `metadata.email`, so a
+              // display label alone would replace an earlier account that used
+              // the same label. Keep the label readable in Magpie's UI but make
+              // the identity unique per isolated account reference.
               const metadata: PersistedAuthMetadata = {
                 schemaVersion: 1,
                 accountRef,
                 mode: "isolated",
-                email: cleanLabel || `agy-${accountRef.slice(0, 8)}`,
+                email: cleanLabel
+                  ? `${cleanLabel} (${accountRef.slice(0, 8)})`
+                  : `agy-${accountRef.slice(0, 8)}`,
                 label: cleanLabel || undefined,
               };
 

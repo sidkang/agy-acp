@@ -302,7 +302,7 @@ export function buildCatalog(
  */
 export function buildProviderModels(
   catalog: AccountCatalog,
-  options?: { includeRawIds?: boolean }
+  options?: { includeRawIds?: boolean; fellBack?: boolean }
 ): Record<string, MagpieModelMetadata> {
   const result: Record<string, MagpieModelMetadata> = {};
 
@@ -350,6 +350,15 @@ export function buildProviderModels(
     }
   }
 
+  if (catalog.isFallback || options?.fellBack === true) {
+    // Magpie (host.js) keeps the model list it already had when a provider says
+    // it fell back, instead of replacing it with a transient fallback catalog.
+    Object.defineProperty(result, Symbol.for("magpie.fellBack"), {
+      value: true,
+      enumerable: false,
+    });
+  }
+
   return result;
 }
 
@@ -380,6 +389,10 @@ export function resolveRequestedModel(
     }
   }
 
+  // Magpie appends `[1m]` to denote a 1M-context request; it is not part of
+  // the agy model ID.
+  modelName = modelName.replace(/\[1m\]$/i, "");
+
   // Strip trailing date suffixes like "-20241022" or "-20250514"
   const undated = modelName.replace(/-\d{8}$/, "");
 
@@ -400,8 +413,8 @@ export function resolveRequestedModel(
   }
 
   // Check if directly a known raw ID
-  if (catalog.rawIds.has(trimmed)) {
-    const variant = catalog.variants.get(trimmed);
+  if (catalog.rawIds.has(modelName)) {
+    const variant = catalog.variants.get(modelName);
     if (effortOverride && variant?.familyId && catalog.routes.has(variant.familyId)) {
       const fam = catalog.routes.get(variant.familyId)!;
       const effort = closestEffort(effortOverride, fam.efforts);
@@ -412,8 +425,8 @@ export function resolveRequestedModel(
       };
     }
     return {
-      rawModelId: trimmed,
-      configModelValue: variant?.configModelValue ?? trimmed,
+      rawModelId: modelName,
+      configModelValue: variant?.configModelValue ?? modelName,
       effort: variant?.effort,
     };
   }
@@ -487,13 +500,18 @@ export function getStaticFallbackCatalog(): AccountCatalog {
 export const CATALOG_TTL_MS = 5 * 60 * 1000;
 export const CATALOG_FAST_WAIT_MS = 1500;
 
+interface CatalogLookup {
+  catalog: AccountCatalog;
+  fellBack: boolean;
+}
+
 /**
  * Per-account CatalogService with 5-minute TTL, single-flight refresh,
  * and fast-return static fallback if initial probe exceeds 1500ms.
  */
 export class CatalogService {
   private cache = new Map<string, { catalog: AccountCatalog; fetchedAt: number }>();
-  private inFlight = new Map<string, Promise<AccountCatalog>>();
+  private inFlight = new Map<string, Promise<CatalogLookup>>();
 
   /**
    * Caches and single-flight slots are scoped by both descriptors: a slot can be
@@ -505,12 +523,13 @@ export class CatalogService {
   }
 
   /**
-   * Fetches catalog for an account.
+   * Fetches catalog for an account. `fellBack` says the probe failed and the
+   * result is either the previous cached catalog or the static fallback.
    */
   private async fetchAccountCatalog(
     account: AccountDescriptor,
     signal?: AbortSignal
-  ): Promise<AccountCatalog> {
+  ): Promise<CatalogLookup> {
     const cacheScopeKey = CatalogService.cacheScopeKey(account);
     const res = await execAgyBounded(account, ["models"], {
       timeoutMs: 10_000,
@@ -519,49 +538,57 @@ export class CatalogService {
 
     if (res.exitCode !== 0 || !res.stdout.trim()) {
       const existing = this.cache.get(cacheScopeKey);
-      if (existing) return existing.catalog;
-      return getStaticFallbackCatalog();
+      return {
+        catalog: existing?.catalog ?? getStaticFallbackCatalog(),
+        fellBack: true,
+      };
     }
 
     const rawList = parseAgyModelsOutput(res.stdout);
     if (rawList.length === 0) {
       const existing = this.cache.get(cacheScopeKey);
-      if (existing) return existing.catalog;
-      return getStaticFallbackCatalog();
+      return {
+        catalog: existing?.catalog ?? getStaticFallbackCatalog(),
+        fellBack: true,
+      };
     }
 
-    return buildCatalog(rawList);
+    return { catalog: buildCatalog(rawList), fellBack: false };
   }
 
   /**
-   * Returns AccountCatalog for the given account.
+   * Returns AccountCatalog plus whether the probe failed and the result came
+   * from a previous cache or the static fallback.
    * If fresh cache is available, returns it immediately.
    * Otherwise launches single-flight refresh, waiting up to 1500ms before falling back.
    */
-  async getCatalog(
+  async getCatalogWithMeta(
     account: AccountDescriptor,
     options?: { forceRefresh?: boolean; signal?: AbortSignal }
-  ): Promise<AccountCatalog> {
+  ): Promise<CatalogLookup> {
     const cacheScopeKey = CatalogService.cacheScopeKey(account);
     const now = Date.now();
     const cached = this.cache.get(cacheScopeKey);
 
     if (!options?.forceRefresh && cached && !cached.catalog.isFallback && now - cached.fetchedAt < CATALOG_TTL_MS) {
-      return cached.catalog;
+      return { catalog: cached.catalog, fellBack: false };
     }
 
     let refresh = this.inFlight.get(cacheScopeKey);
     if (!refresh) {
       refresh = this.fetchAccountCatalog(account, options?.signal)
-        .then((catalog) => {
-          if (!catalog.isFallback) {
-            this.cache.set(cacheScopeKey, { catalog, fetchedAt: Date.now() });
+        .then((lookup) => {
+          if (!lookup.fellBack && !lookup.catalog.isFallback) {
+            this.cache.set(cacheScopeKey, { catalog: lookup.catalog, fetchedAt: Date.now() });
           }
-          return catalog;
+          return lookup;
         })
         .catch(() => {
           const prev = this.cache.get(cacheScopeKey);
-          return prev?.catalog ?? getStaticFallbackCatalog();
+          return {
+            catalog: prev?.catalog ?? getStaticFallbackCatalog(),
+            fellBack: true,
+          };
         })
         .finally(() => {
           if (this.inFlight.get(cacheScopeKey) === refresh) {
@@ -587,7 +614,20 @@ export class CatalogService {
     }
 
     // Refresh timed out: return cached catalog if available, or static fallback while refreshing in background
-    return cached?.catalog ?? getStaticFallbackCatalog();
+    return {
+      catalog: cached?.catalog ?? getStaticFallbackCatalog(),
+      fellBack: true,
+    };
+  }
+
+  /**
+   * Returns AccountCatalog for the given account.
+   */
+  async getCatalog(
+    account: AccountDescriptor,
+    options?: { forceRefresh?: boolean; signal?: AbortSignal }
+  ): Promise<AccountCatalog> {
+    return (await this.getCatalogWithMeta(account, options)).catalog;
   }
 
   /**
@@ -595,10 +635,15 @@ export class CatalogService {
    */
   async getModels(
     account: AccountDescriptor,
-    options?: { signal?: AbortSignal }
+    options?: { signal?: AbortSignal; includeRawIds?: boolean }
   ): Promise<Record<string, MagpieModelMetadata>> {
-    const catalog = await this.getCatalog(account, options);
-    return buildProviderModels(catalog);
+    const { catalog, fellBack } = await this.getCatalogWithMeta(account, {
+      signal: options?.signal,
+    });
+    return buildProviderModels(catalog, {
+      includeRawIds: options?.includeRawIds,
+      fellBack,
+    });
   }
 
   /**
@@ -607,9 +652,10 @@ export class CatalogService {
   async resolveModel(
     account: AccountDescriptor,
     requestedModel: string,
-    effortOverride?: EffortLevel
+    effortOverride?: EffortLevel,
+    signal?: AbortSignal
   ): Promise<{ rawModelId: string; configModelValue: string; effort?: EffortLevel } | null> {
-    const catalog = await this.getCatalog(account);
+    const catalog = await this.getCatalog(account, { signal });
     return resolveRequestedModel(requestedModel, catalog, effortOverride);
   }
 }

@@ -16,6 +16,7 @@ import {
 } from "../src/runtime/worker";
 import { SessionCoordinator } from "../src/sessions/coordinator";
 import { getSharedMcpServer } from "../src/mcp/http-server";
+import { settleStepUsage } from "../src/usage/step-usage";
 
 const fakeAcpPath = path.resolve(__dirname, "fixtures/fake-acp.ts");
 
@@ -1107,5 +1108,528 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     )!;
     expect(worker2).toBeDefined();
     expect(worker2.account.accountRef).toBe(reauthAccount.accountRef);
+  });
+
+  test("17. Rotating x-anthropic-billing-header: cch=... across turns reuses the warm worker (0 session resets!)", async () => {
+    const sessionId = `test-billing-${Date.now()}`;
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system:
+        "x-anthropic-billing-header: cch=1111aaaa;\nYou are a helpful coding assistant.",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Hello turn 1" }] },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+
+    const worker1 = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker1).toBeDefined();
+    expect(worker1.state).toBe("IDLE");
+
+    // Turn 2 has a DIFFERENT cch hash on the billing header
+    const req2: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system:
+        "x-anthropic-billing-header: cch=2222bbbb;\nYou are a helpful coding assistant.",
+      messages: [
+        ...worker1.committedMessages,
+        { role: "user", content: [{ type: "text", text: "Hello turn 2" }] },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+
+    for await (const _ of coordinator.executeTurn(testAccount, req2, sel)) {}
+
+    const worker2 = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker2).toBe(worker1); // Reused identical warm worker, 0 resets!
+    expect(worker1.state).toBe("IDLE");
+    await worker2.close("test_done");
+  });
+
+  test("18. <system-reminder>PreToolUse hook...</system-reminder> alongside tool_result attaches to MCP tool result and does NOT send session/cancel, whereas <system-reminder>The user sent a new message while you were working: stop and say HI</system-reminder> triggers steering", async () => {
+    const sessionId = `test-reminder-${Date.now()}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object" },
+      },
+    ];
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Test reminders",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    const events1: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req1, sel)) {
+      events1.push(ev);
+    }
+    const toolUse1 = events1.find((e) => e.type === "tool_use") as any;
+    expect(toolUse1).toBeDefined();
+    const toolCallId1 = toolUse1.id;
+
+    const worker = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker.state).toBe("AWAITING_TOOL_RESULTS");
+
+    // Case A: Companion notice alongside tool_result
+    const req2: NormalizedAnthropicRequest = {
+      ...req1,
+      messages: [
+        ...worker.committedMessages,
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: toolCallId1,
+              isError: false,
+              content: [{ type: "text", text: "75F sunny" }],
+            },
+            {
+              type: "text",
+              text: "<system-reminder>PreToolUse hook executed successfully</system-reminder>",
+            },
+          ],
+        },
+      ],
+    };
+    const events2: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req2, sel)) {
+      events2.push(ev);
+    }
+    expect(worker.state).toBe("IDLE");
+    expect(events2.some((e) => e.type === "finish")).toBe(true);
+
+    // Case B: Trigger another tool call, then test queued user steering
+    const req3: NormalizedAnthropicRequest = {
+      ...req1,
+      messages: [
+        ...worker.committedMessages,
+        {
+          role: "user",
+          content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
+        },
+      ],
+    };
+    const events3: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req3, sel)) {
+      events3.push(ev);
+    }
+    const toolUse3 = events3.find((e) => e.type === "tool_use") as any;
+    expect(toolUse3).toBeDefined();
+    const toolCallId3 = toolUse3.id;
+    expect(worker.state).toBe("AWAITING_TOOL_RESULTS");
+
+    const req4: NormalizedAnthropicRequest = {
+      ...req1,
+      messages: [
+        ...worker.committedMessages,
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: toolCallId3,
+              isError: false,
+              content: [{ type: "text", text: "75F" }],
+            },
+            {
+              type: "text",
+              text: "<system-reminder>The user sent a new message while you were working: stop and say HI</system-reminder>",
+            },
+          ],
+        },
+      ],
+    };
+    const events4: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req4, sel)) {
+      events4.push(ev);
+    }
+    expect(worker.state).toBe("IDLE");
+    expect(events4.some((e) => e.type === "finish")).toBe(true);
+    await worker.close("test_done");
+  });
+
+  test("19. Reordered JSON keys / added default field on tool_use.input in client history still matches AWAITING_TOOL_RESULTS without throwing 409", async () => {
+    const sessionId = `test-reordered-keys-${Date.now()}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object" },
+      },
+    ];
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Key ordering test",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
+        },
+      ],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    const events1: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req1, sel)) {
+      events1.push(ev);
+    }
+    const toolUse1 = events1.find((e) => e.type === "tool_use") as any;
+    expect(toolUse1).toBeDefined();
+    const toolCallId = toolUse1.id;
+
+    const worker = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker.state).toBe("AWAITING_TOOL_RESULTS");
+
+    // Client sends history where tool_use has added default param / different input keys
+    const modifiedCommitted = worker.committedMessages.map((msg) => {
+      if (msg.role === "assistant") {
+        return {
+          role: "assistant" as const,
+          content: msg.content.map((part) => {
+            if (part.type === "tool_use") {
+              return {
+                ...part,
+                input: { ...part.input, defaultSchemaParam: true, reordered: "val" },
+              };
+            }
+            return part;
+          }),
+        };
+      }
+      return msg;
+    });
+
+    const req2: NormalizedAnthropicRequest = {
+      ...req1,
+      messages: [
+        ...modifiedCommitted,
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: toolCallId,
+              isError: false,
+              content: [{ type: "text", text: "72F" }],
+            },
+          ],
+        },
+      ],
+    };
+
+    const events: TurnStreamEvent[] = [];
+    for await (const ev of coordinator.executeTurn(testAccount, req2, sel)) {
+      events.push(ev);
+    }
+    expect(worker.state).toBe("IDLE");
+    expect(events.some((e) => e.type === "finish")).toBe(true);
+    await worker.close("test_done");
+  });
+
+  test("20. Assistant prefill merges onto a single assistant message in committedMessages and reuses warm session on Turn N+1", async () => {
+    const sessionId = `test-prefill-${Date.now()}`;
+    const req1: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Prefill test",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "What is 2+2?" }] },
+        { role: "assistant", content: [{ type: "text", text: "Answer: " }] },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    for await (const _ of coordinator.executeTurn(testAccount, req1, sel)) {}
+    const worker = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker).toBeDefined();
+
+    // committedMessages must have merged prefill and completion into exactly ONE assistant message
+    expect(worker.committedMessages.length).toBe(2);
+    expect(worker.committedMessages[0]!.role).toBe("user");
+    expect(worker.committedMessages[1]!.role).toBe("assistant");
+    const fullAssistantText = (worker.committedMessages[1]!.content[0] as any)
+      .text;
+    expect(fullAssistantText).toContain("Answer: ");
+
+    // Turn N+1: Client sends follow-up user turn
+    const req2: NormalizedAnthropicRequest = {
+      ...req1,
+      messages: [
+        ...worker.committedMessages,
+        { role: "user", content: [{ type: "text", text: "And 3+3?" }] },
+      ],
+    };
+
+    for await (const _ of coordinator.executeTurn(testAccount, req2, sel)) {}
+    const worker2 = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker2).toBe(worker); // Warm reuse!
+    expect(worker.state).toBe("IDLE");
+    await worker2.close("test_done");
+  });
+
+  test("21. 112 KiB replay budget preserves <current_turn> intact when <conversation_history> is 200 KiB", async () => {
+    const sessionId = `test-budget-${Date.now()}`;
+    const hugeChunk = "X".repeat(15 * 1024); // 15 KiB (> 12 KiB clip limit)
+    const priorMessages: any[] = [];
+    for (let i = 0; i < 15; i++) {
+      priorMessages.push(
+        {
+          role: "user",
+          content: [{ type: "text", text: `Old question ${i}: ${hugeChunk}` }],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: `Old answer ${i}: ${hugeChunk}` }],
+        },
+      );
+    }
+
+    const req: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Budget test",
+      messages: [
+        ...priorMessages,
+        {
+          role: "user",
+          content: [{ type: "text", text: "TARGET_CURRENT_TURN_PROMPT" }],
+        },
+      ],
+      tools: [],
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    let finishEvent: any = null;
+    for await (const ev of coordinator.executeTurn(testAccount, req, sel)) {
+      if (ev.type === "finish") finishEvent = ev;
+    }
+    expect(finishEvent).toBeDefined();
+
+    const worker = coordinator.getActiveWorker(
+      `${testAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(worker).toBeDefined();
+    expect(worker.state).toBe("IDLE");
+    await worker.close("test_done");
+  });
+
+  test("22. Concurrent Promise.all worker acquisitions strictly obey maxPerAccountWorkers / maxGlobalWorkers", async () => {
+    const smallScheduler = new GlobalScheduler({
+      maxGlobalWorkers: 2,
+      maxPerAccountWorkers: 2,
+    });
+
+    const w1 = new AgySessionWorker(testAccount, "sess-1", mcpServer, {
+      spawnFn: spawnFakeAcp,
+    });
+    const w2 = new AgySessionWorker(testAccount, "sess-2", mcpServer, {
+      spawnFn: spawnFakeAcp,
+    });
+    const w3 = new AgySessionWorker(testAccount, "sess-3", mcpServer, {
+      spawnFn: spawnFakeAcp,
+    });
+    const w4 = new AgySessionWorker(testAccount, "sess-4", mcpServer, {
+      spawnFn: spawnFakeAcp,
+    });
+
+    // All 4 workers in STARTING state
+    const results = await Promise.allSettled([
+      smallScheduler.reserveAndRegister(w1),
+      smallScheduler.reserveAndRegister(w2),
+      smallScheduler.reserveAndRegister(w3),
+      smallScheduler.reserveAndRegister(w4),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+
+    expect(fulfilled.length).toBe(2);
+    expect(rejected.length).toBe(2);
+    expect(smallScheduler.getActiveCount()).toBe(2);
+
+    for (const r of rejected) {
+      expect((r as PromiseRejectedResult).reason).toBeInstanceOf(
+        BridgeHttpError,
+      );
+      expect(
+        ((r as PromiseRejectedResult).reason as BridgeHttpError).status,
+      ).toBe(503);
+    }
+
+    await smallScheduler.closeAll();
+    smallScheduler.destroy();
+  });
+
+  test("23. Title/summary tool-less side request on the same sessionId does NOT evict the main warm tool-bearing worker", async () => {
+    const sideAccount: AccountDescriptor = {
+      slotKey: "agy#side-req",
+      accountRef: "33333333-3333-4333-8333-333333333333",
+      mode: "host",
+      label: "Side Test Account",
+      isolatedHomeDir: null,
+    };
+    const sessionId = `test-side-req-${Date.now()}`;
+    const tools = [
+      { name: "bash", description: "Bash", inputSchema: { type: "object" } },
+    ];
+    const reqMain: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Main tool session",
+      messages: [{ role: "user", content: [{ type: "text", text: "Start" }] }],
+      tools,
+      toolChoice: { type: "auto" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    const sel: ModelSelection = {
+      rawModelId: "gemini-3.8-flash",
+      configModelValue: "gemini-3.8-flash",
+    };
+
+    for await (const _ of coordinator.executeTurn(sideAccount, reqMain, sel)) {}
+    const mainWorker = coordinator.getActiveWorker(
+      `${sideAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(mainWorker).toBeDefined();
+    expect(mainWorker.state).toBe("IDLE");
+    expect(mainWorker.registeredTools.length).toBe(1);
+
+    // Send title side-request with tools: [] and completely different question
+    const reqTitle: NormalizedAnthropicRequest = {
+      model: "gemini-3.8-flash",
+      system: "Title generator",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Generate a short title" }],
+        },
+      ],
+      tools: [],
+      toolChoice: { type: "none" },
+      stream: true,
+      thinkingEnabled: false,
+      sessionId,
+    };
+    for await (const _ of coordinator.executeTurn(sideAccount, reqTitle, sel)) {}
+
+    // The main worker is STILL active and IDLE! Not evicted or closed!
+    const checkWorker = coordinator.getActiveWorker(
+      `${sideAccount.slotKey}::${sessionId}`,
+    )!;
+    expect(checkWorker).toBe(mainWorker);
+    expect(mainWorker.state).toBe("IDLE");
+    expect(mainWorker.registeredTools.length).toBe(1);
+    await mainWorker.close("test_done");
+  });
+
+  test("24. settleStepUsage unit tests and normalization", () => {
+    // 1. Single-step normalization with double-counted folded tokens
+    const u1 = settleStepUsage(
+      {
+        inputTokens: 100,
+        outputTokens: 50,
+        cachedReadTokens: 20,
+        cachedWriteTokens: 10,
+        totalTokens: 150,
+      },
+      1,
+    );
+    expect(u1.outputTokens).toBe(50);
+    expect(u1.cacheCreationInputTokens).toBe(10);
+    expect(u1.inputTokens).toBe(80);
+    expect(u1.cacheReadInputTokens).toBe(20);
+
+    // 2. Multi-step estimation without SQLite measurements
+    const u2 = settleStepUsage(
+      {
+        inputTokens: 300,
+        outputTokens: 60,
+        cachedReadTokens: 60,
+        totalTokens: 420,
+      },
+      3,
+    );
+    expect(u2.inputTokens).toBe(100);
+    expect(u2.cacheReadInputTokens).toBe(20);
+    expect(u2.outputTokens).toBe(60);
+
+    // 3. Exact measurement from SQLite stepMeasurements wins
+    const u3 = settleStepUsage(
+      { inputTokens: 99999, outputTokens: 99999 },
+      5,
+      [
+        { idx: 1, input: 40, output: 20, write: 5, read: 10, thinking: 0 },
+        { idx: 2, input: 50, output: 25, write: 5, read: 15, thinking: 0 },
+      ],
+    );
+    expect(u3.inputTokens).toBe(50);
+    expect(u3.outputTokens).toBe(25);
+    expect(u3.cacheReadInputTokens).toBe(15);
+    expect(u3.cacheCreationInputTokens).toBe(5);
   });
 });

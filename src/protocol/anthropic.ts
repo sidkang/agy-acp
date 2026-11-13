@@ -18,10 +18,17 @@
 //     laundered into `200` (SSE) or `502` (JSON), and `invalid_request_error`
 //     must stay a `400`.
 //
-// Parameters that the Antigravity ACP runtime cannot honour (`stop_sequences`,
-// forced `tool_choice`) are rejected instead of being silently dropped: a
-// caller that believes a stop sequence is enforced would get different text
-// than it was promised.
+// Parameters that the Antigravity ACP runtime cannot honour (`stop_sequences`)
+// are rejected instead of being silently dropped: a caller that believes a stop
+// sequence is enforced would get different text than it was promised. Forced
+// `tool_choice` values (`any`/`tool`) are *not* rejected: they are validated
+// against the declared tools and forwarded in their normalized form.
+//
+// Claude Code (>= 2.1.296) and OpenAI-Responses translators also inject a wide
+// tail of things this module must tolerate rather than 400 on: mid-conversation
+// `system`/`developer` messages (hook notices, workdir updates,
+// `<task-notification>`, queued user messages), `ToolSearch` reference blocks and
+// Anthropic server-tool result blocks. Those are normalized here, not refused.
 
 import { createHmac, randomBytes } from "node:crypto";
 
@@ -42,7 +49,20 @@ export const SESSION_ID_HEADER = "x-agy-session-id";
 /** Header carrying an explicit effort override (lowest-precedence explicit source). */
 export const EFFORT_HEADER = "x-magpie-effort";
 
+/** Header naming the Claude Code subagent that issued the turn. */
+export const SUBAGENT_HEADER = "x-magpie-subagent";
+
+/** Claude Code's own subagent header, accepted as a fallback for `SUBAGENT_HEADER`. */
+export const ALT_SUBAGENT_HEADER = "x-claude-code-agent-id";
+
+/** Header carrying the working directory the turn was issued from. */
+export const WORKDIR_HEADER = "x-magpie-work-dir";
+
+/** Response header that tells Magpie's gateway the account sign-in expired. */
+export const SIGN_IN_HEADER = "x-magpie-sign-in";
+
 type ImageMediaType = Extract<NormalizedContentPart, { type: "image" }>["mediaType"];
+type TextPart = Extract<NormalizedContentPart, { type: "text" }>;
 type ToolResultContentPart = Extract<
   NormalizedContentPart,
   { type: "tool_result" }
@@ -175,16 +195,26 @@ function parseEffortLevel(value: unknown, field: string): EffortLevel | undefine
   );
 }
 
+/**
+ * Claude Code appends `[1m]` to opt into the 1M-token context window: either at
+ * the very end (`claude-opus-5-5-low[1m]`) or just before a `:effort` suffix
+ * (`gemini-3.8-flash[1m]:high`). The marker is a client-side hint, never part of
+ * the ACP model id.
+ */
+function stripContextSuffix(value: string): string {
+  return value.replace(/\[1m\]/gi, "").trim();
+}
+
 function parseModelAndEffort(rawModel: unknown): { model: string; effort?: EffortLevel } {
   const requested = nonEmptyString(rawModel);
   if (requested === null) {
     throw invalidRequest("model is required and must be a non-empty string");
   }
 
-  let model = requested;
+  let model = stripContextSuffix(requested);
   for (const prefix of MODEL_PREFIXES) {
     if (model.startsWith(prefix)) {
-      model = model.slice(prefix.length).trim();
+      model = stripContextSuffix(model.slice(prefix.length));
       break;
     }
   }
@@ -194,7 +224,7 @@ function parseModelAndEffort(rawModel: unknown): { model: string; effort?: Effor
   const separator = model.lastIndexOf(":");
   if (separator > 0) {
     const suffix = model.slice(separator + 1).trim().toLowerCase();
-    const base = model.slice(0, separator).trim();
+    const base = stripContextSuffix(model.slice(0, separator));
     if (base !== "" && (EFFORT_LEVELS as readonly string[]).includes(suffix)) {
       effort = suffix as EffortLevel;
       model = base;
@@ -217,11 +247,11 @@ function effortFromThinkingBudget(budget: unknown): EffortLevel | undefined {
   return "high";
 }
 
-function parseToolChoice(value: unknown): ToolChoiceSpec {
+function parseToolChoice(value: unknown, tools: NormalizedTool[]): ToolChoiceSpec {
   if (value === undefined || value === null) return { type: "auto" };
 
   if (typeof value === "string") {
-    return toolChoiceFromType(value, undefined);
+    return toolChoiceFromType(value, undefined, undefined, tools);
   }
 
   if (!isPlainObject(value)) {
@@ -236,12 +266,17 @@ function parseToolChoice(value: unknown): ToolChoiceSpec {
     typeof value.disable_parallel_tool_use === "boolean"
       ? value.disable_parallel_tool_use
       : undefined;
-  return toolChoiceFromType(type.toLowerCase(), disableParallelToolUse);
+  // OpenAI-translated clients nest the tool name: { type: "function", function: { name } }.
+  const fn = isPlainObject(value.function) ? value.function : undefined;
+  const name = nonEmptyString(value.name) ?? nonEmptyString(fn?.name) ?? undefined;
+  return toolChoiceFromType(type.toLowerCase(), disableParallelToolUse, name, tools);
 }
 
 function toolChoiceFromType(
   rawType: string,
   disableParallelToolUse: boolean | undefined,
+  name: string | undefined,
+  tools: NormalizedTool[],
 ): ToolChoiceSpec {
   const type = rawType.trim().toLowerCase();
   switch (type) {
@@ -253,14 +288,35 @@ function toolChoiceFromType(
       return { type: "none" };
     case "any":
     case "required":
+      // "Call some tool" is meaningless without a tool catalog to choose from.
+      if (tools.length === 0) {
+        throw invalidRequest(
+          `tool_choice "${rawType}" requires at least one declared tool`,
+        );
+      }
+      return disableParallelToolUse === undefined
+        ? { type: "any" }
+        : { type: "any", disableParallelToolUse };
     case "tool":
-      // ACP has no server-side tool_choice enforcement: a prompt reminder is not
-      // enforcement, so pretending `any`/`tool` works would be a lie.
-      throw invalidRequest(
-        "Forced tool_choice (any/tool) is not natively enforced by Antigravity ACP; use auto or none",
-      );
+    case "function": {
+      if (name === undefined) {
+        throw invalidRequest(
+          `tool_choice "${rawType}" requires a non-empty tool "name"`,
+        );
+      }
+      if (!tools.some((tool) => tool.name === name)) {
+        throw invalidRequest(
+          `tool_choice names unknown tool "${name}"; it must match one of the declared tools`,
+        );
+      }
+      return disableParallelToolUse === undefined
+        ? { type: "tool", name }
+        : { type: "tool", name, disableParallelToolUse };
+    }
     default:
-      throw invalidRequest(`Unsupported tool_choice type "${rawType}"; use auto or none`);
+      throw invalidRequest(
+        `Unsupported tool_choice type "${rawType}"; use auto, any, tool, or none`,
+      );
   }
 }
 
@@ -335,9 +391,125 @@ function extractSystemTextFromMessage(content: unknown, index: number): string {
   return segments.join("\n\n");
 }
 
+/**
+ * Claude Code's steering envelope: a queued user message arrives wrapped in a
+ * `<system-reminder>` (or as a mid-conversation `system`/`developer` message).
+ * Unwrapping it lets the coordinator treat the text as genuine steering instead
+ * of as an anonymous reminder.
+ */
+const QUEUED_USER_MESSAGE_RE =
+  /^<system-reminder>\s*The user sent a new message while you were working:\s*([\s\S]*?)\s*<\/system-reminder>$/i;
+
+/**
+ * A mid-conversation `system`/`developer` message (hook notice, working-directory
+ * update, `<task-notification>`, queued user message) becomes a `user` turn:
+ * ACP has exactly one `user` role, and refusing these would 400 Claude Code.
+ * Wrapping reminder-shaped content keeps adjacent-`user` merging clean.
+ */
+function convertMidConversationSystemMessage(
+  content: unknown,
+  index: number,
+): TextPart | null {
+  const text = extractSystemTextFromMessage(content, index).trim();
+  if (text === "") return null;
+
+  const queued = QUEUED_USER_MESSAGE_RE.exec(text);
+  if (queued !== null) {
+    const inner = (queued[1] ?? "").trim();
+    // The wrapper itself carried the whole prompt: emit the user's words alone.
+    return inner === "" ? null : { type: "text", text: inner };
+  }
+
+  if (/^<system-reminder\b/i.test(text)) return { type: "text", text };
+  return { type: "text", text: `<system-reminder>\n${text}\n</system-reminder>` };
+}
+
 // ---------------------------------------------------------------------------
 // Request parsing: content parts
 // ---------------------------------------------------------------------------
+
+/**
+ * Block types that Claude Code's `ToolSearch` and Anthropic's server tools emit
+ * inside `content` / `tool_result` arrays. None of them map onto an ACP content
+ * block, so they are rendered as readable text (or skipped) instead of 400ing.
+ */
+const RICH_BLOCK_TYPES: ReadonlySet<string> = new Set([
+  "tool_reference",
+  "search_result",
+  "tool_addition",
+  "tool_removal",
+  "server_tool_use",
+  "mcp_tool_use",
+  "web_search_tool_result",
+  "mcp_tool_result",
+  "code_execution_tool_result",
+]);
+
+/** Flattens whatever a tool-result-ish block carries into plain text. */
+function renderBlockContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const segments: string[] = [];
+    for (const entry of content) {
+      if (typeof entry === "string") {
+        segments.push(entry);
+      } else if (isPlainObject(entry)) {
+        if (typeof entry.text === "string") segments.push(entry.text);
+        else if (typeof entry.content === "string") segments.push(entry.content);
+        else segments.push(JSON.stringify(entry));
+      }
+    }
+    return segments.join("\n");
+  }
+  if (content === undefined || content === null) return "";
+  return typeof content === "object" ? JSON.stringify(content) : String(content);
+}
+
+const TOOL_RESULT_BLOCK_LABELS: Readonly<Record<string, string>> = {
+  web_search_tool_result: "Web search results",
+  mcp_tool_result: "MCP tool result",
+  code_execution_tool_result: "Code execution result",
+};
+
+/** Renders one rich block as text, or `null` when it carries nothing to say. */
+function parseRichTextBlock(block: Record<string, unknown>, type: string): TextPart | null {
+  switch (type) {
+    case "tool_reference":
+      return {
+        type: "text",
+        text: `Loaded tool: ${nonEmptyString(block.tool_name) ?? "unknown"}`,
+      };
+    case "search_result": {
+      const title = nonEmptyString(block.title);
+      const source = nonEmptyString(block.source);
+      const body = renderBlockContent(block.content).trim();
+      const lines = [title === null ? "Search result" : `Search result: ${title}`];
+      if (source !== null) lines.push(`Source: ${source}`);
+      if (body !== "") lines.push(body);
+      return { type: "text", text: lines.join("\n") };
+    }
+    case "tool_addition":
+    case "tool_removal":
+      // Catalog deltas are already reflected in `tools`; nothing to replay.
+      return null;
+    case "server_tool_use":
+    case "mcp_tool_use": {
+      const name =
+        nonEmptyString(block.name) ?? nonEmptyString(block.tool_name) ?? "unknown";
+      const input = isPlainObject(block.input) ? JSON.stringify(block.input) : "";
+      return {
+        type: "text",
+        text: input === "" ? `Tool call: ${name}` : `Tool call: ${name} ${input}`,
+      };
+    }
+    default: {
+      const label = TOOL_RESULT_BLOCK_LABELS[type];
+      if (label === undefined) return null;
+      const body = renderBlockContent(block.content).trim();
+      return { type: "text", text: body === "" ? label : `${label}:\n${body}` };
+    }
+  }
+}
 
 function parseImageSource(
   source: unknown,
@@ -476,6 +648,10 @@ function parseToolResultPart(block: Record<string, unknown>): NormalizedContentP
           );
         }
         content.push(document);
+      } else if (typeof innerType === "string" && RICH_BLOCK_TYPES.has(innerType)) {
+        // `ToolSearch` references and server-tool results are text-only here.
+        const rich = parseRichTextBlock(inner, innerType);
+        if (rich !== null) content.push(rich);
       } else {
         throw invalidRequest(
           `Unsupported tool_result content block type "${String(innerType)}"`,
@@ -566,6 +742,11 @@ function parseContentParts(
         parts.push(parseToolResultPart(block));
         break;
       default:
+        if (typeof type === "string" && RICH_BLOCK_TYPES.has(type)) {
+          const rich = parseRichTextBlock(block, type);
+          if (rich !== null) parts.push(rich);
+          break;
+        }
         throw invalidRequest(
           `Unsupported content block type "${String(type)}" in messages[${messageIndex}]`,
         );
@@ -667,7 +848,8 @@ export function parseAnthropicRequest(
     );
   }
 
-  const toolChoice = parseToolChoice(body.tool_choice);
+  const tools = parseTools(body.tools);
+  const toolChoice = parseToolChoice(body.tool_choice, tools);
 
   const thinking = isPlainObject(body.thinking) ? body.thinking : undefined;
   const thinkingType =
@@ -693,7 +875,7 @@ export function parseAnthropicRequest(
     if (!isPlainObject(raw)) {
       throw invalidRequest(`messages[${cursor}] must be an object`);
     }
-    if (raw.role !== "system") break;
+    if (raw.role !== "system" && raw.role !== "developer") break;
     const systemText = extractSystemTextFromMessage(raw.content, cursor);
     if (systemText.trim() !== "") systemSegments.push(systemText);
     cursor += 1;
@@ -705,18 +887,25 @@ export function parseAnthropicRequest(
     if (!isPlainObject(raw)) {
       throw invalidRequest(`messages[${cursor}] must be an object`);
     }
-    if (raw.role === "system") {
-      throw invalidRequest(
-        `messages[${cursor}]: system messages are only supported at the start of the conversation`,
-      );
+
+    let role: "user" | "assistant";
+    let parts: NormalizedContentPart[];
+    if (raw.role === "system" || raw.role === "developer") {
+      // Mid-conversation hook notice / workdir update / queued user message:
+      // ACP has one `user` role, so this must become a user turn, never a 400.
+      const converted = convertMidConversationSystemMessage(raw.content, cursor);
+      if (converted === null) continue;
+      role = "user";
+      parts = [converted];
+    } else {
+      if (raw.role !== "user" && raw.role !== "assistant") {
+        throw invalidRequest(
+          `Unsupported message role "${String(raw.role)}" at messages[${cursor}]; expected "user" or "assistant"`,
+        );
+      }
+      role = raw.role;
+      parts = parseContentParts(raw.content, role, cursor);
     }
-    if (raw.role !== "user" && raw.role !== "assistant") {
-      throw invalidRequest(
-        `Unsupported message role "${String(raw.role)}" at messages[${cursor}]; expected "user" or "assistant"`,
-      );
-    }
-    const role = raw.role;
-    const parts = parseContentParts(raw.content, role, cursor);
 
     // Translators sometimes emit consecutive same-role messages; merge them so
     // the ACP prompt keeps one user/assistant turn per role run.
@@ -732,10 +921,14 @@ export function parseAnthropicRequest(
     throw invalidRequest("messages must contain at least one user or assistant message");
   }
 
-  const tools = parseTools(body.tools);
-
   const sessionIdHeader = headerValue(SESSION_ID_HEADER);
   const sessionId = sessionIdHeader === null ? null : nonEmptyString(sessionIdHeader);
+
+  // Subagent / workdir are Claude Code tool-loop context: forwarded, never required.
+  const subagentId =
+    nonEmptyString(headerValue(SUBAGENT_HEADER)) ??
+    nonEmptyString(headerValue(ALT_SUBAGENT_HEADER));
+  const workDir = nonEmptyString(headerValue(WORKDIR_HEADER));
 
   const metadata = isPlainObject(body.metadata) ? body.metadata : undefined;
   const userId = typeof metadata?.user_id === "string" ? metadata.user_id : undefined;
@@ -756,6 +949,8 @@ export function parseAnthropicRequest(
     ...(maxTokens === undefined ? {} : { maxTokens }),
     thinkingEnabled,
     sessionId,
+    ...(subagentId === null ? {} : { subagentId }),
+    ...(workDir === null ? {} : { workDir }),
     ...(userId === undefined ? {} : { userId }),
   };
 }
@@ -804,9 +999,15 @@ export function jsonErrorResponse(err: unknown): Response {
         ? err.message
         : "Unexpected internal error";
 
+  // Magpie's gateway reads this header to mark the account's sign-in expired
+  // immediately, instead of retrying a credential that will never work again.
+  const signInExpired = bridge !== null && (bridge.signInExpired || bridge.status === 401);
+  const headers: Record<string, string> = { ...JSON_HEADERS };
+  if (signInExpired) headers[SIGN_IN_HEADER] = "expired";
+
   return new Response(
     JSON.stringify({ type: "error", error: { type: errorType, message } }),
-    { status, headers: { ...JSON_HEADERS } },
+    { status, headers },
   );
 }
 
@@ -815,6 +1016,15 @@ export function jsonErrorResponse(err: unknown): Response {
 // ---------------------------------------------------------------------------
 
 type PeekOutcome = { kind: "error"; error: unknown } | { kind: "events" };
+
+/** Maps one terminal `error` event onto the bridge error it represents. */
+function bridgeErrorFromEvent(
+  event: Extract<TurnStreamEvent, { type: "error" }>,
+): BridgeHttpError {
+  return new BridgeHttpError(event.status, event.errorType, event.message, {
+    signInExpired: event.signInExpired,
+  });
+}
 
 /**
  * The events that mean "the turn has begun": once one of these arrives we must
@@ -910,10 +1120,7 @@ class PeekedTurnSource {
         const event = result.value;
         if (event.type === "error") {
           // Pre-stream failure: surface the real status, not a 200 SSE stream.
-          return {
-            kind: "error",
-            error: new BridgeHttpError(event.status, event.errorType, event.message),
-          };
+          return { kind: "error", error: bridgeErrorFromEvent(event) };
         }
         this.peeked.push(event);
         if (PRE_STREAM_TERMINATOR_TYPES.has(event.type)) return { kind: "events" };
@@ -929,6 +1136,8 @@ interface SseChannel {
   bind(controller: ReadableStreamDefaultController<Uint8Array>): void;
   bindAbort(signal: AbortSignal | undefined, onAbort: () => void): void;
   emit(event: string, data: unknown): Promise<void>;
+  /** Grants one frame of downstream capacity and wakes a blocked `emit`. */
+  wakeDrain(): void;
   startHeartbeat(intervalMs: number): void;
   finish(): void;
 }
@@ -939,6 +1148,20 @@ function createSseChannel(): SseChannel {
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let detachAbort: (() => void) | null = null;
+  /**
+   * Downstream credits, one per `pull()`. With `highWaterMark: 0` a consumer
+   * that keeps reading never lets `desiredSize` rise above 0, so a pull is the
+   * only reliable signal that the buffer really drained.
+   */
+  let pullCredits = 0;
+  /** Resolver parked by `emit` while the downstream buffer is full. */
+  let drainWaiter: (() => void) | null = null;
+
+  const resolveDrainWaiter = (): void => {
+    const waiter = drainWaiter;
+    drainWaiter = null;
+    waiter?.();
+  };
 
   const stopHeartbeat = (): void => {
     if (heartbeat !== null) {
@@ -947,10 +1170,18 @@ function createSseChannel(): SseChannel {
     }
   };
 
+  const encodeFrame = (event: string, data: unknown): Uint8Array =>
+    encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  /**
+   * Unconditional write, used by heartbeats. It still consumes a pull credit so
+   * pings and pump frames share the same downstream budget.
+   */
   const writeFrame = (event: string, data: unknown): void => {
     if (closed || controller === null) return;
+    if (pullCredits > 0) pullCredits -= 1;
     try {
-      controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      controller.enqueue(encodeFrame(event, data));
     } catch {
       closed = true;
     }
@@ -966,6 +1197,8 @@ function createSseChannel(): SseChannel {
       detachAbort();
       detachAbort = null;
     }
+    // A pump parked on backpressure must never be left hanging on teardown.
+    resolveDrainWaiter();
     try {
       controller.close();
     } catch {
@@ -1000,9 +1233,28 @@ function createSseChannel(): SseChannel {
       signal.addEventListener("abort", onAbortEvent, { once: true });
       detachAbort = () => signal.removeEventListener("abort", onAbortEvent);
     },
-    emit(event: string, data: unknown): Promise<void> {
-      writeFrame(event, data);
-      return Promise.resolve();
+    async emit(event: string, data: unknown): Promise<void> {
+      // Bound the buffer: a reader that stops reading must stall the pump here
+      // (memory would otherwise grow without limit), and a cancelled stream
+      // wakes us through `finish()` so the `await` never hangs.
+      for (;;) {
+        if (closed || controller === null) return;
+        // A null desiredSize means the downstream is already closed or errored:
+        // there is nothing left worth writing to.
+        const desired = controller.desiredSize;
+        if (desired === null) return;
+        if (pullCredits > 0 || desired > 0) {
+          writeFrame(event, data);
+          return;
+        }
+        await new Promise<void>((resolve) => {
+          drainWaiter = resolve;
+        });
+      }
+    },
+    wakeDrain(): void {
+      pullCredits += 1;
+      resolveDrainWaiter();
     },
     startHeartbeat(intervalMs: number): void {
       if (heartbeat !== null || closed) return;
@@ -1182,10 +1434,7 @@ async function encodeSseEvent(
       return true;
     }
     case "error": {
-      await emitStreamErrorFrame(
-        channel,
-        new BridgeHttpError(event.status, event.errorType, event.message),
-      );
+      await emitStreamErrorFrame(channel, bridgeErrorFromEvent(event));
       return true;
     }
     default:
@@ -1294,6 +1543,8 @@ function createSseResponse(
         channel.bind(controller);
       },
       pull() {
+        // A pull is the only proof that the downstream buffer really drained.
+        channel.wakeDrain();
         if (pumping) return;
         pumping = true;
         if (!source.claim()) {
@@ -1467,9 +1718,7 @@ export async function collectAnthropicJsonResponse(
           break;
         }
         case "error": {
-          return jsonErrorResponse(
-            new BridgeHttpError(event.status, event.errorType, event.message),
-          );
+          return jsonErrorResponse(bridgeErrorFromEvent(event));
         }
         default:
           break;
