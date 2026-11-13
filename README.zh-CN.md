@@ -29,12 +29,14 @@ magpie plugin login agy-acp
 
 模型调用格式为 `agy-acp/<模型>`（如 `agy-acp/gemini-3.8-flash`、`agy-acp/gemini-4-hydrogen`、`agy-acp/claude-sonnet-5-5`、`agy-acp/claude-opus-5-5`）。
 
-### 两种登录方式（支持添加多个账号并发使用）
+### 登录与导入方式（支持多账号并发池）
 
-可执行多次 `magpie plugin login agy-acp`（或在 **Magpie › Providers › Antigravity ACP** 点击添加账号）：
+执行 `magpie plugin login agy-acp` 或在 **Magpie › Providers › Antigravity ACP** 中添加账号：
 
-1. **`Sign in isolated Google account (multi-account)`（推荐，多账号隔离）**：在 `$XDG_DATA_HOME/agy-acp/accounts/<uuid>` 下创建 `0700` 独立凭证目录，使用文件级 Token 存储，不读写系统 Keychain，也不影响终端里的默认 `agy` 登录态。打开输出的授权链接完成登录后，粘贴授权码或回调 URL 即可。
-2. **`Adopt existing local agy login (host default)`（复用本机登录）**：直接复用终端 `agy` 当前已登录的账号。
+1. **`Sign in with Google (browser)`（默认，浏览器自动回调）**：浏览器完成授权后自动本地回调完成登录；若 Magpie 跑在远程服务器或 Docker 中，可直接把浏览器落地的完整 `Callback URL` 粘贴到回调框完成登录。凭据以 `0600` 独立写入 `$XDG_DATA_HOME/agy-acp/accounts/<uuid>`，不触碰系统 Keychain。
+2. **文件批量导入 / 粘贴 JSON 或 `refresh_token`**：点击登录面板中的 **Import from a file instead…** 选择 JSON 文件批量导入（支持 Antigravity Switcher、CLIProxyAPI、`antigravity-oauth-token`、单账号或 `accounts` 数组 JSON，以及每行一个 `refresh_token` 的文本），或在 **Other ways to sign in…** 中直接粘贴。
+3. **`Adopt existing local agy login (host default)`（一键复用本机登录）**：直接复用终端 `agy` 已登录账号。
+4. **`Sign in via agy terminal code (agy acp --login)`**：备用终端授权码登录。
 
 查看各账号 5 小时 / 7 天额度窗口：
 

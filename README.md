@@ -29,12 +29,14 @@ magpie plugin login agy-acp
 
 Models are served as `agy-acp/<model>` (for example `agy-acp/gemini-3.8-flash`, `agy-acp/gemini-4-hydrogen`, `agy-acp/claude-sonnet-5-5`, `agy-acp/claude-opus-5-5`).
 
-### Sign-In Modes
+### Sign-In & Import Modes
 
-Run `magpie plugin login agy-acp` (or add accounts in **Magpie › Providers › Antigravity ACP**) as many times as needed:
+Run `magpie plugin login agy-acp` or add accounts in **Magpie › Providers › Antigravity ACP**:
 
-1. **Sign in isolated Google account (multi-account)** *(recommended)* — creates an isolated `0700` account directory under `$XDG_DATA_HOME/agy-acp/accounts/<uuid>` using file-backed credentials without touching your system Keychain or terminal `agy` login. Open the printed Google OAuth URL and paste back the authorization code or callback URL.
-2. **Adopt existing local agy login (host default)** — reuses the account already signed in via `agy` in your shell.
+1. **Sign in with Google (browser)** *(default)* — opens Google OAuth and finishes automatically via a local callback listener (or paste the `Callback URL` when running Magpie on a remote server / Docker). Writes isolated `0600` credentials under `$XDG_DATA_HOME/agy-acp/accounts/<uuid>` without touching your system Keychain.
+2. **Import from a file / JSON or refresh token** — use **Import from a file instead…** (supports single/multi-account JSON exports from Antigravity Switcher, CLIProxyAPI, `antigravity-oauth-token`, or newline-separated `refresh_token`s) or paste JSON / a refresh token directly under **Other ways to sign in…**.
+3. **Adopt existing local agy login (host default)** — reuses the account already signed in via `agy` in your shell.
+4. **Sign in via agy terminal code (`agy acp --login`)** — fallback manual code flow driven directly by `agy`.
 
 Check per-account 5-hour / weekly quota windows:
 

@@ -1,5 +1,11 @@
 import { BridgeHttpError } from "./types";
-import { createAuthMethods, resolveAccountDescriptor } from "./accounts/auth";
+import {
+  createAuthMethods,
+  IMPORT_FROM_EN,
+  IMPORT_FROMS,
+  importAccountFiles,
+  resolveAccountDescriptor,
+} from "./accounts/auth";
 import {
   buildProviderModels,
   CatalogService,
@@ -147,6 +153,10 @@ async function AntigravityMagpiePlugin(
       maxConcurrency: 16,
       maxAccounts: 0,
       options: buildProviderOptionSchemas(pkgOptions),
+      importFrom: IMPORT_FROM_EN,
+      importFroms: IMPORT_FROMS,
+      import: (texts: string[] | string, opts?: { signal?: AbortSignal }) =>
+        importAccountFiles(texts, opts),
       methods: createAuthMethods(),
 
       usage: async (

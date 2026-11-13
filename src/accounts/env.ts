@@ -554,5 +554,9 @@ export function redactSecrets(text: string): string {
   out = out.replace(/(\/mcp\/)[A-Za-z0-9_-]+/gi, "$1[REDACTED]");
   // Google OAuth authorization code format e.g. 4/0A...
   out = out.replace(/\b4\/0A[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+  // Google OAuth refresh token format e.g. 1//04...
+  out = out.replace(/\b1\/\/[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]");
+  // Google OAuth access token format e.g. ya29....
+  out = out.replace(/\bya29\.[A-Za-z0-9._-]{8,}\b/g, "[REDACTED]");
   return out;
 }

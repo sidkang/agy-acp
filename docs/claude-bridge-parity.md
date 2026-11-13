@@ -6,12 +6,12 @@
 
 ## 1. 是否禁用底层 CLI 自带 System Prompt（双模式支持）
 
-| 维度 | Magpie 官方 `claude_subscription` | `agy-acp` 实现 |
-|---|---|---|
-| 开关名称与默认值 | `ClaudeLeanPrompt`（默认 **`false` 关闭**） | `minimal_agent`（默认 **`false` 关闭**） |
-| **保留原生提示词（默认）** | 保留 Claude Code 内置系统提示词（约 ~1.1K tokens），上游看到的请求形态与真人交互式运行一致 | 隔离 Agent 配置 `excludeDefaultComponents: false`，保留 `agy` 原生组件（约 ~8.4K tokens，第 2 步起 86%~90% 走 Prompt Cache 命中），保持完整原生请求指纹 |
-| **精简/禁用原生提示词（开启）** | 传 `--system-prompt-file` 替换内置系统提示词，仅保留最小身份头与调用方提示词 | 设 `excludeDefaultComponents: true`，剥离 `agy` 内置组件，仅剩桥接的一行工具说明 + 调用方提示词（首步系统提示词降至 ~500 tokens） |
-| **动态切换隔离** | `run.lean != req.leanPrompt` 时拒绝复用旧进程，立即重建会话 | `worker.minimalAgent !== requestedMinimalAgent` 时立即关闭旧 Worker 并跳过异构冷会话缓存，按新模式重建 |
+| 维度                            | Magpie 官方 `claude_subscription`                                                          | `agy-acp` 实现                                                                                                                                          |
+| ------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 开关名称与默认值                | `ClaudeLeanPrompt`（默认 **`false` 关闭**）                                                | `minimal_agent`（默认 **`false` 关闭**）                                                                                                                |
+| **保留原生提示词（默认）**      | 保留 Claude Code 内置系统提示词（约 ~1.1K tokens），上游看到的请求形态与真人交互式运行一致 | 隔离 Agent 配置 `excludeDefaultComponents: false`，保留 `agy` 原生组件（约 ~8.4K tokens，第 2 步起 86%~90% 走 Prompt Cache 命中），保持完整原生请求指纹 |
+| **精简/禁用原生提示词（开启）** | 传 `--system-prompt-file` 替换内置系统提示词，仅保留最小身份头与调用方提示词               | 设 `excludeDefaultComponents: true`，剥离 `agy` 内置组件，仅剩桥接的一行工具说明 + 调用方提示词（首步系统提示词降至 ~500 tokens）                       |
+| **动态切换隔离**                | `run.lean != req.leanPrompt` 时拒绝复用旧进程，立即重建会话                                | `worker.minimalAgent !== requestedMinimalAgent` 时立即关闭旧 Worker 并跳过异构冷会话缓存，按新模式重建                                                  |
 
 ---
 
@@ -35,13 +35,13 @@
 
 ## 3. 冷却回收时长、内存上限与孤儿进程防护
 
-| 参数 / 机制 | Magpie 官方 `claude_subscription` | `agy-acp` 实现 |
-|---|---|---|
-| **热空闲超时（`idleTimeoutMs`）** | **`1 小时`**（`idleLongest = time.Hour`，对齐 1h Prompt Cache 窗口，`#463`） | **`1 小时`**（`3,600,000 ms`，可在插件 Options 覆盖） |
-| **每账号热进程上限** | `idleMost = 6` | `maxPerAccountWorkers = 6`（全局上限 `maxGlobalWorkers = 16`） |
-| **挂起工具等待超时** | `parkLongest = 5m`（最多保留 `parkedMost = 16`） | `awaitingToolTimeoutMs = 10m`（客户端中断未交 `tool_result` 自动回收） |
-| **冷会话架（`parkedSessions`）** | 落盘会话供 `--resume` 续接 | 内存仅存轻量索引供 `session/resume`：**TTL 6 小时 + 最多 32 条 + 单会话 ≤ 4 MiB + 总预算 ≤ 16 MiB**（超大图会话冷却后立即释放堆内存） |
-| **孤儿进程与临时目录清理** | `proc.StartTree`（Unix Session / Windows Job）整树回收 + 启动清扫超时临时目录 | 1. `detached: false` 保持在 Magpie `StartTree` 进程组内，宿主遭 `SIGKILL` 时随组一并回收；<br>2. 单 Worker 关闭时按父子 PID 树自底向上清理后代进程；<br>3. 同时监听 `process.once("exit")` / `SIGINT` / `SIGTERM`（覆盖 `host.js` `stdin` 关闭时的 `process.exit(0)`），连短命 `/usage`、`models` 探测子进程与临时目录一并同步回收；<br>4. 临时目录写入 `.owner-pid`，启动及每分钟巡检自动清扫死进程遗留目录。 |
+| 参数 / 机制                       | Magpie 官方 `claude_subscription`                                             | `agy-acp` 实现                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **热空闲超时（`idleTimeoutMs`）** | **`1 小时`**（`idleLongest = time.Hour`，对齐 1h Prompt Cache 窗口，`#463`）  | **`1 小时`**（`3,600,000 ms`，可在插件 Options 覆盖）                                                                                                                                                                                                                                                                                                                                                          |
+| **每账号热进程上限**              | `idleMost = 6`                                                                | `maxPerAccountWorkers = 6`（全局上限 `maxGlobalWorkers = 16`）                                                                                                                                                                                                                                                                                                                                                 |
+| **挂起工具等待超时**              | `parkLongest = 5m`（最多保留 `parkedMost = 16`）                              | `awaitingToolTimeoutMs = 10m`（客户端中断未交 `tool_result` 自动回收）                                                                                                                                                                                                                                                                                                                                         |
+| **冷会话架（`parkedSessions`）**  | 落盘会话供 `--resume` 续接                                                    | 内存仅存轻量索引供 `session/resume`：**TTL 6 小时 + 最多 32 条 + 单会话 ≤ 4 MiB + 总预算 ≤ 16 MiB**（超大图会话冷却后立即释放堆内存）                                                                                                                                                                                                                                                                          |
+| **孤儿进程与临时目录清理**        | `proc.StartTree`（Unix Session / Windows Job）整树回收 + 启动清扫超时临时目录 | 1. `detached: false` 保持在 Magpie `StartTree` 进程组内，宿主遭 `SIGKILL` 时随组一并回收；<br>2. 单 Worker 关闭时按父子 PID 树自底向上清理后代进程；<br>3. 同时监听 `process.once("exit")` / `SIGINT` / `SIGTERM`（覆盖 `host.js` `stdin` 关闭时的 `process.exit(0)`），连短命 `/usage`、`models` 探测子进程与临时目录一并同步回收；<br>4. 临时目录写入 `.owner-pid`，启动及每分钟巡检自动清扫死进程遗留目录。 |
 
 ---
 
@@ -62,6 +62,7 @@
 ## 5. 其他已对齐的细节与后续可扩展项
 
 ### 已完成对齐项
+
 - **`tool_choice` 缓存稳定性**：与 `claude_subscription`（`TestClaudeToolChoiceNoneKeepsTheTools`）一致，`tool_choice: none / tool / any` 时保持 `tools/list` 工具目录不变以保护 Prompt Cache 前缀，在 Broker 层做调用拦截与约束提醒。
 - **工作目录透传与环境消歧**：自动对 Magpie 网关发来的百分号编码头 `X-Magpie-Work-Dir` 执行 `decodeURIComponent` 解码，仅对本机真实存在的绝对目录传递 `--add-dir`，并在系统提示词中追加与 `envElsewhereLeanNote` 对齐的工具运行环境消歧说明。
 - **子代理与标题/分类器旁路请求保护（对齐 `aside()`）**：识别 `X-Magpie-Subagent` 独立分桶；当同一会话已有带工具的主进程时，客户端发来的 `tools: []`（无论是否匹配历史前缀）或 `tool_choice: none` 旁路请求一律走无状态短会话，绝不挤占、污染或误关正在热运行的工具主会话。
@@ -71,4 +72,5 @@
 - **WAL SQLite 逐 Step 用量与缓存读取**：通过只读 URI（Checkpointed WAL 自动走 `?immutable=1`）读取 `gen_metadata`，在 `tool_use` 与 `end_turn` 每一步精确上报 `input_tokens`、`output_tokens` 与 `cache_read_input_tokens`。
 
 ### 后续可选演进项
+
 - **重启后跨进程持久化会话映射（可选）**：当前 `parkedSessions` 保存在插件宿主内存中（Magpie 不重启即可在 6 小时内无缝 `session/resume`）；若未来希望 Magpie 彻底重启后仍能 `session/resume` 旧会话，可参考 `agy-cli` 在 `$AGY_ACP_DATA_DIR` 落盘一份只存 `sessionId + SHA256(system/history)`（不含正文）的轻量索引文件。

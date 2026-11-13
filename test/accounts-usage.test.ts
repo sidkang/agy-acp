@@ -16,7 +16,10 @@ import {
 import {
   createAuthMethods,
   extractAuthorizationCode,
+  importAccountFiles,
+  parseImportedAccounts,
   resolveAccountDescriptor,
+  writeIsolatedAgyOAuthToken,
 } from "../src/accounts/auth";
 import {
   buildCatalog,
@@ -342,6 +345,8 @@ describe("src/accounts/env.ts", () => {
       .toBe("Connecting to http://127.0.0.1:49152/mcp/[REDACTED]");
     expect(redactSecrets("Google auth code: 4/0AeanS-abcdef12345678901234567890"))
       .toBe("Google auth code: [REDACTED]");
+    expect(redactSecrets("Bare refresh 1//04secretRefreshTokenValue and ya29.a0secretAccessToken"))
+      .toBe("Bare refresh [REDACTED] and [REDACTED]");
   });
 });
 
@@ -405,15 +410,346 @@ describe("src/accounts/auth.ts", () => {
     ).toThrow("No authorization code found");
   });
 
-  test("createAuthMethods registers OAuth and Host API methods", async () => {
-    const methods = createAuthMethods();
-    expect(methods.length).toBe(2);
+  test("parseImportedAccounts supports Switcher, CLIProxyAPI, agy FileTokenStorage, plugin-auth, arrays, and lines", () => {
+    // 1. Direct refresh_token JSON
+    expect(
+      parseImportedAccounts(JSON.stringify({ refresh_token: "1//04rtA", email: "a@example.com" }))
+    ).toEqual([{ refreshToken: "1//04rtA", email: "a@example.com" }]);
 
-    const [oauthMethod, hostMethod] = methods;
-    expect(oauthMethod?.type).toBe("oauth");
-    expect(oauthMethod?.label).toContain("isolated Google account");
-    expect(hostMethod?.type).toBe("api");
-    expect(hostMethod?.label).toContain("local agy login");
+    // 2. agy native antigravity-oauth-token format
+    expect(
+      parseImportedAccounts(
+        JSON.stringify({
+          token: { access_token: "ya29.at", refresh_token: "1//04rtB", expires_in: 3500 },
+          auth_method: "consumer",
+        })
+      )
+    ).toEqual([{ refreshToken: "1//04rtB", accessToken: "ya29.at", expiresIn: 3500 }]);
+
+    // 3. opencode-antigravity-auth / Magpie plugin-auth entry ("rt|project")
+    expect(
+      parseImportedAccounts(
+        JSON.stringify({
+          type: "oauth",
+          refresh: "1//04rtC|proj-123",
+          accountId: "c@example.com",
+        })
+      )
+    ).toEqual([{ refreshToken: "1//04rtC", project: "proj-123", email: "c@example.com" }]);
+
+    // 4. Multi-account { accounts: [...] } with deduplication
+    expect(
+      parseImportedAccounts(
+        JSON.stringify({
+          accounts: [
+            { refreshToken: "1//04rt1", email: "one@example.com" },
+            { refreshToken: "1//04rt2", email: "two@example.com" },
+            { refreshToken: "1//04rt1", email: "dup@example.com" },
+          ],
+        })
+      )
+    ).toEqual([
+      { refreshToken: "1//04rt1", email: "one@example.com" },
+      { refreshToken: "1//04rt2", email: "two@example.com" },
+    ]);
+
+    // 5. Plain newline-separated refresh tokens with comments
+    expect(parseImportedAccounts("# exported\n1//04line1\n\n1//04line2|my-proj\n")).toEqual([
+      { refreshToken: "1//04line1" },
+      { refreshToken: "1//04line2", project: "my-proj" },
+    ]);
+
+    // 6. Rejects non-Antigravity account JSON
+    expect(() =>
+      parseImportedAccounts(JSON.stringify({ type: "claude", refresh_token: "1//04wrong" }))
+    ).toThrow("Unsupported account type");
+  });
+
+  test("Browser loopback OAuth (method: auto) + JSON paste + file batch import (auth.import)", async () => {
+    const mockFetch = (async (input: any, init?: any) => {
+      const url = typeof input === "string" ? input : input.url;
+      if (url.includes("oauth2.googleapis.com/token")) {
+        const params = new URLSearchParams(String(init?.body ?? ""));
+        const grant = params.get("grant_type");
+        if (grant === "authorization_code") {
+          expect(params.get("code_verifier")).toBeTruthy();
+          expect(params.get("redirect_uri")).toMatch(/^http:\/\/localhost:\d+\/oauth-callback$/);
+          return new Response(
+            JSON.stringify({
+              access_token: "ya29.browser_at",
+              refresh_token: "1//04browser_rt",
+              expires_in: 3600,
+              token_type: "Bearer",
+            }),
+            { status: 200 }
+          );
+        }
+        const rt = params.get("refresh_token") ?? "";
+        if (rt.includes("bad")) {
+          return new Response(
+            JSON.stringify({ error: "invalid_grant", error_description: "Token has been expired or revoked." }),
+            { status: 400 }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            access_token: `ya29.refreshed_${rt.slice(-4)}`,
+            expires_in: 3600,
+            token_type: "Bearer",
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("googleapis.com/oauth2/v2/userinfo")) {
+        const auth = new Headers(init?.headers).get("Authorization") ?? "";
+        const suffix = auth.includes("browser_at") ? "browser" : auth.slice(-4);
+        return new Response(JSON.stringify({ email: `${suffix}@example.com` }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const verifyCalls: string[] = [];
+    const mockVerify = async (acc: AccountDescriptor) => {
+      verifyCalls.push(acc.accountRef);
+      if (acc.label.includes("failverify")) {
+        return { ok: false, error: "agy models verification failed" };
+      }
+      return { ok: true };
+    };
+
+    const methods = createAuthMethods({ fetchFn: mockFetch, verifyAccountFn: mockVerify });
+    expect(methods.length).toBe(4);
+    const [browserMethod, importPasteMethod, hostMethod, cliCodeMethod] = methods;
+    expect(browserMethod?.label).toBe("Sign in with Google (browser)");
+    expect(importPasteMethod?.label).toContain("Import an account");
+    expect((hostMethod as any)?.keyless).toBe(true);
+    expect(cliCodeMethod?.label).toContain("agy acp --login");
+
+    // 1. Browser auto flow: start listener, check state mismatch + XSS escape, then complete callback
+    const autoFlow = (await browserMethod!.authorize()) as any;
+    expect(autoFlow.method).toBe("auto");
+    const authUrl = new URL(autoFlow.url);
+    expect(authUrl.searchParams.get("scope")).toContain("https://www.googleapis.com/auth/aicode");
+    const redirectUri = authUrl.searchParams.get("redirect_uri")!;
+    const state = authUrl.searchParams.get("state")!;
+    expect(redirectUri).toMatch(/^http:\/\/localhost:\d+\/oauth-callback$/);
+
+    const cbPromise = autoFlow.callback();
+
+    // Bad state gets 400 and does NOT finish sign-in
+    const badRes = await fetch(`${redirectUri}?code=bad&state=wrong`);
+    expect(badRes.status).toBe(400);
+
+    // Valid redirect (or pasted Callback URL replayed by Magpie) finishes automatically!
+    const okRes = await fetch(
+      `${redirectUri}?code=4/0AvalidBrowserCode&state=${encodeURIComponent(state)}`
+    );
+    expect(okRes.status).toBe(200);
+
+    const browserDone = await cbPromise;
+    expect(browserDone.type).toBe("success");
+    expect(browserDone.accountId).toBe("browser@example.com");
+    const isolatedDir = resolveIsolatedHomeDir(browserDone.metadata.accountRef);
+    const tokenFile = path.join(isolatedDir, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+    expect(fs.existsSync(tokenFile)).toBe(true);
+    const savedTokenJson = JSON.parse(fs.readFileSync(tokenFile, "utf-8"));
+    expect(savedTokenJson.token.refresh_token).toBe("1//04browser_rt");
+    expect(savedTokenJson.auth_method).toBe("consumer");
+    if (process.platform !== "win32") {
+      expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600);
+    }
+
+    // 2. Paste JSON import flow (`Other ways to sign in...`)
+    const pasteFlow = (await importPasteMethod!.authorize({
+      account: JSON.stringify({ refresh_token: "1//04paste_u1", email: "pasted@example.com" }),
+    })) as any;
+    expect(pasteFlow.method).toBe("auto");
+    const pasteDone = await pasteFlow.callback();
+    expect(pasteDone.type).toBe("success");
+    expect(pasteDone.accountId).toBe("e_u1@example.com");
+
+    // 3. Batch file import (`auth.import` — "Import from a file instead...")
+    const batchResults = await importAccountFiles(
+      [
+        JSON.stringify({
+          accounts: [
+            { refresh_token: "1//04file_a1" },
+            { refresh_token: "1//04bad_tok", email: "revoked@example.com" },
+          ],
+        }),
+      ],
+      undefined,
+      { fetchFn: mockFetch, verifyAccountFn: mockVerify }
+    );
+    expect(batchResults.length).toBe(2);
+    expect(batchResults[0]?.type).toBe("success");
+    expect((batchResults[0] as any)?.accountId).toBe("e_a1@example.com");
+    expect(batchResults[1]?.type).toBe("failed");
+    expect((batchResults[1] as any)?.accountId).toBe("revoked@example.com");
+
+    // 4. Re-importing same verified email reuses deterministic UUIDv5 (zero stranded homes)
+    //    and rolls back previous token if a re-import verification fails!
+    const reimportOk = await importAccountFiles(
+      [JSON.stringify({ refresh_token: "1//04file_a1", access_token: "ya29.stale_ignored" })],
+      undefined,
+      { fetchFn: mockFetch, verifyAccountFn: mockVerify }
+    );
+    expect(reimportOk[0]?.type).toBe("success");
+    expect((reimportOk[0] as any)?.metadata.accountRef).toBe(
+      (batchResults[0] as any)?.metadata.accountRef
+    );
+    const sameAccountTokenPath = path.join(
+      resolveIsolatedHomeDir((batchResults[0] as any).metadata.accountRef),
+      ".gemini",
+      "antigravity-cli",
+      "antigravity-oauth-token"
+    );
+    const beforeFailReimport = fs.readFileSync(sameAccountTokenPath, "utf-8");
+
+    const reimportFail = await importAccountFiles(
+      [JSON.stringify({ refresh_token: "1//04file_a1" })],
+      undefined,
+      {
+        fetchFn: mockFetch,
+        verifyAccountFn: async () => ({ ok: false, error: "simulated CLI check fail" }),
+      }
+    );
+    expect(reimportFail[0]?.type).toBe("failed");
+    expect(fs.readFileSync(sameAccountTokenPath, "utf-8")).toBe(beforeFailReimport);
+
+    // 5. Truncated JSON starting with '{' fails cleanly instead of falling through to plain lines
+    expect(() => parseImportedAccounts('{"refresh_token":"1//04trunc",')).toThrow("Invalid JSON");
+    const badPasteFlow = (await importPasteMethod!.authorize({
+      account: '{"refresh_token":"1//04trunc",',
+    })) as any;
+    expect(typeof badPasteFlow.callback).toBe("function");
+    const badPasteRes = await badPasteFlow.callback();
+    expect(badPasteRes.type).toBe("failed");
+
+    // 6. Malformed raw HTTP request target (GET //[...] HTTP/1.1) returns 400 without crashing,
+    //    and uninvoked callback listener self-closes after listenerMaxLifetimeMs!
+    const net = await import("node:net");
+    const shortLivedMethods = createAuthMethods({
+      fetchFn: mockFetch,
+      verifyAccountFn: mockVerify,
+      listenerMaxLifetimeMs: 120,
+    });
+    const shortFlow = (await shortLivedMethods[0]!.authorize()) as any;
+    const shortRedirect = new URL(shortFlow.url).searchParams.get("redirect_uri")!;
+    const shortPort = Number(new URL(shortRedirect).port);
+
+    const rawHttpReply = await new Promise<string>((resolve, reject) => {
+      const sock = net.connect(shortPort, "127.0.0.1", () => {
+        sock.write("GET //[ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+      });
+      let data = "";
+      sock.on("data", (c) => (data += c.toString("utf8")));
+      sock.on("end", () => resolve(data));
+      sock.on("error", reject);
+    });
+    expect(rawHttpReply).toContain("400");
+
+    // Without ever invoking shortFlow.callback(), wait 180ms and confirm port is closed!
+    await new Promise((r) => setTimeout(r, 180));
+    const stillOpen = await new Promise<boolean>((resolve) => {
+      const sock = net.connect(shortPort, "127.0.0.1");
+      sock.once("connect", () => {
+        sock.destroy();
+        resolve(true);
+      });
+      sock.once("error", () => resolve(false));
+    });
+    expect(stillOpen).toBe(false);
+
+    // 7. Cancelled batch import rolls back newly created account directories
+    const batchAbort = new AbortController();
+    let seenBatchCalls = 0;
+    const abortedBatch = await importAccountFiles(
+      [
+        JSON.stringify({
+          accounts: [{ refresh_token: "1//04abort_b1" }, { refresh_token: "1//04abort_b2" }],
+        }),
+      ],
+      { signal: batchAbort.signal },
+      {
+        fetchFn: mockFetch,
+        verifyAccountFn: async () => {
+          seenBatchCalls++;
+          if (seenBatchCalls === 2) batchAbort.abort();
+          return { ok: true };
+        },
+      }
+    );
+    expect(abortedBatch.length).toBe(1);
+    const { accountRefFromEmail } = await import("../src/accounts/auth");
+    const b1Dir = path.join(TEST_DIR, "accounts", accountRefFromEmail("t_b1@example.com"));
+    expect(fs.existsSync(b1Dir)).toBe(false);
+
+    // 8. Legacy random-UUID account loaded via resolveAccountDescriptor is reused in-place on re-import
+    const legacyUuid = "22222222-3333-4444-8555-666666666666";
+    resolveAccountDescriptor("agy-acp#legacy", {
+      type: "api",
+      key: `agy-isolated:${legacyUuid}`,
+      metadata: {
+        schemaVersion: 1,
+        accountRef: legacyUuid,
+        mode: "isolated",
+        email: "y_u9@example.com",
+      },
+    });
+    const legacyReimported = await importAccountFiles(
+      [JSON.stringify({ refresh_token: "1//04legacy_u9" })],
+      undefined,
+      { fetchFn: mockFetch, verifyAccountFn: mockVerify }
+    );
+    expect(legacyReimported[0]?.type).toBe("success");
+    expect((legacyReimported[0] as any)?.metadata.accountRef).toBe(legacyUuid);
+
+    // 9. Concurrent provisioning of the same email serializes cleanly (failed A never deletes B)
+    let concAttempt = 0;
+    const [concA, concB] = await Promise.all([
+      importAccountFiles([JSON.stringify({ refresh_token: "1//04conc_c1" })], undefined, {
+        fetchFn: mockFetch,
+        verifyAccountFn: async () => {
+          const n = ++concAttempt;
+          if (n === 1) {
+            await new Promise((r) => setTimeout(r, 40));
+            return { ok: false, error: "first attempt failed" };
+          }
+          return { ok: true };
+        },
+      }),
+      importAccountFiles([JSON.stringify({ refresh_token: "1//04conc_c1" })], undefined, {
+        fetchFn: mockFetch,
+        verifyAccountFn: async () => {
+          const n = ++concAttempt;
+          if (n === 1) {
+            await new Promise((r) => setTimeout(r, 40));
+            return { ok: false, error: "first attempt failed" };
+          }
+          return { ok: true };
+        },
+      }),
+    ]);
+    const outcomes = [concA[0]!, concB[0]!];
+    expect(outcomes.some((o) => o.type === "failed")).toBe(true);
+    expect(outcomes.some((o) => o.type === "success")).toBe(true);
+    const c1Dir = path.join(TEST_DIR, "accounts", accountRefFromEmail("c_c1@example.com"));
+    expect(fs.existsSync(path.join(c1Dir, ".gemini", "antigravity-cli", "antigravity-oauth-token"))).toBe(
+      true
+    );
+  });
+
+  test("createAuthMethods registers terminal code OAuth and Host API methods", async () => {
+    const methods = createAuthMethods();
+    expect(methods.length).toBe(4);
+
+    const hostMethod = methods[2]!;
+    const oauthMethod = methods[3]!;
+    expect(oauthMethod.type).toBe("oauth");
+    expect(oauthMethod.label).toContain("agy acp --login");
+    expect(hostMethod.type).toBe("api");
+    expect(hostMethod.label).toContain("local agy login");
 
     // SAFETY RULE CHECK: Use mock agy binary, never invoke real /opt/homebrew/bin/agy acp --login!
     const mockAgyPath = path.join(TEST_DIR, "mock-agy.sh");
@@ -423,7 +759,6 @@ describe("src/accounts/auth.ts", () => {
 if [ "$1" = "acp" ]; then
   echo "https://accounts.google.com/o/oauth2/auth?client_id=123&response_type=code"
   read line
-  # $3 is geminiDir from --gemini-dir <path>
   mkdir -p "$3"
   touch "$3/session.json"
   exit 0
@@ -443,8 +778,7 @@ exit 1
     process.env.AGY_PATH = mockAgyPath;
 
     try {
-      // Test OAuth login flow
-      const flow = await oauthMethod!.authorize({ label: "test-auth-user" });
+      const flow = await oauthMethod.authorize({ label: "test-auth-user" });
       expect("url" in flow).toBe(true);
       if ("type" in flow && flow.type === "failed") {
         throw new Error(flow.error);
@@ -461,13 +795,11 @@ exit 1
         expect(cbResult.metadata.email).toMatch(/^test-auth-user \([0-9a-f]{8}\)$/);
       }
 
-      // Verify single-use callback guard
       await expect(oauthResult.callback("code-again")).rejects.toThrow(
         "Callback has already been invoked"
       );
 
-      // Test host adoption method
-      const hostAdopt = (await hostMethod!.authorize()) as { type: string; metadata?: any };
+      const hostAdopt = (await hostMethod.authorize()) as { type: string; metadata?: any };
       expect(hostAdopt.type).toBe("success");
       expect(hostAdopt.metadata?.mode).toBe("host");
     } finally {
@@ -494,8 +826,8 @@ exit 1
     process.env.AGY_PATH = mockAgyPath;
 
     try {
-      const [oauthMethod] = createAuthMethods();
-      const flow = (await oauthMethod!.authorize()) as { type: string; error?: string };
+      const oauthMethod = createAuthMethods()[3]!;
+      const flow = (await oauthMethod.authorize()) as { type: string; error?: string };
       expect(flow.type).toBe("failed");
       const error = flow.error ?? "";
       expect(error).toContain("before printing sign-in URL");
@@ -531,8 +863,8 @@ exit 1
     process.env.AGY_PATH = mockAgyPath;
 
     try {
-      const [oauthMethod] = createAuthMethods();
-      const flow = (await oauthMethod!.authorize()) as any;
+      const oauthMethod = createAuthMethods()[3]!;
+      const flow = (await oauthMethod.authorize()) as any;
       expect(flow.method).toBe("code");
       const result = await flow.callback("mock-auth-code-12345");
       expect(result.type).toBe("failed");
