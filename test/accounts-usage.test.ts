@@ -247,11 +247,15 @@ describe("src/accounts/env.ts", () => {
     expect(acpResult.env.SSH_CONNECTION).toBe("127.0.0.1 0 127.0.0.1 22");
     expect(acpResult.env.XDG_CONFIG_HOME).toBe(path.join(isolatedAccount.isolatedHomeDir!, ".config"));
 
-    // Verify args for `acp` have --gemini-dir and --app-data-dir
+    // Verify args for `acp` have absolute --gemini-dir and relative --app-data-dir
     expect(acpResult.finalArgs[0]).toBe("acp");
-    expect(acpResult.finalArgs).toContain("--gemini-dir");
-    expect(acpResult.finalArgs).toContain(path.join(isolatedAccount.isolatedHomeDir!, ".gemini"));
-    expect(acpResult.finalArgs).toContain("--app-data-dir");
+    const geminiIdx = acpResult.finalArgs.indexOf("--gemini-dir");
+    expect(geminiIdx).toBeGreaterThan(0);
+    expect(acpResult.finalArgs[geminiIdx + 1]).toBe(path.join(isolatedAccount.isolatedHomeDir!, ".gemini"));
+    const appDataIdx = acpResult.finalArgs.indexOf("--app-data-dir");
+    expect(appDataIdx).toBeGreaterThan(0);
+    expect(acpResult.finalArgs[appDataIdx + 1]).toBe("antigravity-cli");
+    expect(path.isAbsolute(acpResult.finalArgs[appDataIdx + 1]!)).toBe(false);
 
     // Verify args for `models` do NOT append --gemini-dir
     const modelsResult = buildAgyEnvAndArgs(isolatedAccount, ["models"]);

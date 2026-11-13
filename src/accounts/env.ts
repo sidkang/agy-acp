@@ -268,7 +268,9 @@ export function buildAgyEnvAndArgs(
 
     if (finalArgs[0] === "acp") {
       const geminiDir = path.join(home, ".gemini");
-      const appDataDir = path.join(geminiDir, "antigravity-cli");
+      // agy launcher.go requires --gemini-dir to be absolute, while --app-data-dir
+      // MUST be a relative subdirectory name under geminiDir ("must not be absolute").
+      const appDataDir = "antigravity-cli";
       if (!finalArgs.includes("--gemini-dir")) {
         finalArgs.splice(1, 0, "--gemini-dir", geminiDir);
       }
