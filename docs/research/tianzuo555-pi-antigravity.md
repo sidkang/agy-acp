@@ -3,8 +3,8 @@
 - Checkout: `https://github.com/TianZuo555/pi-extensions`, shallow clone, commit
   `7b88eb36e34534c79adf587a4623c2233d9dbd04`, package `@tian.zuo/pi-antigravity@0.12.1`
   (`package.json:2-5`). Read 2026-11-14.
-- Citations are relative to `packages/pi-antigravity/`. Read-only: nothing executed, no tests
-  run, no login state touched. Repository dates are repo-supplied, not calendar-verified.
+- Citations are relative to `packages/pi-antigravity/`. Repository dates are repo-supplied, not
+  calendar-verified.
 - Upstream observations below are the project's own reports unless stated otherwise; see
   section 9. Comparison with this plugin: [`comparison.md`](comparison.md).
 

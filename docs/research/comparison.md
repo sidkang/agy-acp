@@ -104,7 +104,7 @@ linked documents.
 | Synthetic thought summaries | tianzuo555 | not adopted: ACP supplies real thought text |
 | Native read-only re-execution plus replay wrapper | tianzuo555, estebanforge (stream-json) | not adopted: the caller is an Anthropic HTTP client, not pi's renderer, and `agy` built-ins are disabled |
 | pi-style error prefixes and regex taxonomy | fdkevin0 | not adopted: `resource_exhausted` -> `QUOTA` -> `quota exceeded:` would present a transient limit as a spent window, and `token limit` would read an output ceiling as overflow |
-| "Still running" / poll protocol | fdkevin0, estebanforge | deferred inside the long-tool-call item: extra model rounds and synthetic results, against the broker's authentic `tool_use` / `tool_result` contract |
+| "Still running" / poll protocol | fdkevin0, estebanforge | rejected for the current design: bounded waiting and a fresh-session replay of the completed result, which keeps the broker's authentic `tool_use` / `tool_result` contract ([plan](../plan.md) item 1); the relay stays described in the two sibling documents |
 | Stream-json carrier staging; a 25 KB ACP limit | estebanforge | not adopted: `systemPrompt.append` is capability-gated at session creation; no evidence of a 25 KB ACP limit |
 | Kill-first cancel based on the RC01 probe | estebanforge | not adopted: notification, broker cancel and a 1.5 s settle before retirement already cover a hung cancel |
 | Two turn engines behind one interface | estebanforge | not adopted: it doubles every behavioral claim; stream-json would be a separate spike |

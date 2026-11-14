@@ -6,8 +6,8 @@
 - Citations are relative to the repository root. Size: 5,893 lines of TypeScript, `index.ts`
   (267) plus `src/*.ts` (5,626), excluding tests; `src/runtime.ts` 1,541, `src/conversation.ts`
   744, `src/history.ts` 357, `src/catalog.ts` 265, `src/quota.ts` 188.
-- Read-only: nothing executed, no tests run, no token files accessed. Upstream observations are
-  the project's own (section 9). Comparison with this plugin: [`comparison.md`](comparison.md).
+- Upstream observations are the project's own (section 9). Comparison with this plugin:
+  [`comparison.md`](comparison.md).
 
 ## 1. Host and upstream
 

@@ -185,14 +185,13 @@ counted) and are taken at their word. The spent-credit notice answers `402`, a h
 so it needs the log. A model asked what an error means writes the notice back, and that must
 stay answer text.
 
-A live probe of `agy 1.5.9` found a suspended account answering with the vendor's suspension
-sentence as the turn's content and `stopReason: end_turn`. Nothing errors and no log line is
-written, so a bridge that only reads the result answers `200` with that sentence and Magpie
-keeps choosing the dead account. It was observed on the account that was later suspended; the
-next probe ran on a different login, so the sentence reports the state of that account rather than
-a transient turn failure, which is why the class must rotate the account instead of delivering the
-sentence as an answer. These probes do not establish that the suspension is permanent: appeals do
-restore accounts ([account safety](account-safety.md)). The sentence is
+On `agy 1.5.9` a suspended account answers with the vendor's suspension sentence as the turn's
+content and `stopReason: end_turn`. Nothing errors and no log line is written, so a bridge that
+only reads the result answers `200` with that sentence and Magpie keeps choosing that account. The
+sentence reports the state of an account rather than a single failed turn, which is why the class
+must rotate the account instead of delivering it as an answer; nothing establishes that a
+suspension is permanent, and appeals do restore accounts ([account safety](account-safety.md)).
+Probe history: [`CHANGELOG.md`](../CHANGELOG.md), "a suspended account answers as content". The sentence is
 a terminal marker (`AGENT_TERMINAL_MARKERS`), taken at its word only when it is the whole
 answer: a model writing it after prose is quoting it.
 

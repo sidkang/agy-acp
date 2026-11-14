@@ -3,10 +3,8 @@
 - Checkout: `https://github.com/EstebanForge/pi-extensions`, shallow clone, commit
   `d3ca5cc66947a3299e2ef18b8986c7dc86e9373b` (commit date 2026-11-13), package
   `@estebanforge/pi-antigravity-bridge@1.10.6` (`package.json:1-3`). Read 2026-11-14.
-- Citations are relative to `packages/pi-antigravity-bridge/`. Inspected `src/*.ts`,
-  `src/acp/*.ts`, `extensions/index.ts`, `docs/{ARCHITECTURE,ENGINES,PI-BRIDGE-GAPS,ACP-PROTOCOL-REFERENCE}.md`,
-  `README.md`, `CHANGELOG.md`, and selected tests (read, not run). About 11.3k lines of `src`
-  (count not tied to a recorded commit). Nothing executed; no credentials touched.
+- Citations are relative to `packages/pi-antigravity-bridge/`. About 11.3k lines of `src`
+  (count not tied to a recorded commit).
 - Much of what this package records about `agy` comes from the authors' dated probes; raw RC01
   traffic is gitignored (`docs/ACP-PROTOCOL-REFERENCE.md:5-24`), so its provenance cannot be
   checked from the clone. Section 8 collects those observations with their versions.

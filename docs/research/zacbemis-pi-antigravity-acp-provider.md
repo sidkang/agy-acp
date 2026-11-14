@@ -6,8 +6,7 @@
 - Citations are relative to the repository root. Size at this commit: 5,902 lines in `src`
   (including the non-TypeScript `src/acp/supervisor.mjs:1-101`, `src/mcp/schema.ts` is 223) and
   23 files in `docs/`; the repository's own `docs/` were read as documented intent only.
-- Read-only: nothing executed, no tests or builds, no artifact downloads, no keychain or login
-  access. Comparison with this plugin: [`comparison.md`](comparison.md).
+- Comparison with this plugin: [`comparison.md`](comparison.md).
 
 ## 1. Host and upstream
 
