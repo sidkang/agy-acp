@@ -45,6 +45,7 @@ import { decodeWebp } from "../src/protocol/webp";
 import { SessionToolBroker } from "../src/mcp/broker";
 import { getSharedMcpServer } from "../src/mcp/http-server";
 import { renderMessagesToPrompt } from "../src/sessions/prompt-render";
+import { CONTEXT_BUDGET_FAILURE_MESSAGE } from "../src/runtime/diagnostics";
 import { encodeAnthropicSseResponse } from "../src/protocol/anthropic";
 import {
   AsyncEventQueue,
@@ -1299,6 +1300,42 @@ describe("Phase 3: inline image fitting & broker/prompt-render wiring", () => {
       mediaType: "image/webp",
       data: forgedBombB64,
     });
+  });
+
+  test("an oversized raw turn is refused, not clipped; a framed compaction is trimmed", () => {
+    // Clipping the middle of the caller's own text loses instructions the model
+    // then never receives, while the ledger records the whole request and later
+    // turns believe the model read it. A client's compaction request is framed in
+    // `<conversation>` and is meant to be trimmed.
+    const big = "x".repeat(140 * 1024);
+    let thrown: unknown;
+    try {
+      renderMessagesToPrompt([], [
+        { role: "user", content: [{ type: "text", text: big }] },
+      ]);
+    } catch (err) {
+      thrown = err;
+    }
+    expect((thrown as { status?: number } | undefined)?.status).toBe(400);
+    expect(String((thrown as { message?: string } | undefined)?.message)).toBe(
+      CONTEXT_BUDGET_FAILURE_MESSAGE,
+    );
+    expect(String((thrown as { message?: string } | undefined)?.message)).toMatch(
+      /prompt is too long/i,
+    );
+
+    const framed = renderMessagesToPrompt([], [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `<conversation>\n${big}\n</conversation>\n\nSummarize the above.`,
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(framed)).toContain("truncated middle for prompt budget");
   });
 
   test("SessionToolBroker and renderMessagesToPrompt pass inline images through fitInlineImage", async () => {

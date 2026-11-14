@@ -531,6 +531,18 @@ describe("extractErrorEvidence and classifyAgentFailure", () => {
     );
   });
 
+  test("reads the 'Usage Limit Reached … reset in' notice as a spent window", () => {
+    // The wording two sibling bridges parse; ours did not recognize it, so a
+    // genuinely spent window answered as a plain throttle.
+    const notice =
+      "Usage Limit Reached\n\nYou have reached your current quota for this period. Your limit will reset in 2 hours, 30 minutes.";
+    expect(classifyAgentFailure(notice, "")).toBe("quota");
+    expect(retryAfterSecondsFrom(notice)).toBe(2 * 3600);
+
+    const absolute = "Your limit will reset on Sep 4, 2026 12:30 UTC";
+    expect(classifyAgentFailure(absolute, "")).toBe("quota");
+  });
+
   test("reads a Retry-After out of the refusal, clamped", () => {
     expect(retryAfterSecondsFrom("retrying in 4s")).toBe(4);
     expect(retryAfterSecondsFrom("please try again in 30 seconds")).toBe(30);
@@ -1145,6 +1157,34 @@ describe("AgySessionWorker diagnostics integration", () => {
         .join("");
       expect(text).toContain("ran out of credits");
       expect(text).toContain("credits balance is too low");
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("a silent turn retires the worker instead of leaving a live generation", async () => {
+    // The old wall clock could fire while a tool call was outstanding, clear
+    // `pendingPrompt`, and let the next tool result start a second
+    // `session/prompt` on the same native session. Silence now retires instead.
+    const ws = makeTempDir("worker-idle-watchdog-");
+    const worker = new AgySessionWorker(account, "diag-sess-idle", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () => createScriptedFakeAcpChild(ws, () => {}),
+    });
+
+    try {
+      await worker.start();
+      const gen = worker.startPromptTurn([{ type: "text", text: "hi" }]);
+      const first = gen.next();
+      await Promise.resolve();
+      expect(worker.state).toBe("GENERATING");
+
+      // Ten minutes of silence, then the watchdog's tick.
+      (worker as any).turnProgressAt = Date.now() - 11 * 60 * 1000;
+      (worker as any).checkTurnIdle();
+      expect((worker as any).isClosed).toBe(true);
+
+      await Promise.resolve(first).catch(() => {});
     } finally {
       await worker.close("test_done");
     }

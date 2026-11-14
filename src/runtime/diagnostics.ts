@@ -357,7 +357,7 @@ const RPC_AUTH_RE =
  * account exhaustion rests a healthy account for its whole window.
  */
 const EXHAUSTED_QUOTA_RE =
-  /exhausted (?:your|the|its|this) (?:quota|capacity)|quota (?:exceeded|exhausted|limit reached|will reset)|insufficient quota|out of quota/i;
+  /exhausted (?:your|the|its|this) (?:quota|capacity)|quota (?:exceeded|exhausted|limit reached|will reset)|insufficient quota|out of quota|usage limit reached|reached (?:your|the|its) (?:current |weekly |daily )?(?:usage )?quota\b|(?:your|the|its) limit will reset (?:in|on)\b/i;
 
 /**
  * A `429`-shaped refusal: `agy`'s `RESOURCE_EXHAUSTED (code 429): Resource has

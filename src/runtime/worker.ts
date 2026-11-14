@@ -61,6 +61,21 @@ import { type LoopbackMcpServer } from "../mcp/http-server";
 import { thinkingSignatureFor } from "../protocol/anthropic";
 import { AsyncEventQueue, TurnContext } from "./turn-context";
 
+/**
+ * How long a turn may sit silent before the worker is retired.
+ *
+ * A 30-minute wall clock said nothing about activity: it could not tell a quiet
+ * generation from a dead one, and when it fired while a tool call was
+ * outstanding the local RPC timeout was taken for proof that the native prompt
+ * had settled, so the next tool result started a second `session/prompt` on a
+ * live native session. Two progress budgets cannot make that mistake: silence is
+ * measured from the last thing `agy` actually said.
+ */
+const TURN_IDLE_BUDGET_MS = 10 * 60 * 1000;
+/** A tool call may legitimately take far longer than a quiet generation. */
+const TURN_TOOL_IDLE_BUDGET_MS = 60 * 60 * 1000;
+const TURN_IDLE_TICK_MS = 30 * 1000;
+
 export type WorkerState =
   | "STARTING"
   | "IDLE"
@@ -416,6 +431,50 @@ export class AgySessionWorker {
     if (!enabled) {
       this.turn.resetThinking();
     }
+  }
+
+  private turnIdleTimer: ReturnType<typeof setInterval> | null = null;
+  private turnProgressAt = 0;
+
+  /**
+   * Starts the progress watchdog for a turn. Every chunk and every delivered
+   * tool result re-arms it; only silence retires the worker.
+   */
+  private armTurnIdleWatchdog(): void {
+    this.turnProgressAt = Date.now();
+    if (this.turnIdleTimer !== null) return;
+    this.turnIdleTimer = setInterval(() => this.checkTurnIdle(), TURN_IDLE_TICK_MS);
+    (this.turnIdleTimer as { unref?: () => void }).unref?.();
+  }
+
+  private noteTurnProgress(): void {
+    this.turnProgressAt = Date.now();
+  }
+
+  private stopTurnIdleWatchdog(): void {
+    if (this.turnIdleTimer === null) return;
+    clearInterval(this.turnIdleTimer);
+    this.turnIdleTimer = null;
+  }
+
+  private checkTurnIdle(): void {
+    if (this._state === "IDLE" || this._state === "STARTING") {
+      this.stopTurnIdleWatchdog();
+      return;
+    }
+    if (this.isClosed) {
+      this.stopTurnIdleWatchdog();
+      return;
+    }
+    const budget =
+      this._state === "AWAITING_TOOL_RESULTS"
+        ? TURN_TOOL_IDLE_BUDGET_MS
+        : TURN_IDLE_BUDGET_MS;
+    if (Date.now() - this.turnProgressAt < budget) return;
+    // Retire rather than settle the turn: a local timeout is not proof that the
+    // native prompt stopped, and a second prompt on a live native session answers
+    // with whatever the first generation is still doing.
+    void this.close("turn_idle_timeout");
   }
 
   private setState(newState: WorkerState): void {
@@ -793,6 +852,9 @@ export class AgySessionWorker {
 
   private handleSessionUpdate(rawParams: any): void {
     if (!rawParams) return;
+    // Anything `agy` says is progress, including output this turn will not
+    // forward (a suppressed steer, a retry notice, a tool-call update).
+    this.noteTurnProgress();
     // A steered-cancel turn and an aborted retry-storm turn both drop output:
     // the caller was already told, or is about to be, that this turn is over.
     if (this.turn.suppressingSteerCancel || this.retryStormAborted) {
@@ -1481,6 +1543,7 @@ export class AgySessionWorker {
     this.broker.openTurnWindow();
     this.setState("GENERATING");
     this.markTurnDiagnosticsStart();
+    this.armTurnIdleWatchdog();
     const queue = this.createTurnQueue();
 
     const seq = this.turn.nextPromptEpoch();
@@ -1491,7 +1554,9 @@ export class AgySessionWorker {
         sessionId: this.nativeSessionId,
         prompt,
       },
-      30 * 60 * 1000, // 30-minute generation watchdog (matches claude_subscription.go)
+      // A backstop only: the progress watchdog above retires a silent turn in
+      // ten minutes, and this bounds a turn that keeps talking forever.
+      TURN_TOOL_IDLE_BUDGET_MS,
     );
     this.turn.pendingPrompt = promptPromise;
 
@@ -1507,6 +1572,7 @@ export class AgySessionWorker {
   }
 
   private handlePromptSuccess(result: any, seq?: number): void {
+    this.stopTurnIdleWatchdog();
     if (this.turn.isSuppressedOrStale(seq)) {
       // A cancelled steer turn still spent tokens; bank them so the next
       // reported turn carries them exactly once.
@@ -1604,6 +1670,7 @@ export class AgySessionWorker {
   }
 
   private handlePromptError(err: any, seq?: number): void {
+    this.stopTurnIdleWatchdog();
     if (this.turn.isSuppressedOrStale(seq)) {
       return;
     }
@@ -1740,6 +1807,7 @@ export class AgySessionWorker {
     }
 
     // 2. Deliver tool results
+    this.noteTurnProgress();
     const delivery = this.broker.deliverToolResults(toolResults);
 
     if (!delivery.allPendingResolved) {
@@ -1920,6 +1988,7 @@ export class AgySessionWorker {
 
   closeSync(reason = "process_exit"): void {
     if (this.isClosed) return;
+    this.stopTurnIdleWatchdog();
     this.isClosed = true;
     liveWorkersForExitCleanup.delete(this);
     this.setState("CLOSED");

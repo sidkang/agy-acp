@@ -17,7 +17,8 @@
 // oversized image can still be made acceptable, and `fitInlineImage` is a no-op
 // for anything that already fits.
 
-import type { NormalizedMessage } from "../types";
+import { BridgeHttpError, type NormalizedMessage } from "../types";
+import { CONTEXT_BUDGET_FAILURE_MESSAGE } from "../runtime/diagnostics";
 import { fitInlineImage } from "../protocol/images";
 import { utf8Bytes } from "./ledger";
 
@@ -400,14 +401,29 @@ export function renderMessagesToPrompt(
   let historyText = "";
 
   if (priorMessages.length === 0 && currentBytes > MAX_PROMPT_BYTES) {
-    // A standalone oversized turn (typically a client's own compaction
-    // request): clip inside its `<conversation>` body so the instructions after
-    // it survive, else clip the middle of the text.
     const truncateMarker = "\n...[truncated middle for prompt budget]...\n";
     const openMatch = /<conversation[^>]*>/i.exec(turnText);
     const closeMatch = /<\/conversation>/i.exec(turnText);
+    const framedCompaction =
+      openMatch !== null &&
+      closeMatch !== null &&
+      closeMatch.index > openMatch.index;
 
-    if (openMatch && closeMatch && closeMatch.index > openMatch.index) {
+    if (!framedCompaction) {
+      // A client's own compaction request is framed in `<conversation>` and is
+      // meant to be trimmed. A raw turn this large is the caller's own text:
+      // clipping its middle loses instructions the model then never sees, while
+      // the ledger records the whole request and later turns believe the model
+      // already read them. Refuse with the message Magpie reads as an overflow,
+      // so the client compacts instead.
+      throw new BridgeHttpError(
+        400,
+        "invalid_request_error",
+        CONTEXT_BUDGET_FAILURE_MESSAGE,
+      );
+    }
+
+    if (framedCompaction) {
       const openIdx = openMatch.index;
       const openLen = openMatch[0].length;
       const closeIdx = closeMatch.index;

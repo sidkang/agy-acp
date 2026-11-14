@@ -127,25 +127,32 @@ answer, so it is a pattern to add, not a mechanism to trust alone.
 with no quota override (`src/runtime.ts:1534-1537`). Splitting the two classes is
 our decision, and this research does not argue against it.
 
-## Ranked actions this research suggests
+## Ranked actions, and where they stand
+
+**Landed in 0.1.10** (see the commit that cites this file): the progress-armed
+inactivity watchdog (action 2), failing instead of clipping an oversized raw turn
+(action 4), and the "Usage Limit Reached … reset in" window with its
+`Retry-After` (action 5).
+
+Still open:
 
 1. **Read usage from ACP before reading SQLite.** A prompt response carries
    exact counts on current builds (`estebanforge` `src/acp/connection.ts:558-577`).
    If `agy 1.5.8` reports them, the WAL row becomes a cross-check and the
    delayed-row double count (a 0.1.10 review finding) disappears. Needs one probe
    against our own build first.
-2. **Replace the 30-minute wall clock with a progress-armed inactivity
-   watchdog**, two budgets (`zacbemis` `src/acp/prompt-watchdog.ts`). It retires
-   the watchdog defect by design rather than by patching.
+2. ~~Replace the 30-minute wall clock with a progress-armed inactivity
+   watchdog.~~ Done: 10 minutes silent while generating, 60 minutes while a tool
+   call is outstanding, and the wall clock demoted to a backstop.
 3. **Give a long tool call a progress or relay path.** The upstream abandons a
    `tools/call` before our 15-minute park expires (`fdkevin0`
    `src/mcp-bridge.ts:6-9`), and two siblings already handle it.
-4. **Fail, never truncate, when the rendered prompt would lose information**
-   (`zacbemis` `src/stream/context.ts:19-25` throws `invalid_input` past 256 KiB).
-   This is the honest fix for silently clipped renders under a ledger that records
-   the full request.
-5. **Add the "Usage Limit Reached … reset in …" notice** as a named-window
-   pattern and a `Retry-After` source.
+4. ~~Fail, never truncate, when the rendered prompt would lose information.~~
+   Done for a raw oversized turn (400 with the overflow wording, so the client
+   compacts); a client's own `<conversation>`-framed compaction request is still
+   trimmed, as intended.
+5. ~~Add the "Usage Limit Reached … reset in …" notice as a named-window pattern
+   and a `Retry-After` source.~~ Done.
 6. **Keep the ACP `mcpServers` seam.** The alternatives are the same protocol at
    a different layer, with more moving parts.
 
