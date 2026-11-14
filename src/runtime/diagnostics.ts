@@ -31,18 +31,17 @@ const DEFAULT_MAX_TOTAL_LOG_BYTES = 256 * 1024;
  *   - `serializing trajectory: maxMessageTokens must be positive, got 0`
  *   - `serializing trajectory: no messages fit within the context token budget`
  *
- * Fixed and deliberately neutral: it states only the observed failure and what
- * the user can do about it.
+ * Reported as a `400` whose words hit Magpie's `tooLongRe` ("prompt is too long",
+ * "maximum context length", "reduce the length of the messages"), so `overflowed`
+ * fires: it asks a member with room for it, rests no account, and tells the agent
+ * to compact. The same conversation is too long on every account of this plugin,
+ * so failing over between accounts only repeated the refusal.
  *
- * It must contain neither `quota` nor `rate limit`, not even negated. Magpie's
- * gateway scans response text with its `quotaWords` regex (`fallback.go`) and
- * parks the account when it matches, so a well-meant "this is not a quota
- * problem" would still rest the account. It also does not assert a root cause:
- * the measured trigger is a large `_meta.antigravity.systemPrompt.append`
- * block, but the native budget formula is unpublished.
+ * It must avoid `max_tokens`-style words and any pace or quota wording, or
+ * Magpie reads it as a reply-length or rate refusal instead of the conversation.
  */
 export const CONTEXT_BUDGET_FAILURE_MESSAGE =
-  "Antigravity CLI could not serialize this conversation within its context limits. Try a shorter conversation or another model/effort setting.";
+  "Prompt is too long for Antigravity to serialize: the conversation exceeds the model's maximum context length. Start a new conversation or reduce the length of the messages.";
 
 /**
  * Public text for an unclassified `agy` failure.
@@ -63,6 +62,56 @@ export const GENERIC_FAILURE_MESSAGE =
  * plain `429` holds it briefly and lets the next account answer. That is why
  * neither "quota" nor "rate limit" appears here.
  */
+/**
+ * Public text for an account the vendor disabled outright.
+ *
+ * Antigravity answers `PERMISSION_DENIED (code 403): This service has been
+ * disabled in this account for violation of Terms of Service. Please submit an
+ * appeal…` for the whole account, not for one prompt. It is reported as a `403`
+ * (Magpie treats any 403 as retryable and asks the next account) with words that
+ * name the cause and nothing of quota, because the account's `/usage` windows
+ * still read healthy and would otherwise look like the best account to route to.
+ */
+export const VENDOR_DISABLED_FAILURE_MESSAGE =
+  "Antigravity answered: This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product. Remove the account in Magpie if you are not appealing; other signed-in accounts can answer this turn.";
+
+/**
+ * Public text for a `PERMISSION_DENIED` that is not the Terms-of-Service
+ * suspension: a region, project or policy refusal of the whole account.
+ */
+export const VENDOR_POLICY_FAILURE_MESSAGE =
+  "Antigravity denied this account permission for the request (not the prompt). Another signed-in account can answer this turn.";
+
+/**
+ * Public text for a model this account is not served: the vendor's
+ * `NOT_FOUND` / `Requested entity was not found.` The words must say the model
+ * is not found, which is how Magpie rests that model alone on this account and
+ * keeps asking it for the others.
+ */
+export const MODEL_UNSERVED_FAILURE_MESSAGE =
+  "Antigravity does not serve the requested model for this account (model not found). Other models of the account are unaffected; another account may serve it.";
+
+/**
+ * Public text for the vendor's own servers being busy or unreachable
+ * (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, a 5xx, "overloaded").
+ *
+ * `overloaded` is the word Magpie reads on a 5xx as the vendor being too busy
+ * (`vendorOverloaded` -> a 30-second rest, no failure counted on the account's
+ * ladder). It must not carry a quota *code* (`quotaCodes` would make it a spent
+ * window instead), and it must not blame the account.
+ */
+export const UPSTREAM_BUSY_FAILURE_MESSAGE =
+  "Antigravity upstream is overloaded or unreachable for this request (transient). Retry shortly; another signed-in account can answer it now.";
+
+/**
+ * Public text for a spent credit balance: `agy 1.5.8` ends the turn with
+ * "Your AI credits balance is too low to continue." Magpie reads a `402` as out
+ * of credit and holds the account on that ladder, which is what topping up
+ * clears — a quota window it is not.
+ */
+export const CREDIT_EXHAUSTED_FAILURE_MESSAGE =
+  "Antigravity says this account's credit balance is too low to continue. Top up or use another signed-in account.";
+
 export const TRANSIENT_LIMIT_FAILURE_MESSAGE =
   "Antigravity upstream temporarily limited this turn (transient 429) before any answer was produced. Retry shortly; another signed-in account can answer it now.";
 
@@ -76,6 +125,23 @@ export const TRANSIENT_LIMIT_FAILURE_MESSAGE =
  * counted instead: a storm of them means the turn is only spinning through
  * `agy`'s exponential backoff (observed 8 attempts over ~8 minutes).
  */
+/**
+ * The ways `agy` ends a turn with its own failure notice instead of an answer.
+ * `1.5.8` words a dead connection and a spent credit balance separately from a
+ * generic failure (#1136 upstream); a bridge that knows only the generic one
+ * forwards the other two to the agent as if the model had written them.
+ */
+export const AGENT_TERMINAL_MARKERS: ReadonlyArray<string> = [
+  "\n⚠ Agent execution terminated due to error.\n",
+  "\n⚠ There was a network issue connecting to the server, please try again.\n",
+  "\n⚠ Your AI credits balance is too low to continue.\n",
+];
+
+/** agy's own "retry me" note, not a terminal failure: the turn goes on. */
+export const AGENT_RETRY_NOTE_MARKERS: ReadonlyArray<string> = [
+  "\n⚠ Model produced invalid output.\n",
+];
+
 const RETRY_NOTICE_PREFIXES: ReadonlyArray<string> = [
   "API error (attempt",
   "⚠ API error (attempt",
@@ -200,6 +266,11 @@ export function splitAgentRetryNotices(text: string): RetryNoticeScan {
 
 type AgentFailureKind =
   | "auth"
+  | "vendor_restricted"
+  | "vendor_policy"
+  | "model_unserved"
+  | "upstream_busy"
+  | "credit_exhausted"
   | "quota"
   | "rate_limit"
   | "invalid_request"
@@ -294,7 +365,30 @@ const EXHAUSTED_QUOTA_RE =
  * throttle. None of it states that a plan window is spent.
  */
 const LIMIT_SIGNAL_RE =
-  /resource_exhausted|resource has been exhausted|rate[ _-]?limit(?:ed|_exceeded)?|too many requests|throttl(?:ed|ing)|check quota/i;
+  /resource_exhausted|resource has been exhausted|rate[ _-]?limit(?:ed|_exceeded)?|too many requests|throttl(?:ed|ing)|check quota|\bMODEL_CAPACITY_EXHAUSTED\b/i;
+
+/**
+ * The vendor disabling the whole account (Antigravity's Terms-of-Service
+ * refusal). Distinct from a prompt-level refusal, which is about one request.
+ */
+const VENDOR_DISABLED_RE =
+  /service has been disabled in this account|violation of terms of service|submit an appeal to continue|\bTOS_VIOLATION\b/i;
+
+/** A `PERMISSION_DENIED` that is about the account (region, project, policy). */
+const VENDOR_POLICY_RE =
+  /permission_denied \(code \d+\)|permission denied|the caller does not have permission|\bVALIDATION_REQUIRED\b/i;
+
+/** The vendor does not serve this model here (Code Assist `NOT_FOUND`). */
+const MODEL_UNSERVED_RE =
+  /requested entity was not found|model.{0,80}(not (?:supported|accessible|available|found|enabled|allowed)|unsupported|does ?n[o']t exist|unknown|invalid)|(?:no such|unknown|invalid|unsupported) model|model_not_found/i;
+
+/** `agy`'s gRPC statuses for the backend itself being busy or unreachable. */
+const UPSTREAM_BUSY_RE =
+  /unavailable \(code \d+\)|deadline_exceeded \(code \d+\)|deadline exceeded|the model is overloaded|\boverloaded\b|server_is_overloaded|service unavailable|temporarily unavailable|network issue connecting to the server/i;
+
+/** A spent credit balance, which `agy 1.5.8` words on its own (#1136). */
+const CREDIT_EXHAUSTED_RE =
+  /credits? balance is too low|\bQUOTA_EXHAUSTED\b.*credit|out of credits?|credit balance (?:is )?exhausted/i;
 
 const QUOTA_RE = new RegExp(
   `${EXHAUSTED_QUOTA_RE.source}|${LIMIT_SIGNAL_RE.source}`,
@@ -347,6 +441,10 @@ function isExhaustedQuotaSignal(text: string): boolean {
 function hasVerdictSignal(text: string): boolean {
   return (
     CONTEXT_BUDGET_RE.test(text) ||
+    VENDOR_DISABLED_RE.test(text) ||
+    VENDOR_POLICY_RE.test(text) ||
+    MODEL_UNSERVED_RE.test(text) ||
+    UPSTREAM_BUSY_RE.test(text) ||
     AUTH_RE.test(text) ||
     isQuotaSignal(text) ||
     INVALID_REQUEST_RE.test(text)
@@ -424,9 +522,12 @@ export function extractErrorEvidence(raw: string): string {
 }
 
 /**
- * Classifies evidence, most-specific first: `context_budget` -> `auth` ->
- * `quota` (a named exhausted quota) -> `rate_limit` (a `429`-shaped refusal that
- * names no spent window) -> `invalid_request` -> `internal`.
+ * Classifies evidence, most-specific first: `context_budget` ->
+ * `vendor_restricted` (the account was suspended) -> `vendor_policy` (a policy
+ * or region refusal of the account) -> `auth` -> `quota` (a named exhausted
+ * quota) -> `rate_limit` (a `429`-shaped refusal that names no spent window) ->
+ * `model_unserved` (this account is not served the model) -> `upstream_busy`
+ * (the vendor's own servers) -> `invalid_request` -> `internal`.
  *
  * `quota` and `rate_limit` are separate on purpose. `agy` retries a per-minute
  * `429` in-process with exponential backoff, so an upstream `resource_exhausted`
@@ -449,15 +550,113 @@ export function classifyAgentFailure(
   if (CONTEXT_BUDGET_RE.test(text) || CONTEXT_BUDGET_RE.test(rpc)) {
     return "context_budget";
   }
+  if (VENDOR_DISABLED_RE.test(text) || VENDOR_DISABLED_RE.test(rpc)) {
+    return "vendor_restricted";
+  }
+  if (VENDOR_POLICY_RE.test(text) || VENDOR_POLICY_RE.test(rpc)) {
+    return "vendor_policy";
+  }
+  if (CREDIT_EXHAUSTED_RE.test(text) || CREDIT_EXHAUSTED_RE.test(rpc)) {
+    return "credit_exhausted";
+  }
   if (AUTH_RE.test(text) || RPC_AUTH_RE.test(rpc)) return "auth";
   if (isExhaustedQuotaSignal(text) || isExhaustedQuotaSignal(rpc)) {
     return "quota";
   }
   if (isQuotaSignal(text) || isQuotaSignal(rpc)) return "rate_limit";
+  if (MODEL_UNSERVED_RE.test(text) || MODEL_UNSERVED_RE.test(rpc)) {
+    return "model_unserved";
+  }
+  if (UPSTREAM_BUSY_RE.test(text) || UPSTREAM_BUSY_RE.test(rpc)) {
+    return "upstream_busy";
+  }
   if (INVALID_REQUEST_RE.test(text) || INVALID_REQUEST_RE.test(rpc)) {
     return "invalid_request";
   }
   return "internal";
+}
+
+/**
+ * The vendor's own words, bounded to one line, for appending to a fixed message.
+ *
+ * Magpie reads the whole body, so a detail is only ever appended when the verdict
+ * already stands on its fixed prefix; the detail is what a human needs to see.
+ */
+export function upstreamDetail(text: string, limit = 400): string {
+  const one = String(text ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!one) return "";
+  return one.length > limit ? `${one.slice(0, limit - 1)}…` : one;
+}
+
+/**
+ * Google's 429 boilerplate `(e.g. check quota)` reads as "a window is spent" to
+ * Magpie's `quotaWords`, which would hold a healthy account for its window. It is
+ * dropped from a detail, and a detail still carrying limit wording after that is
+ * not appended at all: the fixed sentence is the truthful one there, and Magpie
+ * reads the appended bytes too.
+ */
+export function limitFreeDetail(text: string): string {
+  const cleaned = String(text ?? "")
+    .replace(/\s*\(\s*e\.g\.?\s*check quota\s*\)/gi, "")
+    .replace(/\b(check|verify) (?:your )?quota\b/gi, "check usage");
+  // Magpie's own vocabulary (`quotaWords` plus the credit words that share the
+  // same effect), not a guess: `billing` alone makes `failure()` answer
+  // failCredit, which rests the account for half an hour.
+  if (
+    /quota|insufficient|balance|credit|billing|budget|exceeded|overloaded|rate[ _-]?limit|usage[ _-]?limit|limit.?reached|too many requests|\u4f59\u989d|\u989d\u5ea6|\u6b20\u8d39|\u9650\u6d41|\u9891\u7387|\u9891\u7e41|\u901f\u7387|\u5957\u9910|\u7528\u91cf|\u4e0a\u9650/i.test(
+      cleaned,
+    )
+  ) {
+    return "";
+  }
+  return upstreamDetail(cleaned);
+}
+
+/**
+ * Magpie refuses to read a 400 as an overflow when the body also names a token
+ * ceiling or a paced limit (`tooLong` in gateway.go), so a detail carrying those
+ * words would veto the sentence that makes the 400 an overflow.
+ */
+export function tooLongVetoed(text: string): boolean {
+  return /max_(?:output_|completion_)?tokens|tokens?\s*(?:per|\/)\s*(?:minute|hour|day)|\b(?:tpm|rpm)\b/i.test(
+    String(text ?? ""),
+  );
+}
+
+/**
+ * Local paths out of an error detail: the client is not always the person who
+ * owns the filesystem the log names.
+ */
+export function withoutLocalPaths(text: string): string {
+  return String(text ?? "")
+    .replace(/(\/(?:Users|home)\/)[^\/\s"'`]+/g, "$1[user]")
+    .replace(/([A-Za-z]:\\Users\\)[^\\\s"'`]+/g, "$1[user]");
+}
+
+/**
+ * Seconds a vendor's refusal named, for a `Retry-After` header. Only the shapes
+ * these CLIs write are read (`retrying in 4s`, `try again in 30 seconds`,
+ * `resets in 2h`), clamped to 1s … 24h so a misread reset cannot bench a client.
+ */
+export function retryAfterSecondsFrom(text: string): number | undefined {
+  const source = String(text ?? "");
+  if (!source) return undefined;
+  // The last wait, not the first: a turn that retried twice named two, and the
+  // client must wait out the current one.
+  const hints = [
+    ...source.matchAll(
+      /(?:retry(?:ing)?|try again|resets?|reset after|back)\D{0,24}?(\d+(?:\.\d+)?)\s*(s|sec(?:onds?)?|m|min(?:utes?)?|h|hours?)\b/gi,
+    ),
+  ];
+  const hint = hints.at(-1);
+  if (!hint) return undefined;
+  const value = Number(hint[1]);
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  const unit = hint[2]!.toLowerCase();
+  const seconds = unit.startsWith("h") ? value * 3600 : unit.startsWith("m") ? value * 60 : value;
+  return Math.min(24 * 3600, Math.max(1, Math.round(seconds)));
 }
 
 /**

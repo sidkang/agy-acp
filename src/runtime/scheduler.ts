@@ -14,8 +14,13 @@ export interface GlobalSchedulerOptions {
   installSignalHandlers?: boolean;
 }
 
+/**
+ * `overloaded` on purpose: this bridge being at capacity says nothing about the
+ * account, and Magpie reads a 5xx saying "overloaded" as the vendor being busy
+ * (`vendorOverloaded`): a 30-second rest and no failure counted against it.
+ */
 const BUSY_MESSAGE =
-  "All Antigravity session workers are busy or awaiting tool results";
+  "Antigravity bridge is overloaded: all session workers are busy or awaiting tool results";
 
 interface CapacityWaiter {
   account: AccountDescriptor;
@@ -185,7 +190,7 @@ export class GlobalScheduler {
   }
 
   private busyError(): BridgeHttpError {
-    return new BridgeHttpError(503, "overloaded_error", BUSY_MESSAGE);
+    return new BridgeHttpError(503, "api_error", BUSY_MESSAGE);
   }
 
   private abortedError(): BridgeHttpError {
@@ -197,7 +202,7 @@ export class GlobalScheduler {
   }
 
   private closedError(): BridgeHttpError {
-    return new BridgeHttpError(503, "overloaded_error", "Scheduler closed");
+    return new BridgeHttpError(503, "api_error", "Scheduler closed");
   }
 
   private isAwaitingToolExpired(worker: AgySessionWorker, now: number): boolean {
@@ -418,7 +423,7 @@ export class GlobalScheduler {
         waiter.cleanup();
       } catch {}
       try {
-        waiter.reject(new BridgeHttpError(503, "overloaded_error", reason));
+        waiter.reject(new BridgeHttpError(503, "api_error", reason));
       } catch {}
     }
   }

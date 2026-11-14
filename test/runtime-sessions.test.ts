@@ -754,12 +754,15 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
     expect(error503).toBeInstanceOf(BridgeHttpError);
     expect(error503?.status).toBe(503);
-    expect(error503?.message).toContain("All Antigravity session workers are busy or awaiting tool results");
+    // The bridge at capacity must not look like the account's failure: Magpie
+    // reads a 5xx saying "overloaded" as the vendor being busy.
+    expect(error503?.message).toContain("overloaded");
+    expect(error503?.message).toContain("session workers are busy or awaiting tool results");
 
     smallScheduler.destroy();
   });
 
-  test("8. Thinking accumulation and synthetic thinking signature", async () => {
+  test("8. Thinking accumulation and its unsigned signature", async () => {
     const sessionId = `test-think-${Date.now()}`;
     const req = makeReq(
       [
@@ -783,7 +786,13 @@ describe("Runtime Sessions & Coordinator Integration", () => {
 
     const thinkSig = events.find((e) => e.type === "thinking_signature");
     expect(thinkSig).toBeDefined();
-    expect(thinkSig?.type === "thinking_signature" && thinkSig.signature.startsWith("agy1.")).toBe(true);
+    // UUID-shaped: a client keeps the block, and Magpie drops it before Claude.
+    expect(
+      thinkSig?.type === "thinking_signature" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+          thinkSig.signature,
+        ),
+    ).toBe(true);
   });
 
   test("9. Stateless request (sessionId === null) runs on ephemeral worker", async () => {

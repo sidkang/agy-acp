@@ -220,7 +220,10 @@ describe("Phase 2 GlobalScheduler wait-for-room", () => {
       expect(err).toBeInstanceOf(BridgeHttpError);
       expect((err as BridgeHttpError).status).toBe(503);
       expect((err as BridgeHttpError).message).toContain(
-        "All Antigravity session workers are busy or awaiting tool results",
+        "overloaded",
+      );
+      expect((err as BridgeHttpError).message).toContain(
+        "session workers are busy or awaiting tool results",
       );
     } finally {
       await scheduler.closeAll();

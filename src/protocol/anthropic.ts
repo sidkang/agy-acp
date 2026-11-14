@@ -30,7 +30,7 @@
 // `<task-notification>`, queued user messages), `ToolSearch` reference blocks and
 // Anthropic server-tool result blocks. Those are normalized here, not refused.
 
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import {
   BridgeHttpError,
@@ -999,29 +999,51 @@ export function parseAnthropicRequest(
 }
 
 // ---------------------------------------------------------------------------
-// Synthetic thinking signatures
+// Thinking signatures
 // ---------------------------------------------------------------------------
 
 /**
- * Per-process HMAC key. Signatures are only ever verified by this process
- * (they exist so clients that require a non-empty `signature` on `thinking`
- * blocks accept streamed thought summaries), so the key never leaves memory.
+ * A signature for a thinking block `agy` did not sign, in the shape of a UUID.
+ *
+ * The shape is the point. A client keeps and replays a thinking block only when
+ * it carries a signature (pi turns an unsigned one into ordinary history text),
+ * so an empty value loses the summary and, worse, sends it back as assistant
+ * prose. A fabricated vendor prefix (`agy1.`, `agyb1.`) keeps the block too, but
+ * Magpie reads it as a genuine foreign signature and forwards it to a Claude
+ * route, which answers `400 invalid signature in thinking block` once per new
+ * value. Magpie's preventive filter drops a thinking block whose signature is
+ * empty **or a UUID** (`deepseekSignature`), since that is the shape DeepSeek's
+ * endpoint issues, so this value gives the client a block to keep while never
+ * reaching a real Anthropic endpoint.
+ *
+ * Deterministic in `(sessionId, thinkingText)`: the same summary signs the same
+ * way, which makes a log line and a replayed history match without any secret.
  */
-const PER_PROCESS_KEY = randomBytes(32);
-
 /**
- * A stable per-process signature for one streamed thinking block, scoped to
- * `(sessionId, thinkingText)`. Pass `""` for `sessionId` when encoding a
- * standalone stream without session context.
+ * The value a thinking block opens with. Empty on purpose: a client adds each
+ * `signature_delta` to it (pi: `signature += delta.signature`), so a value here
+ * would be concatenated with the real one and stop looking like a UUID to
+ * Magpie's filter.
  */
-export function createSyntheticThinkingSignature(
+export const OPENING_THINKING_SIGNATURE = "";
+
+export function thinkingSignatureFor(
   sessionId: string,
   thinkingText: string,
 ): string {
-  const digest = createHmac("sha256", PER_PROCESS_KEY)
-    .update(`${sessionId}:${thinkingText}`)
-    .digest("base64url");
-  return `agy1.${digest}`;
+  const digest = createHash("sha256")
+    .update(`${sessionId}\n${thinkingText}`)
+    .digest();
+  digest[6] = (digest[6]! & 0x0f) | 0x40;
+  digest[8] = (digest[8]! & 0x3f) | 0x80;
+  const hex = digest.subarray(0, 16).toString("hex");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join("-");
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1074,15 @@ export function jsonErrorResponse(err: unknown): Response {
   const signInExpired = bridge !== null && (bridge.signInExpired || bridge.status === 401);
   const headers: Record<string, string> = { ...JSON_HEADERS };
   if (signInExpired) headers[SIGN_IN_HEADER] = "expired";
+  // The refusal named when it would answer, and whether asking again as it stands
+  // can help at all: Magpie routes on status and words, but a direct client
+  // (OpenCode, pi) needs both told plainly or it retries into the same wall.
+  if (bridge?.retryAfterSeconds) {
+    headers["retry-after"] = String(bridge.retryAfterSeconds);
+  }
+  if (status === 400 || status === 401 || status === 404) {
+    headers["x-should-retry"] = "false";
+  }
 
   return new Response(
     JSON.stringify({ type: "error", error: { type: errorType, message } }),
@@ -1071,6 +1102,7 @@ function bridgeErrorFromEvent(
 ): BridgeHttpError {
   return new BridgeHttpError(event.status, event.errorType, event.message, {
     signInExpired: event.signInExpired,
+    retryAfterSeconds: event.retryAfterSeconds,
   });
 }
 
@@ -1340,7 +1372,13 @@ async function openThinkingBlock(state: SseTurnState, channel: SseChannel): Prom
   await channel.emit("content_block_start", {
     type: "content_block_start",
     index,
-    content_block: { type: "thinking", thinking: "" },
+    // An explicit empty signature at the block's start: a client that wants the
+    // field present and whole gets it, and `agy` has none to give.
+    content_block: {
+      type: "thinking",
+      thinking: "",
+      signature: OPENING_THINKING_SIGNATURE,
+    },
   });
 }
 
@@ -1364,7 +1402,7 @@ async function closeOpenBlock(state: SseTurnState, channel: SseChannel): Promise
   if (block.kind === "thinking" && !block.signatureSent) {
     // Clients require a non-empty signature on thinking blocks.
     const signature =
-      state.pendingSignature ?? createSyntheticThinkingSignature("", block.thinking);
+      state.pendingSignature ?? thinkingSignatureFor("", block.thinking);
     state.pendingSignature = null;
     await channel.emit("content_block_delta", {
       type: "content_block_delta",
@@ -1807,7 +1845,7 @@ export async function collectAnthropicJsonResponse(
 
   for (const block of content) {
     if (block.type === "thinking" && block.signature === "") {
-      block.signature = createSyntheticThinkingSignature("", block.thinking);
+      block.signature = thinkingSignatureFor("", block.thinking);
     }
   }
 

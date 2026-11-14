@@ -106,7 +106,7 @@ const OPTION_SPECS: readonly ProviderOptionSpec[] = [
     fallback: true,
     label: "Expose thought summaries",
     description:
-      "Stream Antigravity ACP thought summaries as Anthropic thinking blocks.",
+      "Stream Antigravity ACP thought summaries as Anthropic thinking blocks. agy signs none, so each block carries a UUID-shaped placeholder: clients keep it, and Magpie drops it before a Claude route.",
     labels: {
       zh: "输出思考摘要块",
     },

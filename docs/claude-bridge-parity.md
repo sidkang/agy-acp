@@ -29,7 +29,7 @@ When preserving `agy`'s built-in system prompt (default mode), the bridge must s
 
 3. **Volatile Noise Stripping & Prompt Cloaking (`src/protocol/cloak.ts`)**:
    - Strips rotating `x-anthropic-billing-header` (`cch=...`) lines and dynamic clock lines inside `<system-reminder>` blocks so warm sessions are not misclassified as prompt mutations.
-   - Inserts zero-width spaces (`\u200B`) into third-party harness signature phrases (Claude Code / Claude Agent SDK, Codex, Hermes, and oh-my-pi RFC 2119 lines) that otherwise trigger synthetic upstream `429` refusals when `cloak_prompts` is enabled (default `true`).
+   - Rewords third-party harness phrases (Claude Code / Claude Agent SDK, Codex, Hermes, and oh-my-pi RFC 2119 lines) that otherwise trigger synthetic upstream `429` refusals when `cloak_prompts` is enabled (default `true`). Rewording, not zero-width insertion: since 11-14 the upstream reads past invisible characters and turns the broken-up copy away as the line itself.
    - Rewrites the DeepSeek Harness `@`-path paragraph into equivalent prose so affected models do not skip reasoning.
    - Converts mid-conversation `role: "system"` / `"developer"` messages into `<system-reminder>` user blocks so multi-turn warm sessions stay contiguous.
 

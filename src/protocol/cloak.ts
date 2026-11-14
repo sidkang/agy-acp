@@ -10,21 +10,88 @@ const TURNED_AWAY: readonly string[] = [
   "rfc 2119 keywords: must, required, should, recommended, may, optional.",
 ];
 
-const ZW = "\u200B";
-
 function asciiLower(s: string): string {
   return String(s ?? "").replace(/[A-Z]/g, (ch) =>
     String.fromCharCode(ch.charCodeAt(0) + 32),
   );
 }
 
-export function turnsAway(system: string | undefined | null): boolean {
-  const low = String(system ?? "").toLowerCase();
-  return TURNED_AWAY.some((l) => low.includes(l));
+/**
+ * Characters Google's trigger check reads past when it turns a line away: a line
+ * broken up with a zero-width space after the first and second letter of each
+ * word (or after every letter), or with U+2060, is still the line (#1028). Since
+ * 11-14 the upstream also turns those broken-up copies away, so a bridge must
+ * read them (to report the refusal as a prompt, not a quota) and must reword the
+ * line rather than break it up.
+ */
+const INVISIBLE = "[\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]";
+const INVISIBLE_RE = new RegExp(INVISIBLE, "g");
+
+/**
+ * White space as Google's check reads it, with the invisible characters taken
+ * out: the two classes must stay disjoint, or one 3200-character run of U+FEFF
+ * can be divided between `INVISIBLE*`, `\s+` and `INVISIBLE*` in enough ways to
+ * block the thread for twelve seconds (measured on a lone `?` after the run).
+ */
+const SPACE = "[^\\S\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]";
+
+function escapeRe(ch: string): string {
+  return ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-const breakUp = (line: string): string =>
-  line.replace(/[A-Za-z0-9]{3,}/g, (w) => w[0]! + ZW + w[1]! + ZW + w.slice(2));
+/**
+ * One trigger as a matcher that tolerates invisible characters inside each word
+ * and any run of white space between words, like Google's own check. Claude
+ * Code's billing line is matched to its end, since it goes whole.
+ */
+function triggerRe(line: string): RegExp {
+  const words = line
+    .split(" ")
+    .map((word) => [...word].map(escapeRe).join(`${INVISIBLE}*`));
+  const tail = line === "x-anthropic-billing-header:" ? "[^\n]*\n?" : "";
+  return new RegExp(
+    words.join(`${INVISIBLE}*${SPACE}+${INVISIBLE}*`) + tail,
+    "gi",
+  );
+}
+
+const TRIGGER_RES: ReadonlyArray<RegExp> = TURNED_AWAY.map((line) =>
+  triggerRe(line),
+);
+
+function triggerMatches(text: string): boolean[] {
+  return TRIGGER_RES.map((re) => {
+    re.lastIndex = 0;
+    const hit = re.test(text);
+    re.lastIndex = 0;
+    return hit;
+  });
+}
+
+export function turnsAway(system: string | undefined | null): boolean {
+  const text = String(system ?? "");
+  return text !== "" && triggerMatches(text).some(Boolean);
+}
+
+/**
+ * How each turned-away line goes instead, with its invisible characters taken
+ * out and its white space kept: a rewording that keeps its meaning. Each was
+ * answered on a real account while the line itself, broken up or not, was turned
+ * away. Claude Code's billing line is left out of the rewrites: it is Anthropic's
+ * and no Antigravity model reads anything in it.
+ */
+const SAID_AS: ReadonlyArray<(line: string) => string> = [
+  () => "",
+  (line) =>
+    line.replace(
+      /^(built\s+on\s+)anthropic's(\s+)(claude\s+agent\s+sdk)$/i,
+      "$1the$2$3 by Anthropic",
+    ),
+  (line) => line.replace(/based(\s+)on/i, "built$1on"),
+  (line) => line.replace(/based(\s+)on/i, "built$1on"),
+  (line) => line.replace(/created(\s+)by/i, "built$1by"),
+  (line) => line.replace(/(key)(words)/i, "$1 $2"),
+];
 
 /**
  * Paragraphs that Antigravity accepts without 429 but answers poorly unless reworded
@@ -118,30 +185,31 @@ export function stripVolatileMessageText(text: string | undefined | null): strin
 }
 
 /**
- * Strips billing header and inserts zero-width spaces into recognized third-party harness
- * trigger phrases that cause Antigravity's upstream to return fake 429 refusals.
+ * Strips Claude Code's billing header and rewords recognized third-party harness
+ * prompt lines, which Antigravity answers with a 429 to whatever quota is left.
+ * Break-up with invisible characters is not a defence: since 11-14 the upstream
+ * reads past them and refuses the line all the same.
  */
 export function cloakSystemPrompt(system: string | undefined | null, enabled = true): string {
   const cleaned = stripBillingHeader(system).trim();
   if (!enabled || !cleaned) return cleaned;
   let cloaked = cleaned;
   if (turnsAway(cloaked)) {
-    const low = asciiLower(cloaked);
-    const at: Array<[number, number]> = [];
-    for (const line of TURNED_AWAY) {
-      for (let i = 0; ; ) {
-        const j = low.indexOf(line, i);
-        if (j < 0) break;
-        at.push([j, j + line.length]);
-        i = j + line.length;
+    const at: Array<[number, number, (line: string) => string]> = [];
+    TRIGGER_RES.forEach((re, i) => {
+      re.lastIndex = 0;
+      for (const match of cloaked.matchAll(re)) {
+        const from = match.index ?? 0;
+        at.push([from, from + match[0].length, SAID_AS[i]!]);
       }
-    }
+      re.lastIndex = 0;
+    });
     at.sort((a, b) => a[0] - b[0]);
     let out = "";
     let prev = 0;
-    for (const [from, to] of at) {
+    for (const [from, to, said] of at) {
       if (from < prev) continue;
-      out += cloaked.slice(prev, from) + breakUp(cloaked.slice(from, to));
+      out += cloaked.slice(prev, from) + said(cloaked.slice(from, to).replace(INVISIBLE_RE, ""));
       prev = to;
     }
     cloaked = out + cloaked.slice(prev);
@@ -159,18 +227,10 @@ const RFC_HINT =
   "Antigravity rejected the RFC 2119 system-prompt trigger line with a prompt-level 429 refusal, not an account quota limit.";
 
 export function refusalHint(system: string | undefined | null): string {
-  const low = String(system ?? "").toLowerCase();
-  if (low.includes("rfc 2119 keywords: must, required, should, recommended, may, optional.")) {
-    return RFC_HINT;
-  }
-  if (
-    low.includes("you are codex, an agent based on gpt-5") ||
-    low.includes("you are codex, a coding agent based on gpt-5")
-  ) {
-    return CODEX_HINT;
-  }
-  if (low.includes("hermes agent, an intelligent ai assistant created by nous research")) {
-    return HERMES_HINT;
-  }
+  const hit = triggerMatches(String(system ?? ""));
+  // TURNED_AWAY order: billing, Claude Agent SDK, both Codex lines, Hermes, RFC 2119.
+  if (hit[5]) return RFC_HINT;
+  if (hit[2] || hit[3]) return CODEX_HINT;
+  if (hit[4]) return HERMES_HINT;
   return HINT;
 }

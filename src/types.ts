@@ -132,11 +132,14 @@ export type TurnStreamEvent =
         | "invalid_request_error"
         | "authentication_error"
         | "permission_error"
+        | "not_found_error"
         | "rate_limit_error"
         | "overloaded_error"
         | "api_error";
       message: string;
       signInExpired?: boolean;
+      /** Seconds the refusal named, for a `Retry-After` header. */
+      retryAfterSeconds?: number;
     };
 
 export class BridgeHttpError extends Error {
@@ -145,21 +148,25 @@ export class BridgeHttpError extends Error {
     | "invalid_request_error"
     | "authentication_error"
     | "permission_error"
+    | "not_found_error"
     | "rate_limit_error"
     | "overloaded_error"
     | "api_error";
   readonly signInExpired: boolean;
+  /** Seconds the refusal named, for a `Retry-After` header. */
+  readonly retryAfterSeconds?: number;
 
   constructor(
     status: number,
     errorType: BridgeHttpError["errorType"],
     message: string,
-    opts?: { signInExpired?: boolean },
+    opts?: { signInExpired?: boolean; retryAfterSeconds?: number },
   ) {
     super(message);
     this.name = "BridgeHttpError";
     this.status = status;
     this.errorType = errorType;
+    this.retryAfterSeconds = opts?.retryAfterSeconds;
     this.signInExpired = Boolean(
       opts?.signInExpired || (status === 401 && errorType === "authentication_error"),
     );

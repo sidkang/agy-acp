@@ -109,3 +109,20 @@ The adversarial pass flagged two items that were checked rather than applied:
 - **VP8L Huffman-group budget, truncated-partition tolerance, empty specific quota groups, and import rollback bookkeeping** — confirmed and fixed before this record was written.
 
 Still open by choice: **[CARRY-1]** PDF `embeddedContext` passthrough, and the optional virtual `StructuredOutput` / streaming `<tool_call>` work.
+
+---
+
+## 6. Phase 5: `v0.1.9` — Status Alignment with Magpie's Router (Complete)
+
+A live audit of what the plugin answers versus what Magpie's router does with each status, and versus the statuses `agy` can actually produce (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `NOT_FOUND`, `PERMISSION_DENIED`, … read from its binary and from a suspended account's real answer).
+
+| Change | Before | Now | Why |
+| --- | --- | --- | --- |
+| Vendor-suspended account | `500 Agent execution terminated due to error` | `403` keeping the vendor's own sentence | Magpie recognizes the suspension (`googleToS`), the refusal is retryable, the next account answers and the provider isn't walled off |
+| `PERMISSION_DENIED` that isn't the suspension | `500` | `403` policy/region text | it is the account's, not the prompt's: fail over instead of blaming the request |
+| Model this account isn't served (`NOT_FOUND`, `Requested entity was not found.`) | `500` | `404` "model not found" | Magpie rests that model alone (`modelRefused`) and keeps asking the account for its other models |
+| The vendor's own servers (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, 5xx "overloaded") | `500` | `503` "overloaded" | `vendorOverloaded`: 30-second rest, no failure counted on the account's ladder |
+| Conversation agy cannot serialize (`maxMessageTokens must be positive, got 0`) | `500` | `400` "too long … shorten" | `overflowed`: asks a member with room, rests no account, tells the agent to compact — failing over between accounts only repeated it |
+| This bridge at capacity | `503` with no status words | `503` saying "overloaded" | our own saturation no longer rests the account as a failure |
+
+Tests: the classifier covers each verdict and the non-verdicts (`INVALID_ARGUMENT` stays `invalid_request`, a prompt-level refusal stays `internal`), and the worker table asserts the status, type and wording that reach Magpie for the `403`, `404`, `503` and `400` paths. **349 pass, 0 fail.**

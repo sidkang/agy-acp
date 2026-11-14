@@ -16,15 +16,27 @@ import {
 import { AcpConnection } from "./acp-connection";
 import { measureProcessTreeRssBytes } from "./rss";
 import {
+  AGENT_RETRY_NOTE_MARKERS,
+  AGENT_TERMINAL_MARKERS,
   CONTEXT_BUDGET_FAILURE_MESSAGE,
   GENERIC_FAILURE_MESSAGE,
+  CREDIT_EXHAUSTED_FAILURE_MESSAGE,
+  MODEL_UNSERVED_FAILURE_MESSAGE,
   TRANSIENT_LIMIT_FAILURE_MESSAGE,
+  UPSTREAM_BUSY_FAILURE_MESSAGE,
+  VENDOR_DISABLED_FAILURE_MESSAGE,
+  VENDOR_POLICY_FAILURE_MESSAGE,
   TurnLogWatch,
   classifyAgentFailure,
   extractErrorEvidence,
   hasUpstreamRetryEvidence,
   looksLikeAgentRetryNotice,
+  retryAfterSecondsFrom,
   stderrDelta,
+  limitFreeDetail,
+  tooLongVetoed,
+  upstreamDetail,
+  withoutLocalPaths,
 } from "./diagnostics";
 import {
   turnsAway,
@@ -46,7 +58,7 @@ import {
   type ToolResultDelivery,
 } from "../mcp/broker";
 import { type LoopbackMcpServer } from "../mcp/http-server";
-import { createSyntheticThinkingSignature } from "../protocol/anthropic";
+import { thinkingSignatureFor } from "../protocol/anthropic";
 import { AsyncEventQueue, TurnContext } from "./turn-context";
 
 export type WorkerState =
@@ -103,11 +115,25 @@ export interface WorkerOptions {
   ) => void;
 }
 
-const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n";
-
 /** `ps`-based RSS sampling is throttled to this window on non-Linux hosts. */
 const RSS_SAMPLE_COOLDOWN_MS = 10_000;
-const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim();
+
+/** The terminal notices `agy` writes as the last thing in a failed turn. */
+const AGENT_ERROR_CORES: readonly string[] = AGENT_TERMINAL_MARKERS.map((m) =>
+  m.trim(),
+);
+const AGENT_ERROR_HELD_MAX = Math.max(...AGENT_TERMINAL_MARKERS.map((m) => m.length)) - 1;
+const AGENT_RETRY_NOTES: readonly string[] = AGENT_RETRY_NOTE_MARKERS.map((m) =>
+  m.trim(),
+);
+
+/** The first terminal notice this text contains, or null. */
+function agentTerminalCore(text: string): string | null {
+  for (const core of AGENT_ERROR_CORES) {
+    if (text.includes(core)) return core;
+  }
+  return null;
+}
 
 /**
  * How many `agy` retry notices a turn may emit before it is ended as a
@@ -640,6 +666,18 @@ export class AgySessionWorker {
           (initRes as any)?.agentCapabilities?.sessionCapabilities?.resume,
       );
 
+      // ACP asks a client to check the agent's HTTP support before offering an
+      // HTTP MCP server. When `agy` says it has none, it drops the session's
+      // `mcpServers` without a word and every tool call fails as if the model had
+      // refused; say so here, with the version, instead of failing later.
+      const httpMcp = (initRes as any)?.agentCapabilities?.mcpCapabilities?.http;
+      if (httpMcp === false) {
+        const version = String((initRes as any)?.agentInfo?.version ?? "unknown");
+        throw new Error(
+          `agy ${version} does not accept HTTP MCP servers (agentCapabilities.mcpCapabilities.http is false), so no caller tool can reach it; update agy to a version that does`,
+        );
+      }
+
       // Cloak system prompt
       const effectiveSystem = buildEffectiveSystemText(
         this.options.systemPrompt,
@@ -655,7 +693,9 @@ export class AgySessionWorker {
           const resumeParams: Record<string, unknown> = {
             sessionId: this.options.resumeSessionId,
             cwd: this.workspaceDir,
-            mcpServers: [{ name: "magpie", type: "http", url: this.mcpUrl }],
+            mcpServers: [
+              { name: "magpie", type: "http", url: this.mcpUrl, headers: [] },
+            ],
           };
           if (this.appendSystemSupported) {
             const resumeSystem = [
@@ -693,7 +733,9 @@ export class AgySessionWorker {
       if (!sessionRes) {
         const newParams: Record<string, unknown> = {
           cwd: this.workspaceDir,
-          mcpServers: [{ name: "magpie", type: "http", url: this.mcpUrl }],
+          mcpServers: [
+            { name: "magpie", type: "http", url: this.mcpUrl, headers: [] },
+          ],
         };
 
         if (this.appendSystemSupported) {
@@ -813,11 +855,14 @@ export class AgySessionWorker {
       let text = this.turn.heldText + absorbed.text;
       this.turn.heldText = "";
 
-      const marker = text.lastIndexOf(AGENT_ERROR_CORE);
-      if (
-        marker >= 0 &&
-        !text.slice(marker + AGENT_ERROR_CORE.length).trim()
-      ) {
+      // agy's "retry me" note is its own, not the model's: the turn goes on.
+      for (const note of AGENT_RETRY_NOTES) {
+        if (text.includes(note)) text = text.split(note).join("\n");
+      }
+
+      const terminal = agentTerminalCore(text);
+      const marker = terminal === null ? -1 : text.lastIndexOf(terminal);
+      if (marker >= 0 && terminal !== null && !text.slice(marker + terminal.length).trim()) {
         const start = text[marker - 1] === "\n" ? marker - 1 : marker;
         this.turn.heldText = text.slice(start);
         text = text.slice(0, start);
@@ -825,13 +870,13 @@ export class AgySessionWorker {
         return;
       }
 
-      for (
-        let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1);
-        keep > 0;
-        keep--
-      ) {
-        if (AGENT_ERROR_MARKER.startsWith(text.slice(-keep))) {
-          this.turn.heldText = text.slice(-keep);
+      for (let keep = Math.min(text.length, AGENT_ERROR_HELD_MAX); keep > 0; keep--) {
+        const tail = text.slice(-keep);
+        if (
+          AGENT_TERMINAL_MARKERS.some((m) => m.startsWith(tail)) ||
+          AGENT_RETRY_NOTES.some((m) => m.startsWith(tail))
+        ) {
+          this.turn.heldText = tail;
           text = text.slice(0, -keep);
           break;
         }
@@ -919,6 +964,17 @@ export class AgySessionWorker {
    * process logs only `front: session/prompt`, while the executor error is
    * written by the per-session worker into its own numbered log.
    */
+  /**
+   * A model can quote one of `agy`'s notices (a caller asking what the error
+   * means), so held words only become the turn's failure when the turn said
+   * nothing else first, or when the turn's own log carries the same failure. The
+   * same rule keeps a quoted notice from resting a healthy account.
+   */
+  private terminalNoticeIsEvidence(): boolean {
+    if (!this.turn.deliveredWork) return true;
+    return this.currentTurnLogEvidence() !== "";
+  }
+
   private currentTurnLogEvidence(): string {
     try {
       // No mark means no turn window (diagnosis before any prompt): read the
@@ -975,24 +1031,92 @@ export class AgySessionWorker {
     // Log records and turn-scoped stderr are merged as evidence; the ACP error
     // text is passed separately because it is authoritative for this turn and
     // may therefore state auth in wording that a log must not trust.
-    switch (classifyAgentFailure(evidence, redactedRawErr)) {
+    const verdict = classifyAgentFailure(evidence, redactedRawErr);
+
+    // The vendor's own words, appended after the fixed sentence: the verdict is
+    // what Magpie routes on, the detail is what a human reads. Bounded, one line,
+    // secrets already redacted above.
+    // Every byte that can reach the client is redacted and stripped of local
+    // paths: the log tail is not redacted where it is read.
+    const upstreamText = withoutLocalPaths(
+      redactSecrets([redactedRawErr, evidence].filter(Boolean).join(" ")),
+    );
+    const rawDetail = upstreamDetail(upstreamText);
+    // A detail on a verdict that is *not* about limits must not carry limit
+    // wording: Magpie reads the whole body, so an echoed "quota" in a 400 or 403
+    // would be taken for a spent window and hold the account.
+    const limitFree = limitFreeDetail(upstreamText);
+    const withDetail = (message: string, detail = limitFree) =>
+      detail ? `${message} Upstream said: ${detail}` : message;
+    // A `Retry-After` for what the refusal named, so a client that honors it does
+    // not come back before the upstream will answer.
+    const retryAfterSeconds = retryAfterSecondsFrom(
+      `${redactedRawErr}\n${evidence}`,
+    );
+
+    switch (verdict) {
       case "context_budget":
         // `agy` refused to serialize the trajectory (`maxMessageTokens must be
-        // positive, got 0`). The public text is fixed and neutral: the raw line
-        // is not actionable, and naming quotas would trip Magpie's quota-word
-        // detector and rest a healthy account.
+        // positive, got 0`). A `400` saying the conversation is too long is how
+        // Magpie reads a prompt the model can't hold: it asks a member with room,
+        // rests no account, and tells the agent to compact. The same conversation
+        // is too long on every account, so failing over only repeated it.
         return {
           type: "error",
-          status: 500,
+          status: 400,
+          errorType: "invalid_request_error",
+          message: withDetail(
+            CONTEXT_BUDGET_FAILURE_MESSAGE,
+            tooLongVetoed(upstreamText) ? "" : limitFree,
+          ),
+        };
+      case "vendor_restricted":
+        // The account itself is suspended. A `403` is retryable in Magpie, and its
+        // words keep the vendor's own sentence so Magpie reads the suspension
+        // (`googleToS`) rather than walling the provider off for the request.
+        return {
+          type: "error",
+          status: 403,
+          errorType: "permission_error",
+          message: withDetail(VENDOR_DISABLED_FAILURE_MESSAGE),
+        };
+      case "vendor_policy":
+        // Permission denied for the account, not the prompt: retryable, so the
+        // next signed-in account answers this turn.
+        return {
+          type: "error",
+          status: 403,
+          errorType: "permission_error",
+          message: withDetail(VENDOR_POLICY_FAILURE_MESSAGE),
+        };
+      case "model_unserved":
+        // A `404` whose words say the model is not found: Magpie rests that model
+        // on this account alone and keeps asking it for the others (#1235).
+        return {
+          type: "error",
+          status: 404,
+          errorType: "not_found_error",
+          message: withDetail(MODEL_UNSERVED_FAILURE_MESSAGE),
+        };
+      case "upstream_busy":
+        // The vendor's own servers: a `503` saying "overloaded" rests the account
+        // for 30 seconds without counting a failure on its ladder, because the
+        // next request would meet the same thing.
+        return {
+          type: "error",
+          status: 503,
           errorType: "api_error",
-          message: CONTEXT_BUDGET_FAILURE_MESSAGE,
+          message: withDetail(UPSTREAM_BUSY_FAILURE_MESSAGE),
+          ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
         };
       case "auth":
         return {
           type: "error",
           status: 401,
           errorType: "authentication_error",
-          message: "Antigravity CLI authentication expired. Please sign in again.",
+          message: withDetail(
+            "Antigravity CLI authentication expired. Please sign in again.",
+          ),
           signInExpired: true,
         };
       case "quota":
@@ -1008,7 +1132,8 @@ export class AgySessionWorker {
           type: "error",
           status: 429,
           errorType: "rate_limit_error",
-          message: "Account quota exhausted",
+          message: withDetail("Account quota exhausted", rawDetail),
+          ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
         };
       case "rate_limit":
         // A `429` that names no spent window: `agy` retries these in-process, so
@@ -1023,13 +1148,26 @@ export class AgySessionWorker {
             message: refusalHint(this.systemPrompt),
           };
         }
-        return this.transientLimitError();
+        return this.transientLimitError(
+          limitFreeDetail(upstreamText),
+          retryAfterSeconds,
+        );
+      case "credit_exhausted":
+        // A `402` is out of credit to Magpie: the account is held on that ladder
+        // rather than a quota window's, and topping up is what clears it.
+        return {
+          type: "error",
+          status: 402,
+          errorType: "api_error",
+          message: withDetail(CREDIT_EXHAUSTED_FAILURE_MESSAGE, rawDetail),
+          ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+        };
       case "invalid_request":
         return {
           type: "error",
           status: 400,
           errorType: "invalid_request_error",
-          message: "Invalid request to agent",
+          message: withDetail("Invalid request to agent"),
         };
       default:
         // Never echo the raw error: for a process exit it carries the whole
@@ -1058,12 +1196,18 @@ export class AgySessionWorker {
   }
 
   /** The fixed `429` event for a transient upstream limit (see the message doc). */
-  private transientLimitError(): Extract<TurnStreamEvent, { type: "error" }> {
+  private transientLimitError(
+    detail?: string,
+    retryAfterSeconds?: number,
+  ): Extract<TurnStreamEvent, { type: "error" }> {
     return {
       type: "error",
       status: 429,
       errorType: "rate_limit_error",
-      message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+      message: detail
+        ? `${TRANSIENT_LIMIT_FAILURE_MESSAGE} Upstream said: ${detail}`
+        : TRANSIENT_LIMIT_FAILURE_MESSAGE,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
 
@@ -1129,11 +1273,10 @@ export class AgySessionWorker {
     if (this.options.exposeThinking !== false) {
       const thinking = this.turn.consumeThinkingForSignature();
       if (thinking.length > 0) {
-        const signature = createSyntheticThinkingSignature(
-          this.sessionId,
-          thinking,
-        );
-        q.push({ type: "thinking_signature", signature });
+        q.push({
+          type: "thinking_signature",
+          signature: thinkingSignatureFor(this.sessionId, thinking),
+        });
       }
     } else {
       this.turn.resetThinking();
@@ -1357,9 +1500,12 @@ export class AgySessionWorker {
       return;
     }
 
-    if (this.turn.heldText.includes(AGENT_ERROR_CORE)) {
+    const terminal = agentTerminalCore(this.turn.heldText);
+    if (terminal !== null && this.terminalNoticeIsEvidence()) {
+      // The notice's own words are this turn's evidence: `agy` writes it instead
+      // of an answer, and each wording is a different failure.
+      const errorEvent = this.diagnoseTerminationError(this.turn.heldText);
       this.turn.heldText = "";
-      const errorEvent = this.diagnoseTerminationError();
       this.turn.finishWith(errorEvent);
       this.setState("IDLE");
       this.turn.pendingPrompt = null;
@@ -1377,7 +1523,9 @@ export class AgySessionWorker {
 
     if (result?.stopReason === "refusal") {
       const diag = this.diagnoseTerminationError();
-      if (diag.status === 400 || diag.status === 401 || diag.status === 429) {
+      // Anything the diagnosis recognized, except the generic 500 that stands for
+      // "no idea": a refusal with a real cause is that cause (403, 404, 402, 503).
+      if (diag.status !== 500) {
         this.turn.finishWith(diag);
         this.setState("IDLE");
         this.turn.pendingPrompt = null;
@@ -1397,11 +1545,13 @@ export class AgySessionWorker {
       if (this.options.exposeThinking !== false) {
         const thinking = this.turn.consumeThinkingForSignature();
         if (thinking.length > 0) {
-          const signature = createSyntheticThinkingSignature(
-            this.sessionId,
-            thinking,
-          );
-          this.turn.pushEvent({ type: "thinking_signature", signature });
+          // A UUID-shaped value, the shape Magpie's preventive filter drops before
+          // a Claude route (`deepseekSignature`): the client keeps the block, and
+          // no real Anthropic endpoint ever sees a signature it did not issue.
+          this.turn.pushEvent({
+            type: "thinking_signature",
+            signature: thinkingSignatureFor(this.sessionId, thinking),
+          });
         }
       } else {
         this.turn.resetThinking();

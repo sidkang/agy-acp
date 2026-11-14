@@ -15,7 +15,17 @@ import { AgySessionWorker } from "../src/runtime/worker";
 import {
   CONTEXT_BUDGET_FAILURE_MESSAGE,
   GENERIC_FAILURE_MESSAGE,
+  CREDIT_EXHAUSTED_FAILURE_MESSAGE,
+  MODEL_UNSERVED_FAILURE_MESSAGE,
+  limitFreeDetail,
+  retryAfterSecondsFrom,
+  tooLongVetoed,
+  upstreamDetail,
+  withoutLocalPaths,
   TRANSIENT_LIMIT_FAILURE_MESSAGE,
+  UPSTREAM_BUSY_FAILURE_MESSAGE,
+  VENDOR_DISABLED_FAILURE_MESSAGE,
+  VENDOR_POLICY_FAILURE_MESSAGE,
   TurnLogWatch,
   classifyAgentFailure,
   extractErrorEvidence,
@@ -28,6 +38,27 @@ import {
 const TEMP_ROOT = fs.mkdtempSync(
   path.join(os.tmpdir(), "agy-runtime-diagnostics-test-"),
 );
+
+/**
+ * One turn's error event, asserted on the fixed sentence. The vendor's own words
+ * may follow it ("Upstream said: …"), so the message is matched by prefix.
+ */
+function expectErrorEvent(
+  events: TurnStreamEvent[],
+  want: {
+    status: number;
+    errorType: Extract<TurnStreamEvent, { type: "error" }>["errorType"];
+    message: string;
+  },
+): void {
+  const ev = events.find((e) => e.type === "error") as
+    | Extract<TurnStreamEvent, { type: "error" }>
+    | undefined;
+  expect(ev).toBeDefined();
+  expect(ev!.status).toBe(want.status);
+  expect(ev!.errorType).toBe(want.errorType);
+  expect(ev!.message.startsWith(want.message)).toBe(true);
+}
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(TEMP_ROOT, prefix));
@@ -63,6 +94,12 @@ interface FakeAcpScriptContext {
   cancelTurn: () => void;
   /** Answers the in-flight `session/prompt` with a plain `end_turn`. */
   finishTurn: () => void;
+  /**
+   * Answers the in-flight `session/prompt` as a refusal, optionally staging a
+   * numbered worker log line first: `agy` says `stopReason: refusal` when the
+   * agent stops for its own reason, and the log is what names it.
+   */
+  refuseTurn: (log?: { name: string; text: string; append?: boolean }) => void;
 }
 
 /** The chunk agy emits as the only content of a turn that failed internally. */
@@ -84,6 +121,8 @@ interface DiagnosedTurnCase {
   startup?: (ctx: FakeAcpScriptContext) => void;
   status: number;
   signInHeader: string | null;
+  /** Expected `Retry-After` header, when the refusal named a time. */
+  retryAfter?: string;
   errorType: string;
   message?: string;
   /** Substrings that must never appear anywhere in the raw JSON body. */
@@ -142,6 +181,14 @@ function createScriptedFakeAcpChild(
         },
       });
       ctx.sendResult(promptRequestId, { stopReason: "end_turn" });
+    },
+    refuseTurn: (log) => {
+      if (log !== undefined) {
+        const logPath = path.join(workspaceDir, log.name);
+        if (log.append === true) fs.appendFileSync(logPath, log.text);
+        else fs.writeFileSync(logPath, log.text);
+      }
+      ctx.sendResult(promptRequestId, { stopReason: "refusal" });
     },
     failTurn: (message, code = -32000) => {
       ctx.sendError(promptRequestId, code, message);
@@ -422,6 +469,81 @@ describe("extractErrorEvidence and classifyAgentFailure", () => {
     expect(classifyAgentFailure(line)).toBe("internal");
   });
 
+  test("reads agy's own error codes and terminal wordings", () => {
+    // The codes the vendor uses for model capacity, a ToS suspension and an
+    // account that still needs verifying.
+    expect(classifyAgentFailure("", "rpc error: code = ResourceExhausted desc = MODEL_CAPACITY_EXHAUSTED")).toBe(
+      "rate_limit",
+    );
+    expect(classifyAgentFailure("", "PERMISSION_DENIED: TOS_VIOLATION")).toBe(
+      "vendor_restricted",
+    );
+    expect(classifyAgentFailure("", "PERMISSION_DENIED: VALIDATION_REQUIRED")).toBe(
+      "vendor_policy",
+    );
+    // agy 1.5.8's own terminal wordings.
+    expect(
+      classifyAgentFailure(
+        "",
+        "There was a network issue connecting to the server, please try again.",
+      ),
+    ).toBe("upstream_busy");
+    expect(
+      classifyAgentFailure("", "Your AI credits balance is too low to continue."),
+    ).toBe("credit_exhausted");
+  });
+
+  test("appends the vendor's words without carrying limit wording into other verdicts", () => {
+    // A detail is readable and bounded.
+    expect(upstreamDetail("  a   b  ")).toBe("a b");
+    expect(upstreamDetail("x".repeat(500)).length).toBe(400);
+    // Google's boilerplate is dropped and a limit-sounding detail is refused, so
+    // an echoed 400/403 can never read as a spent window to Magpie.
+    expect(
+      limitFreeDetail(
+        "RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).",
+      ),
+    ).toBe("RESOURCE_EXHAUSTED (code 429): Resource has been exhausted.");
+    expect(limitFreeDetail("quota exceeded for model")).toBe("");
+    expect(limitFreeDetail("invalid argument: image is too large")).toBe(
+      "invalid argument: image is too large",
+    );
+  });
+
+  test("drops a detail that would move the verdict, and keeps one that would not", () => {
+    // Magpie's credit/limit vocabulary, not just the word "quota": `billing` alone
+    // rests an account for half an hour as out of credit.
+    expect(limitFreeDetail("PERMISSION_DENIED (code 403): Please enable billing")).toBe("");
+    expect(limitFreeDetail("the caller has used up its budget for today")).toBe("");
+    expect(limitFreeDetail("permission denied: region not allowed")).toBe(
+      "permission denied: region not allowed",
+    );
+    // A token ceiling in the detail vetoes Magpie's overflow reading outright.
+    expect(tooLongVetoed("max_output_tokens is 8192")).toBe(true);
+    expect(tooLongVetoed("1000 tokens per minute")).toBe(true);
+    expect(tooLongVetoed("maxMessageTokens must be positive, got 0")).toBe(false);
+    // A local path names a filesystem the caller may not own.
+    expect(withoutLocalPaths("failed at /Users/sid/repo/a.ts")).toBe(
+      "failed at /Users/[user]/repo/a.ts",
+    );
+  });
+
+  test("reads a Retry-After out of the refusal, clamped", () => {
+    expect(retryAfterSecondsFrom("retrying in 4s")).toBe(4);
+    expect(retryAfterSecondsFrom("please try again in 30 seconds")).toBe(30);
+    expect(retryAfterSecondsFrom("quota resets in 2h")).toBe(7200);
+    expect(retryAfterSecondsFrom("reset after 90 minutes")).toBe(5400);
+    expect(retryAfterSecondsFrom("no time here")).toBeUndefined();
+    // A turn that retried twice named two waits: the client must wait out the last.
+    expect(
+      retryAfterSecondsFrom(
+        "Run: attempt 1 failed, retrying in 4s\nRun: attempt 2 failed, retrying in 32s",
+      ),
+    ).toBe(32);
+    // A misread reset can't bench a client for longer than a day.
+    expect(retryAfterSecondsFrom("resets in 99h")).toBe(86400);
+  });
+
   test("recognizes upstream retry evidence in raw logs, including info records", () => {
     expect(
       hasUpstreamRetryEvidence(
@@ -531,6 +653,45 @@ describe("extractErrorEvidence and classifyAgentFailure", () => {
         "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 4s",
       ),
     ).toBe("rate_limit");
+  });
+
+  test("classifies the vendor disabling the account as vendor_restricted, not auth or quota", () => {
+    const disabled =
+      'error: This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product. AGY_ERROR: {"short_error":"PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service."}';
+    expect(classifyAgentFailure("", disabled)).toBe("vendor_restricted");
+    expect(
+      classifyAgentFailure(
+        `E1114 18:02:11.123456     400 errorreport.go:273] agent executor error: ${disabled}`,
+      ),
+    ).toBe("vendor_restricted");
+    // A prompt-level refusal in different words is not the account's problem.
+    expect(classifyAgentFailure("", "Request blocked by policy")).toBe("internal");
+  });
+
+  test("separates a policy 403, a model this account is not served, and the vendor's own busy", () => {
+    // Permission denied without the suspension's words: the account, not the prompt.
+    expect(
+      classifyAgentFailure("", "PERMISSION_DENIED (code 403): The caller does not have permission"),
+    ).toBe("vendor_policy");
+    // Code Assist's NOT_FOUND for a model this account may not use.
+    expect(
+      classifyAgentFailure("", "NOT_FOUND (code 404): Requested entity was not found."),
+    ).toBe("model_unserved");
+    expect(
+      classifyAgentFailure("", "FAILED_PRECONDITION (code 400): model gemini-4-carbon is not available to this project"),
+    ).toBe("model_unserved");
+    // agy's gRPC statuses for the vendor's own servers.
+    for (const line of [
+      "UNAVAILABLE (code 503): The service is currently unavailable.",
+      "DEADLINE_EXCEEDED (code 504): Deadline expired before operation could complete.",
+      "E1114 18:02:11.000001 400 upstream.go:9] 503 The model is overloaded",
+    ]) {
+      expect(classifyAgentFailure(line)).toBe("upstream_busy");
+    }
+    // A malformed request is still the request's, not the account's.
+    expect(
+      classifyAgentFailure("", "INVALID_ARGUMENT (code 400): Request contains an invalid argument."),
+    ).toBe("invalid_request");
   });
 
   test("classifies explicit raw RPC 401 / auth failures as auth", () => {
@@ -720,14 +881,19 @@ describe("AgySessionWorker diagnostics integration", () => {
     try {
       await worker.start();
       const events = await runTurn(worker, "hello");
-      const errEv = events.find((e) => e.type === "error");
-      expect(errEv).toEqual({
-        type: "error",
-        status: 500,
-        errorType: "api_error",
+      expectErrorEvent(events, {
+        status: 400,
+        errorType: "invalid_request_error",
         message: CONTEXT_BUDGET_FAILURE_MESSAGE,
       });
       expect(CONTEXT_BUDGET_FAILURE_MESSAGE).not.toMatch(/quota|rate.?limit/i);
+      // Magpie reads a 400 as an overflow only when its words match tooLongRe
+      // ("prompt is too long", "maximum context length", "reduce the length of
+      // the messages"): it then asks a member with room and tells the agent to
+      // compact.
+      expect(CONTEXT_BUDGET_FAILURE_MESSAGE).toMatch(/prompt is too long/i);
+      expect(CONTEXT_BUDGET_FAILURE_MESSAGE).toMatch(/maximum context length/i);
+      expect(CONTEXT_BUDGET_FAILURE_MESSAGE).toMatch(/reduce the length of the messages/i);
     } finally {
       await worker.close("test_done");
     }
@@ -763,8 +929,7 @@ describe("AgySessionWorker diagnostics integration", () => {
     try {
       await worker.start();
       const t1 = await runTurn(worker, "turn 1");
-      expect(t1.find((e) => e.type === "error")).toEqual({
-        type: "error",
+      expectErrorEvent(t1, {
         status: 429,
         errorType: "rate_limit_error",
         message: "Account quota exhausted",
@@ -811,12 +976,7 @@ describe("AgySessionWorker diagnostics integration", () => {
         .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
         .join("");
       expect(leaked).toBe("");
-      expect(events.find((e) => e.type === "error")).toEqual({
-        type: "error",
-        status: 429,
-        errorType: "rate_limit_error",
-        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
-      });
+      expectErrorEvent(events, { status: 429, errorType: "rate_limit_error", message: TRANSIENT_LIMIT_FAILURE_MESSAGE });
       // Magpie reads error text for quota wording and holds the account on a
       // match, so this message must stay outside both word families.
       expect(TRANSIENT_LIMIT_FAILURE_MESSAGE).not.toMatch(/quota|rate.?limit/i);
@@ -899,6 +1059,86 @@ describe("AgySessionWorker diagnostics integration", () => {
     }
   });
 
+  test("a notice the model quotes as answer text is not taken for the turn's failure", async () => {
+    // A caller can ask what an error means, and the model then writes the notice
+    // itself. Treating those words as the turn's failure would answer 402 and rest
+    // a healthy account on its credit ladder.
+    const ws = makeTempDir("worker-quoted-notice-");
+    const worker = new AgySessionWorker(account, "diag-sess-quoted", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "The bridge answers 402 when it reads:" },
+            },
+          });
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "\n⚠ Your AI credits balance is too low to continue.\n" },
+            },
+          });
+          ctx.finishTurn();
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "what does this error mean?");
+      expect(events.some((e) => e.type === "error")).toBe(false);
+      const text = events
+        .filter((e): e is Extract<TurnStreamEvent, { type: "text_delta" }> => e.type === "text_delta")
+        .map((e) => e.text)
+        .join("");
+      expect(text).toContain("The bridge answers 402");
+      expect(text).toContain("credits balance is too low");
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("a retry note split across two chunks is still stripped", async () => {
+    const ws = makeTempDir("worker-split-note-");
+    const worker = new AgySessionWorker(account, "diag-sess-split-note", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "\n⚠ Model produced invalid" },
+            },
+          });
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: " output.\n\nThe answer." },
+            },
+          });
+          ctx.finishTurn();
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "split note");
+      const text = events
+        .filter((e): e is Extract<TurnStreamEvent, { type: "text_delta" }> => e.type === "text_delta")
+        .map((e) => e.text)
+        .join("");
+      expect(text).not.toContain("Model produced invalid");
+      expect(text).toContain("The answer.");
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
   test("answers a single-retry termination with the transient 429, not a generic 500", async () => {
     const ws = makeTempDir("worker-single-retry-log-");
     const worker = new AgySessionWorker(account, "diag-sess-single", mcpServer, {
@@ -918,12 +1158,7 @@ describe("AgySessionWorker diagnostics integration", () => {
     try {
       await worker.start();
       const events = await runTurn(worker, "single retry");
-      expect(events.find((e) => e.type === "error")).toEqual({
-        type: "error",
-        status: 429,
-        errorType: "rate_limit_error",
-        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
-      });
+      expectErrorEvent(events, { status: 429, errorType: "rate_limit_error", message: TRANSIENT_LIMIT_FAILURE_MESSAGE });
     } finally {
       await worker.close("test_done");
     }
@@ -971,12 +1206,7 @@ describe("AgySessionWorker diagnostics integration", () => {
         .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
         .join("");
       expect(leaked).toBe("");
-      expect(events.find((e) => e.type === "error")).toEqual({
-        type: "error",
-        status: 429,
-        errorType: "rate_limit_error",
-        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
-      });
+      expectErrorEvent(events, { status: 429, errorType: "rate_limit_error", message: TRANSIENT_LIMIT_FAILURE_MESSAGE });
     } finally {
       await worker.close("test_done");
     }
@@ -1014,12 +1244,7 @@ describe("AgySessionWorker diagnostics integration", () => {
         .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
         .join("");
       expect(leaked).toBe("");
-      expect(events.find((e) => e.type === "error")).toEqual({
-        type: "error",
-        status: 429,
-        errorType: "rate_limit_error",
-        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
-      });
+      expectErrorEvent(events, { status: 429, errorType: "rate_limit_error", message: TRANSIENT_LIMIT_FAILURE_MESSAGE });
     } finally {
       await worker.close("test_done");
     }
@@ -1060,12 +1285,7 @@ describe("AgySessionWorker diagnostics integration", () => {
         .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
         .join("");
       expect(leaked).toBe("");
-      expect(events.find((e) => e.type === "error")).toEqual({
-        type: "error",
-        status: 429,
-        errorType: "rate_limit_error",
-        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
-      });
+      expectErrorEvent(events, { status: 429, errorType: "rate_limit_error", message: TRANSIENT_LIMIT_FAILURE_MESSAGE });
     } finally {
       await worker.close("test_done");
     }
@@ -1088,13 +1308,13 @@ describe("AgySessionWorker diagnostics integration", () => {
     try {
       await worker.start();
       const events = await runTurn(worker, "auth check");
-      expect(events.find((e) => e.type === "error")).toEqual({
-        type: "error",
+      const authEv = events.find((e) => e.type === "error");
+      expectErrorEvent(events, {
         status: 401,
         errorType: "authentication_error",
         message: "Antigravity CLI authentication expired. Please sign in again.",
-        signInExpired: true,
       });
+      expect((authEv as Extract<TurnStreamEvent, { type: "error" }>).signInExpired).toBe(true);
     } finally {
       await worker.close("test_done");
     }
@@ -1170,6 +1390,173 @@ describe("AgySessionWorker diagnostics integration", () => {
       message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
     },
     {
+      name: "agy's network-issue terminal marker answers 503 overloaded, not text",
+      workspacePrefix: "worker-net-marker-",
+      sessionId: "diag-net-marker",
+      script: (ctx) => {
+        ctx.emitUpdate({
+          sessionId: NATIVE_SESSION_ID,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              text: "\n⚠ There was a network issue connecting to the server, please try again.\n",
+            },
+          },
+        });
+        ctx.finishTurn();
+      },
+      status: 503,
+      signInHeader: null,
+      errorType: "api_error",
+      message: UPSTREAM_BUSY_FAILURE_MESSAGE,
+    },
+    {
+      name: "agy's spent-credit terminal marker answers 402, not text",
+      workspacePrefix: "worker-credit-marker-",
+      sessionId: "diag-credit-marker",
+      script: (ctx) => {
+        ctx.emitUpdate({
+          sessionId: NATIVE_SESSION_ID,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "\n⚠ Your AI credits balance is too low to continue.\n" },
+          },
+        });
+        ctx.finishTurn();
+      },
+      status: 402,
+      signInHeader: null,
+      errorType: "api_error",
+      message: CREDIT_EXHAUSTED_FAILURE_MESSAGE,
+    },
+    {
+      name: "a refusal that names a wait answers with Retry-After",
+      workspacePrefix: "worker-retry-after-",
+      sessionId: "diag-retry-after",
+      script: (ctx) => {
+        ctx.terminateTurn({
+          name: "agy-acp.log.91011",
+          text: "E1114 18:02:11.000001 400 run.go:315] Run: attempt 1 failed (UNAVAILABLE (code 503): The service is currently unavailable), retrying in 7s\n",
+        });
+      },
+      status: 503,
+      signInHeader: null,
+      retryAfter: "7",
+      errorType: "api_error",
+      message: UPSTREAM_BUSY_FAILURE_MESSAGE,
+    },
+    {
+      name: "an echoed detail never carries a secret or a home path",
+      workspacePrefix: "worker-busy-detail-",
+      sessionId: "diag-busy-detail",
+      script: (ctx) => {
+        fs.writeFileSync(
+          path.join(ctx.workspaceDir, "agy-acp.log.91021"),
+          "E1114 18:31:00.000001 400 run.go:315] UNAVAILABLE (code 503): the model pool is full; Authorization: Bearer ya29.secret-token; see /Users/private/repo/secret.ts\n",
+        );
+        ctx.failTurn("ACP process exited");
+      },
+      status: 503,
+      signInHeader: null,
+      errorType: "api_error",
+      message: UPSTREAM_BUSY_FAILURE_MESSAGE,
+      forbidden: ["ya29.secret-token", "/Users/private/"],
+      checkRaw: (raw) => {
+        expect(raw).toContain("the model pool is full");
+        expect(raw).toContain("/Users/[user]/repo/secret.ts");
+      },
+    },
+    {
+      name: "a 403 whose vendor text names billing stays a permission error",
+      workspacePrefix: "worker-policy-billing-",
+      sessionId: "diag-policy-billing",
+      script: (ctx) => {
+        fs.writeFileSync(
+          path.join(ctx.workspaceDir, "agy-acp.log.91022"),
+          "E1114 18:31:00.000002 400 run.go:315] PERMISSION_DENIED (code 403): please enable billing for this project\n",
+        );
+        ctx.failTurn("ACP process exited");
+      },
+      status: 403,
+      signInHeader: null,
+      errorType: "permission_error",
+      message: VENDOR_POLICY_FAILURE_MESSAGE,
+      forbidden: ["billing"],
+    },
+    {
+      name: "a refusal completion keeps the diagnosis it names",
+      workspacePrefix: "worker-refusal-403-",
+      sessionId: "diag-refusal-403",
+      script: (ctx) => {
+        ctx.refuseTurn({
+          name: "agy-acp.log.91023",
+          text: "E1114 18:31:00.000003 400 run.go:315] PERMISSION_DENIED: this service has been disabled in this account for violation of Terms of Service\n",
+        });
+      },
+      status: 403,
+      signInHeader: null,
+      errorType: "permission_error",
+      message: VENDOR_DISABLED_FAILURE_MESSAGE,
+    },
+    {
+      name: "a model this account is not served answers 404 so only that model rests",
+      workspacePrefix: "worker-unserved-404-",
+      sessionId: "diag-unserved-404",
+      script: (ctx) => {
+        ctx.failTurn("NOT_FOUND (code 404): Requested entity was not found.");
+      },
+      status: 404,
+      signInHeader: null,
+      errorType: "not_found_error",
+      message: MODEL_UNSERVED_FAILURE_MESSAGE,
+      forbidden: ["quota", "rate limit"],
+    },
+    {
+      name: "the vendor's own UNAVAILABLE answers 503 overloaded so no failure is counted",
+      workspacePrefix: "worker-busy-503-",
+      sessionId: "diag-busy-503",
+      script: (ctx) => {
+        ctx.failTurn("UNAVAILABLE (code 503): The service is currently unavailable.");
+      },
+      status: 503,
+      signInHeader: null,
+      errorType: "api_error",
+      message: UPSTREAM_BUSY_FAILURE_MESSAGE,
+      forbidden: ["quota", "insufficient"],
+      checkRaw: (raw) => {
+        // Magpie reads a 5xx saying "overloaded" as the vendor being busy.
+        expect(raw.toLowerCase()).toContain("overloaded");
+      },
+    },
+    {
+      name: "a policy 403 answers permission_error with the policy text",
+      workspacePrefix: "worker-policy-403-",
+      sessionId: "diag-policy-403",
+      script: (ctx) => {
+        ctx.failTurn("PERMISSION_DENIED (code 403): The caller does not have permission");
+      },
+      status: 403,
+      signInHeader: null,
+      errorType: "permission_error",
+      message: VENDOR_POLICY_FAILURE_MESSAGE,
+      forbidden: ["Terms of Service"],
+    },
+    {
+      name: "a disabled account answers 403 with the vendor-disabled text",
+      workspacePrefix: "worker-disabled-403-",
+      sessionId: "diag-disabled-403",
+      script: (ctx) => {
+        ctx.failTurn(
+          'This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product. AGY_ERROR: {"short_error":"PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service."}',
+        );
+      },
+      status: 403,
+      signInHeader: null,
+      errorType: "permission_error",
+      message: VENDOR_DISABLED_FAILURE_MESSAGE,
+      forbidden: ["quota", "rate limit"],
+    },
+    {
       name: "regression #3: a numbered worker log naming an exhausted quota returns the account-quota 429 JSON",
       workspacePrefix: "worker-http-quota-429-",
       sessionId: "diag-http-quota-429",
@@ -1200,7 +1587,7 @@ describe("AgySessionWorker diagnostics integration", () => {
       message: AUTH_EXPIRED_MESSAGE,
     },
     {
-      name: "regression #3: numbered worker log maxMessageTokens=0 returns the public context-budget 500",
+      name: "regression #3: numbered worker log maxMessageTokens=0 returns the too-long 400",
       workspacePrefix: "worker-http-budget-500-",
       sessionId: "diag-http-budget-500",
       script: (ctx) => {
@@ -1209,12 +1596,13 @@ describe("AgySessionWorker diagnostics integration", () => {
           text: "E1113 20:17:01.500001     910 errorreport.go:273] agent executor error: generating and executing: serializing trajectory: maxMessageTokens must be positive, got 0\n",
         });
       },
-      status: 500,
+      status: 400,
       signInHeader: null,
-      errorType: "api_error",
+      errorType: "invalid_request_error",
       message: CONTEXT_BUDGET_FAILURE_MESSAGE,
       checkRaw: (raw) => {
         expect(raw).not.toMatch(/quota|rate.?limit/i);
+        expect(raw).toMatch(/prompt is too long/i);
       },
     },
 
@@ -1316,6 +1704,9 @@ describe("AgySessionWorker diagnostics integration", () => {
       );
       expect(res.status).toBe(turnCase.status);
       expect(res.headers.get(SIGN_IN_HEADER)).toBe(turnCase.signInHeader);
+      if (turnCase.retryAfter !== undefined) {
+        expect(res.headers.get("retry-after")).toBe(turnCase.retryAfter);
+      }
 
       const raw = await res.text();
       for (const needle of turnCase.forbidden ?? []) expect(raw).not.toContain(needle);
@@ -1324,7 +1715,10 @@ describe("AgySessionWorker diagnostics integration", () => {
       const body: any = JSON.parse(raw);
       expect(body.type).toBe("error");
       expect(body.error?.type).toBe(turnCase.errorType);
-      if (turnCase.message !== undefined) expect(body.error?.message).toBe(turnCase.message);
+      if (turnCase.message !== undefined) {
+        // The fixed sentence first; the vendor's own words may follow it.
+        expect(String(body.error?.message ?? "").startsWith(turnCase.message)).toBe(true);
+      }
     } finally {
       await worker.close("test_done");
     }

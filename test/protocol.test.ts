@@ -4,7 +4,8 @@ import {
   ALT_SESSION_ID_HEADER,
   ALT_SUBAGENT_HEADER,
   collectAnthropicJsonResponse,
-  createSyntheticThinkingSignature,
+  OPENING_THINKING_SIGNATURE,
+  thinkingSignatureFor,
   EFFORT_HEADER,
   encodeAnthropicSseResponse,
   jsonErrorResponse,
@@ -1148,17 +1149,25 @@ describe("parseAnthropicRequest: session & metadata", () => {
 });
 
 // ---------------------------------------------------------------------------
-// createSyntheticThinkingSignature
+// Thinking signatures
 // ---------------------------------------------------------------------------
 
-describe("createSyntheticThinkingSignature", () => {
-  test("is stable, prefixed, and sensitive to both inputs", () => {
-    const signature = createSyntheticThinkingSignature("sess-1", "pondering");
-    expect(signature.startsWith("agy1.")).toBe(true);
-    expect(signature.length).toBeGreaterThan("agy1.".length);
-    expect(createSyntheticThinkingSignature("sess-1", "pondering")).toBe(signature);
-    expect(createSyntheticThinkingSignature("sess-2", "pondering")).not.toBe(signature);
-    expect(createSyntheticThinkingSignature("sess-1", "different")).not.toBe(signature);
+describe("thinking signature", () => {
+  // A client keeps and replays a thinking block only with a signature, but a real
+  // Anthropic endpoint answers 400 to one it did not issue. Magpie's preventive
+  // filter drops empty and UUID-shaped signatures before a Claude route
+  // (`deepseekSignature`), so a UUID is the shape that lets a client keep the
+  // summary while Magpie still removes it.
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  test("is UUID-shaped, stable in its inputs, and distinct for other inputs", () => {
+    const signature = thinkingSignatureFor("sess-1", "pondering");
+    expect(signature).toMatch(UUID);
+    expect(thinkingSignatureFor("sess-1", "pondering")).toBe(signature);
+    expect(thinkingSignatureFor("sess-2", "pondering")).not.toBe(signature);
+    expect(thinkingSignatureFor("sess-1", "different")).not.toBe(signature);
+    // The block opens without one: a client adds each delta to the value it has.
+    expect(OPENING_THINKING_SIGNATURE).toBe("");
   });
 });
 
@@ -1689,7 +1698,30 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
     });
   });
 
-  test("a thinking block without an upstream signature gets a synthetic one", async () => {
+  test("the thinking block opens with the signature field already present", async () => {
+    // Magpie's own encoder writes `signature: ""` at the block's start
+    // (`internal/gateway/anthropic.go:1696-1705`): a client that reads the start
+    // record alone must not find the field missing, and one that only looks for a
+    // later delta must not be the only path that sees it.
+    const response = await encodeAnthropicSseResponse(
+      MODEL,
+      streamOf([
+        { type: "thinking_delta", thinking: "plan" },
+        { type: "finish", stopReason: "end_turn", usage: USAGE },
+      ]),
+    );
+    const frames = parseSseFrames(await response.text());
+    const start = requireFrame(
+      frames,
+      "content_block_start",
+      (data) => asRecord(data.content_block).type === "thinking",
+    );
+    const block = asRecord(start.data.content_block);
+    expect(block.signature).toBe(OPENING_THINKING_SIGNATURE);
+    expect(block.thinking).toBe("");
+  });
+
+  test("a thinking block without an upstream signature gets a UUID-shaped one", async () => {
     const response = await encodeAnthropicSseResponse(
       MODEL,
       streamOf([
@@ -1703,7 +1735,9 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
       "content_block_delta",
       (data) => asRecord(data.delta).type === "signature_delta",
     );
-    expect(String(asRecord(signatureDelta.data.delta).signature).startsWith("agy1.")).toBe(true);
+    expect(String(asRecord(signatureDelta.data.delta).signature)).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
   });
 
   test("tool_use blocks produce input_json_delta that parses back to the input", async () => {
@@ -1876,7 +1910,9 @@ describe("encodeAnthropicSseResponse: frame encoding", () => {
     const signatureDelta = signatureDeltas[0];
     if (signatureDelta === undefined) throw new Error("missing signature_delta");
     expect(signatureDelta.data.index).toBe(0);
-    expect(String(asRecord(signatureDelta.data.delta).signature)).toMatch(/^agy1\./);
+    expect(String(asRecord(signatureDelta.data.delta).signature)).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
   });
 
   test("keeps the connection warm with ping frames while the upstream is silent", async () => {
@@ -1984,7 +2020,7 @@ describe("collectAnthropicJsonResponse", () => {
     expect(body.stop_reason).toBe("end_turn");
   });
 
-  test("thinking blocks without a signature get a synthetic one", async () => {
+  test("thinking blocks without a signature get a UUID-shaped one", async () => {
     const response = await collectAnthropicJsonResponse(
       MODEL,
       streamOf([
@@ -1996,7 +2032,9 @@ describe("collectAnthropicJsonResponse", () => {
     if (!Array.isArray(content)) throw new Error("expected content array");
     const thinking = asRecord(content[0]);
     expect(thinking.type).toBe("thinking");
-    expect(String(thinking.signature).startsWith("agy1.")).toBe(true);
+    expect(String(thinking.signature)).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
   });
 
   test("a signature that arrives after the text block still signs the thought block", async () => {
@@ -2195,16 +2233,25 @@ describe("cloak.ts", () => {
     expect(turnsAway(null)).toBe(false);
   });
 
-  test("cloakSystemPrompt strips the billing header and breaks up trigger phrases", () => {
+  test("cloakSystemPrompt strips the billing header and rewords trigger phrases", () => {
     expect(cloakSystemPrompt("X-Anthropic-Billing-Header: cch=deadbeef\nBe terse.")).toBe(
       "Be terse.",
     );
 
     const cloaked = cloakSystemPrompt("You are Codex, an agent based on GPT-5. Help me.");
-    // Zero-width breaks defuse the trigger phrase without changing what a reader sees.
-    expect(cloaked).toContain("\u200B");
+    // The line is reworded, not broken up: since 11-14 Antigravity reads past
+    // zero-width characters and turns the broken-up copy away all the same.
+    expect(cloaked).toBe("You are Codex, an agent built on GPT-5. Help me.");
     expect(cloaked).toContain("Help me.");
     expect(turnsAway(cloaked)).toBe(false);
+    // A copy someone did break up, or wrapped, is still recognized and repaired.
+    expect(turnsAway("you \u200bare codex, an \u200bagent based on GPT-5")).toBe(true);
+    expect(turnsAway("RFC  2119\tkeywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL.")).toBe(
+      true,
+    );
+    expect(cloakSystemPrompt("You are Codex, an \u200bagent based on GPT-5.")).toBe(
+      "You are Codex, an agent built on GPT-5.",
+    );
 
     // Disabled cloaking still normalizes the billing header, but leaves triggers intact.
     const raw = "You are Codex, an agent based on GPT-5.";
