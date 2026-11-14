@@ -34,6 +34,15 @@ Version in `package.json`; no `v0.1.10` tag exists yet. Work dated 2026-11-14.
   vendor's terms treat workarounds of that kind as circumvention. Detection is unaffected. The
   option description no longer claims zero-width spaces, which the implementation stopped using in
   0.1.9.
+- A tool call that outlives `agy`'s 180 s MCP deadline is relayed instead of lost: the broker
+  answers "still running" after 150 s with the call id, the model asks again through
+  `mcp_magpie_await_result` (always advertised, handled inside the broker so it never becomes a
+  second `tool_use`), and the caller's eventual result lands in the same native prompt. A result
+  that arrives after the model stopped asking is kept for the next prompt; `request.signal` and
+  `notifications/cancelled` end the wait without discarding the execution. Why: measured on
+  `agy 1.5.9`, the POST aborts at 180.004 s and the model then reports a timeout for a tool that
+  may have succeeded. Verified live: notice at 150 s, `await_result` at 186.9 s, result at
+  211.4 s, prompt settled at 248.8 s with the real answer.
 - An account the vendor disabled fails fast for six hours instead of being spawned for every turn
   (`src/accounts/policy-block.ts`). Why: `agy` authenticates normally for a suspended account and
   answers the prompt with the suspension sentence, so each later turn re-ran the refusal. A turn

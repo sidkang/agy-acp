@@ -5,32 +5,21 @@ the recommended decision and how to accept it. When an item ships, delete it her
 [`CHANGELOG.md`](../CHANGELOG.md). Evidence about sibling bridges is in
 [`research/`](research/README.md).
 
-## 1. Bound a parked tool call below `agy`'s 180-second MCP deadline
+## 1. Prove the tool-call relay through a real Magpie round trip
 
-- Problem: the broker parks a caller tool call for up to 15 minutes (`src/mcp/broker.ts:57`), but
-  `agy` abandons the `tools/call` POST at 180 s, tells the model the tool timed out, and ends the
-  turn as an ordinary 200 answer. The broker then holds a parked call nobody consumes, and the
-  caller's real result arrives at a closed connection: neither `src/mcp/http-server.ts` nor
-  `src/mcp/broker.ts` observes `request.signal`.
-- Evidence (measured 2026-11-14 on `agy 1.5.9`, one live ACP turn against a fake Streamable-HTTP
-  MCP server): the call arrives at t=11.3 s with `_meta` carrying
-  `antigravity.google/conversation_id` and a `progressToken`; the client aborts the POST at exactly
-  180.004 s and sends `notifications/cancelled`; at 199.6 s the model writes the timeout as ordinary
-  text and `session/prompt` settles `end_turn` with a normal `usage` block. The client never opens a
-  GET/SSE stream on `/mcp/:token`, so `notifications/progress` has no transport and cannot extend
-  the deadline. fdkevin0 relays a parked call at 85 s for the same reason
-  ([research](research/fdkevin0-pi-agy-acp.md)).
-- Decision: a bounded wait, not a relay. At 170 s answer the `tools/call` with an `isError` result
-  saying the bridge stopped waiting (not that the tool failed), retire the worker, and let the
-  caller's next Messages request cold-replay the transcript with the completed `tool_result`
-  (`SessionCoordinator.executeFreshSessionTurn`). Also observe `request.signal` on the parked POST
-  and handle `notifications/cancelled`; a permission request outside the `magpie` server answers
-  `502` `MAGPIE_BRIDGE_UNEXPECTED_TOOL` instead of an empty 200. A fetch tool stays rejected: the
-  caller already has a result-delivery surface, and a second retrieval protocol would still need
-  the same replay fallback.
-- Acceptance: a fake tool that sleeps past the threshold produces the `isError` notice, the worker
-  retires and the next request's result reaches a fresh session; an aborted POST leaves no parked
-  call; an unexpected-tool turn answers 502 rather than empty text.
+- Problem: the relay shipped in 0.1.10 is verified against `agy 1.5.9` with a synthetic caller
+  (the probe plays Magpie and delivers the tool result after 200 s), not through Magpie's own
+  Anthropic-facing round trip. Two things only that path can show: whether Magpie keeps the
+  `tool_use` it was given while the call is relayed, and whether its repaired continuation arrives
+  with the same session id so the parked call is found again.
+- Evidence: live probe, one turn, tool answered after 200 s — notice at 150 s, the model called
+  `mcp_magpie_await_result` at 186.9 s, the result landed at 211.4 s, the prompt settled at 248.8 s
+  with the answer "returned: 42" instead of a timeout narrative. `CHANGELOG.md` records it.
+- Options: (a) leave it to ordinary use and watch the gateway log; (b) run a scripted turn through
+  the gateway's caller key with a local tool that sleeps past the deadline.
+- Decision: (b) once, on the edge host, before the version is called stable there.
+- Acceptance: a gateway log showing one turn whose `tools/call` outlived 180 s and whose final
+  answer carries the tool result, plus no `tool_call_deadline_expired` in that window.
 
 ## 2. Bound the ACP stdout reassembly buffer
 
