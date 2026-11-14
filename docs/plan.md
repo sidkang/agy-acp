@@ -5,22 +5,6 @@ the recommended decision and how to accept it. When an item ships, delete it her
 [`CHANGELOG.md`](../CHANGELOG.md). Evidence about sibling bridges is in
 [`research/`](research/README.md).
 
-## 1. Prove the tool-call relay through a real Magpie round trip
-
-- Problem: the relay shipped in 0.1.10 is verified against `agy 1.5.9` with a synthetic caller
-  (the probe plays Magpie and delivers the tool result after 200 s), not through Magpie's own
-  Anthropic-facing round trip. Two things only that path can show: whether Magpie keeps the
-  `tool_use` it was given while the call is relayed, and whether its repaired continuation arrives
-  with the same session id so the parked call is found again.
-- Evidence: live probe, one turn, tool answered after 200 s — notice at 150 s, the model called
-  `mcp_magpie_await_result` at 186.9 s, the result landed at 211.4 s, the prompt settled at 248.8 s
-  with the answer "returned: 42" instead of a timeout narrative. `CHANGELOG.md` records it.
-- Options: (a) leave it to ordinary use and watch the gateway log; (b) run a scripted turn through
-  the gateway's caller key with a local tool that sleeps past the deadline.
-- Decision: (b) once, on the edge host, before the version is called stable there.
-- Acceptance: a gateway log showing one turn whose `tools/call` outlived 180 s and whose final
-  answer carries the tool result, plus no `tool_call_deadline_expired` in that window.
-
 ## 2. Bound the ACP stdout reassembly buffer
 
 - Problem: `AcpConnection` appends stdout to an uncapped `stdoutRemainder` and splits on newlines

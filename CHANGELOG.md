@@ -15,6 +15,11 @@ Version in `package.json`; no `v0.1.10` tag exists yet. Work dated 2026-11-14.
   still walked the pool; a warm worker kept the `account_failover` it was built with, so turning
   the option off now reaches it (`setAccountFailover`); and the "another signed-in account can
   answer this turn" wording promised switching that is no longer done.
+- The relay was exercised through Magpie's own gateway on a live host: a tool result delivered 200 s
+  after `agy` called the tool (20 s past its measured 180.004 s abort) came back as the model's own
+  answer, `42`, with no timeout narrative and one native prompt. What that run cannot show from
+  outside is which internal path carried it; the mechanism itself was already proven against
+  `agy 1.5.9` with a synthetic caller (notice at 161 s, `await_result` at 187 s, answer at 252 s).
 - A step row that lands *after* a prompt's result is no longer read as the next turn's work. The
   cursor taken at settlement could not cover rows `agy` commits a moment later, so the next
   turn reported a prompt's usage twice; the tracker now remembers how many steps the settled
