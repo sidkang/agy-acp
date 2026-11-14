@@ -2099,7 +2099,8 @@ describe("src/options.ts", () => {
         const defaults = readProviderOptions({}, undefined);
         expect(defaults).toEqual({
           quotaRouting: true,
-          cloakPrompts: true,
+          // Cloaking is off by default: it works around a vendor check.
+          cloakPrompts: false,
           minimalAgent: false,
           exposeThinking: true,
         });

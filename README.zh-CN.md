@@ -24,6 +24,18 @@ Magpie 社区共有三款 Google Antigravity 渠道插件。对于同一个 Goog
 - **`agy` CLI** `>= 1.5.0`（已加入 `PATH`，或通过 `AGY_PATH` 指定路径）
 - **Magpie** `>= 0.1.3900`
 
+## 账号与服务条款
+
+本插件驱动你自己安装的 `agy` CLI，使用你登录的 Google 账号。Google Antigravity 附加服务条款第 6 条规定：不得在"与本服务无关的第三方产品"中使用本服务，使用第三方软件、工具或服务访问本服务属于违约，"可能导致你的 Antigravity 和/或 Gemini CLI 账号被暂停或终止"。官方 FAQ 进一步说明：把 `agy` 包进第三方编码 Agent、或自动化账号轮换，在个人版套餐下都不被支持。
+
+**对本插件意味着什么。** 它把 `agy` 包给 Magpie 与 OpenCode 使用，多账号池会在配额窗耗尽时切换账号——正是条款点名的两种行为；同时它自己完成浏览器登录（复用 `agy` 自身登录所用的官方 installed-app 客户端身份），把令牌写进该账号的隔离目录。它不伪造客户端身份、不做 TLS 拦截、不调用账号无法选择的模型。
+
+账号被封时 `agy` 会返回"violation of Terms of Service"整句，本插件以 `403` 上报。恢复账号是 Google 的决定，需通过该提示给出的申诉表单，官方措辞写明再次违规将永久停用。需要合规路径请改用 Vertex AI 或 AI Studio 的 API key。
+
+`cloak_prompts` 曾经默认开启：它改写会被上游识别为第三方客户端的系统提示词行，使同一请求通过。这是绕过上游检查，条款视之为规避手段，因此现在默认关闭，建议保持关闭。
+
+**账号风险自负。** 维护者无法恢复被封账号。
+
 ## 安装与登录
 
 ```sh
@@ -60,7 +72,7 @@ magpie quota agy-acp
 | 开关 | 默认值 | 说明 |
 |---|---|---|
 | `quota_routing` | `true` | 将 5 小时 / 周配额接入 Magpie 路由，单账号耗尽时自动切到其他账号 |
-| `cloak_prompts` | `true` | 剥离旋转计费头并对触发上游伪 429 的第三方客户端标识句做零宽字符脱敏 |
+| `cloak_prompts` | `false` | 改写会被上游按配额耗尽拒答的第三方客户端标识句。默认关闭：这是绕过上游检查 |
 | `minimal_agent` | `false` | 为隔离桥接 Agent 开启 `excludeDefaultComponents`，精简内置系统提示词开销 |
 | `expose_thinking` | `true` | 将 ACP 思考摘要作为 Anthropic `thinking` 块返回 |
 

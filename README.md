@@ -24,6 +24,22 @@ Magpie offers three plugins for Google Antigravity. All three **share the exact 
 - **`agy` CLI** `>= 1.5.0` installed on `PATH` (or set `AGY_PATH`)
 - **Magpie** `>= 0.1.3900`
 
+## Account and Terms of Service
+
+This plugin drives the `agy` CLI you installed, with the Google account you signed in with. Google's Antigravity Additional Terms of Service, section 6:
+
+> You must not abuse, harm, interfere with, or disrupt the Service. This includes, but is not limited to, using the Service in connection with products not provided by us. Using third party software, tools, or services to access the Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of this Agreement. Such actions may be grounds for suspension or termination of your Antigravity and/or Gemini CLI accounts.
+
+The Antigravity FAQ adds that wrapping `agy` inside third-party coding agents, or automating account rotation, is not supported under consumer plans.
+
+**What that means for this plugin.** It wraps `agy` for Magpie and OpenCode, and its multi-account pool switches accounts when a quota window is spent: both of the named behaviours. It also performs the browser sign-in itself, using the same installed-app client identity that `agy` uses for its own login, and writes the resulting token into the account's isolated directory. It does not spoof a client identity, intercept TLS, or use a model the account cannot select.
+
+A disabled account answers with "This service has been disabled in this account for violation of Terms of Service"; the plugin surfaces that as a `403`. Restoring an account is Google's decision, through the appeal form the message links to, and their own wording says a repeat violation is permanent. For a supported path, use a Vertex AI or AI Studio API key instead.
+
+`cloak_prompts` used to default to on. It rewrites system-prompt lines that identify a third-party harness so a vendor-side check stops refusing the request; that is a workaround for a vendor check, which the terms treat as circumvention, so it is off by default now and best left off.
+
+**Your account, your risk.** The maintainer cannot restore a disabled account.
+
 ## Install & Sign In
 
 ```sh
@@ -60,7 +76,7 @@ magpie quota agy-acp
 | Option | Default | Description |
 |---|---|---|
 | `quota_routing` | `true` | Expose 5-hour/weekly buckets to Magpie routing so exhausted accounts fail over automatically |
-| `cloak_prompts` | `true` | Strip billing headers and cloak third-party harness phrases that trigger upstream 429 refusals |
+| `cloak_prompts` | `false` | Rewords system-prompt lines that identify a third-party harness and get answered as a spent quota. Off by default: it works around a vendor check |
 | `minimal_agent` | `false` | Enable `excludeDefaultComponents` on the bridge agent to reduce built-in system prompt tokens |
 | `expose_thinking` | `true` | Emit ACP thought summaries as Anthropic `thinking` blocks |
 

@@ -73,15 +73,18 @@ const OPTION_SPECS: readonly ProviderOptionSpec[] = [
     key: "cloak_prompts",
     stateKey: "cloakPrompts",
     envName: "AGY_MAGPIE_CLOAK_PROMPTS",
-    fallback: true,
-    label: "Cloak third-party harness trigger lines",
+    // Off by default: the rewording is a workaround for a vendor check, not a
+    // formatting preference, and the vendor's terms treat workarounds of that kind
+    // as circumvention. Detection of the refusal is unaffected by this switch.
+    fallback: false,
+    label: "Reword third-party harness trigger lines",
     description:
-      "Strip billing headers and insert zero-width spaces into third-party agent prompt phrases that trigger upstream 429 refusals.",
+      "Off by default. Rewords system-prompt lines that identify a third-party harness and are answered with a spent-quota refusal, so the same request goes through. This works around a vendor check; leave it off unless you accept that.",
     labels: {
-      zh: "自动脱敏第三方客户端提示词",
+      zh: "改写第三方客户端标识句（默认关）",
     },
     descriptions: {
-      zh: "移除计费头并对 Claude Code / Codex 等会触发上游伪 429 拒绝的固定标识句插入零宽空格。",
+      zh: "默认关闭。改写会被上游以配额耗尽为由拒答的第三方客户端标识句，使同一请求通过。这是绕过上游检查，除非你接受该风险，否则保持关闭。",
     },
   },
   {

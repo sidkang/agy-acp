@@ -2258,7 +2258,16 @@ describe("cloak.ts", () => {
       "Be terse.",
     );
 
-    const cloaked = cloakSystemPrompt("You are Codex, an agent based on GPT-5. Help me.");
+    // The rewording is opt-in: without the flag, the line is left as the caller
+    // wrote it (the refusal still classifies as one, see diagnostics).
+    expect(cloakSystemPrompt("You are Codex, an agent based on GPT-5. Help me.")).toBe(
+      "You are Codex, an agent based on GPT-5. Help me.",
+    );
+
+    const cloaked = cloakSystemPrompt(
+      "You are Codex, an agent based on GPT-5. Help me.",
+      true,
+    );
     // The line is reworded, not broken up: since 11-14 Antigravity reads past
     // zero-width characters and turns the broken-up copy away all the same.
     expect(cloaked).toBe("You are Codex, an agent built on GPT-5. Help me.");
@@ -2269,7 +2278,7 @@ describe("cloak.ts", () => {
     expect(turnsAway("RFC  2119\tkeywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL.")).toBe(
       true,
     );
-    expect(cloakSystemPrompt("You are Codex, an \u200bagent based on GPT-5.")).toBe(
+    expect(cloakSystemPrompt("You are Codex, an \u200bagent based on GPT-5.", true)).toBe(
       "You are Codex, an agent built on GPT-5.",
     );
 

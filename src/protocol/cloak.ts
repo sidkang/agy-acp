@@ -190,7 +190,7 @@ export function stripVolatileMessageText(text: string | undefined | null): strin
  * Break-up with invisible characters is not a defence: since 11-14 the upstream
  * reads past them and refuses the line all the same.
  */
-export function cloakSystemPrompt(system: string | undefined | null, enabled = true): string {
+export function cloakSystemPrompt(system: string | undefined | null, enabled = false): string {
   const cleaned = stripBillingHeader(system).trim();
   if (!enabled || !cleaned) return cleaned;
   let cloaked = cleaned;
