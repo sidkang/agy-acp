@@ -190,32 +190,101 @@ export function stripVolatileMessageText(text: string | undefined | null): strin
  * Break-up with invisible characters is not a defence: since 11-14 the upstream
  * reads past them and refuses the line all the same.
  */
-export function cloakSystemPrompt(system: string | undefined | null, enabled = false): string {
+export function cloakSystemPrompt(
+  system: string | undefined | null,
+  enabled = false,
+  saidAs?: string | null,
+): string {
   const cleaned = stripBillingHeader(system).trim();
-  if (!enabled || !cleaned) return cleaned;
+  if (!cleaned) return cleaned;
+  if (!enabled) return cleaned;
   let cloaked = cleaned;
-  if (turnsAway(cloaked)) {
-    const at: Array<[number, number, (line: string) => string]> = [];
-    TRIGGER_RES.forEach((re, i) => {
-      re.lastIndex = 0;
-      for (const match of cloaked.matchAll(re)) {
-        const from = match.index ?? 0;
-        at.push([from, from + match[0].length, SAID_AS[i]!]);
-      }
-      re.lastIndex = 0;
-    });
-    at.sort((a, b) => a[0] - b[0]);
-    let out = "";
-    let prev = 0;
-    for (const [from, to, said] of at) {
-      if (from < prev) continue;
-      out += cloaked.slice(prev, from) + said(cloaked.slice(from, to).replace(INVISIBLE_RE, ""));
-      prev = to;
-    }
-    cloaked = out + cloaked.slice(prev);
-  }
-  return rewordSystemPrompt(cloaked);
+  if (turnsAway(cloaked)) cloaked = applyTriggers(cloaked, ALL_TRIGGERS);
+  return applySaidAs(rewordSystemPrompt(cloaked), saidAs);
 }
+
+/**
+ * Rewrites the two Codex lines wherever the *user* wrote them.
+ *
+ * Measured by the `antigravity-cloak` middleware on a real account: since 11-14
+ * Antigravity answers a bare 429 to Codex's GPT-5 line in a user's turn (a pasted
+ * AGENTS.md, say), 3 of 3, while the other lines went through there as written, and
+ * so did tool results and the model's own turns. So this covers user text only.
+ */
+export function cloakUserText(text: string, enabled = false): string {
+  if (!enabled || !text) return text;
+  const hit = triggerMatches(text);
+  if (!hit[2] && !hit[3]) return text;
+  return applyTriggers(text, CODEX_TRIGGERS);
+}
+
+const ALL_TRIGGERS = [0, 1, 2, 3, 4, 5] as const;
+const CODEX_TRIGGERS = [2, 3] as const;
+
+/** Rewrites every match of the given trigger indices, left to right. */
+function applyTriggers(text: string, indices: readonly number[]): string {
+  const at: Array<[number, number, (line: string) => string]> = [];
+  for (const i of indices) {
+    const re = TRIGGER_RES[i]!;
+    re.lastIndex = 0;
+    for (const match of text.matchAll(re)) {
+      const from = match.index ?? 0;
+      at.push([from, from + match[0].length, SAID_AS[i]!]);
+    }
+    re.lastIndex = 0;
+  }
+  if (at.length === 0) return text;
+  at.sort((a, b) => a[0] - b[0]);
+  let out = "";
+  let prev = 0;
+  for (const [from, to, said] of at) {
+    if (from < prev) continue;
+    out += text.slice(prev, from) + said(text.slice(from, to).replace(INVISIBLE_RE, ""));
+    prev = to;
+  }
+  return out + text.slice(prev);
+}
+
+/**
+ * Applies caller-supplied `phrase=replacement` pairs to the system text.
+ *
+ * The trigger list is what other people observed being refused; when the vendor
+ * refuses something else (a custom prompt, another plugin's injected text) this is
+ * the way to answer it without waiting for a release. Same matcher as the built-in
+ * lines — case and white space do not matter — so a pair can be a fragment.
+ */
+export function applySaidAs(
+  text: string,
+  spec: string | undefined | null,
+): string {
+  const pairs = parseSaidAs(spec);
+  if (pairs.length === 0 || !text) return text;
+  let out = text;
+  for (const [from, to] of pairs) {
+    out = out.replace(triggerRe(from), () => to);
+  }
+  return out;
+}
+
+export function parseSaidAs(
+  spec: string | undefined | null,
+): Array<[string, string]> {
+  const raw = String(spec ?? "");
+  if (!raw.trim()) return [];
+  const pairs: Array<[string, string]> = [];
+  for (const entry of raw.split(/[;\n]/)) {
+    const at = entry.indexOf("=");
+    if (at <= 0) continue;
+    const from = entry.slice(0, at).trim();
+    const to = entry.slice(at + 1).trim();
+    if (!from || from.length > 200 || to.length > 200) continue;
+    pairs.push([from, to]);
+    if (pairs.length >= MAX_SAID_AS) break;
+  }
+  return pairs;
+}
+
+const MAX_SAID_AS = 32;
 
 // The wording of these hints goes to Magpie in a `400` body, and Magpie reads
 // the whole body for the words that mean a spent window (`quotaWords`,

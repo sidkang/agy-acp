@@ -78,7 +78,7 @@ magpie quota agy-acp
 | Option | Default | Description |
 |---|---|---|
 | `quota_routing` | `true` | Expose 5-hour/weekly buckets to Magpie routing so exhausted accounts fail over automatically |
-| `cloak_prompts` | `false` | Rewords system-prompt lines that identify a third-party harness and get answered as a spent quota. Off by default: it works around a vendor check |
+| `cloak_prompts` | `false` | Rewords system-prompt lines that identify a third-party harness (and the two Codex lines in your own messages) that get answered as a spent quota. Off by default: it works around a vendor check. Add your own pairs with `cloak_said_as` (`"phrase=replacement; phrase2=replacement2"`) |
 | `minimal_agent` | `false` | Enable `excludeDefaultComponents` on the bridge agent to reduce built-in system prompt tokens |
 | `expose_thinking` | `true` | Emit ACP thought summaries as Anthropic `thinking` blocks |
 

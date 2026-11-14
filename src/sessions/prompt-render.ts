@@ -18,6 +18,7 @@
 // for anything that already fits.
 
 import { BridgeHttpError, type NormalizedMessage } from "../types";
+import { cloakUserText } from "../protocol/cloak";
 import { CONTEXT_BUDGET_FAILURE_MESSAGE } from "../runtime/diagnostics";
 import { fitInlineImage } from "../protocol/images";
 import { utf8Bytes } from "./ledger";
@@ -167,12 +168,15 @@ function renderHistoryEntry(
   msg: NormalizedMessage,
   clipBytes = HISTORY_BLOCK_CLIP_BYTES,
   keepBytes = HISTORY_BLOCK_KEEP_BYTES,
+  cloakUser = false,
 ): string {
   const role = msg.role === "user" ? "User" : "Assistant";
+  const authored = (text: string): string =>
+    msg.role === "user" ? cloakUserText(text, cloakUser) : text;
   let entryText = `[${role}]:\n`;
   for (const part of msg.content) {
     if (part.type === "text") {
-      entryText += `${clipHistoryText(part.text, clipBytes, keepBytes)}\n`;
+      entryText += `${clipHistoryText(authored(part.text), clipBytes, keepBytes)}\n`;
     } else if (part.type === "tool_use") {
       const inputStr = clipHistoryText(
         JSON.stringify(part.input, null, 2),
@@ -213,6 +217,7 @@ export function splitPriorAndCurrent(messages: NormalizedMessage[]): {
 function renderCurrentTurnParts(
   currentMessages: NormalizedMessage[],
   isSingleWarmMessage: boolean,
+  cloakUser = false,
 ): {
   userMessages: NormalizedMessage[];
   turnText: string;
@@ -232,7 +237,7 @@ function renderCurrentTurnParts(
     let out = "";
     for (const part of msg.content) {
       if (part.type === "text") {
-        out += `${part.text}\n`;
+        out += `${cloakUserText(part.text, cloakUser)}\n`;
       } else if (part.type === "tool_result") {
         const txt = part.content
           .filter((c) => c.type === "text")
@@ -358,6 +363,8 @@ export function planColdHistoryRender(
 export interface RenderPromptOptions {
   priorSeededInSystem?: boolean;
   imageSourceMessages?: NormalizedMessage[];
+  /** Rewrite the two Codex lines in user-authored text (never in tool results). */
+  cloakUser?: boolean;
 }
 
 /** Pushes an image part after fitting it, so `agy` never sees an oversized one. */
@@ -392,6 +399,7 @@ export function renderMessagesToPrompt(
   const rendered = renderCurrentTurnParts(
     currentMessages,
     isSingleWarmMessage,
+    opts?.cloakUser === true,
   );
   const userMessages = rendered.userMessages;
   const prefillText = rendered.prefillText;
@@ -461,7 +469,9 @@ export function renderMessagesToPrompt(
 
     const leadNote = opts?.priorSeededInSystem ? SEEDED_ABOVE_NOTE : "";
     const leadBytes = utf8Bytes(leadNote);
-    const historyEntries = priorMessages.map((m) => renderHistoryEntry(m));
+    const historyEntries = priorMessages.map((m) =>
+      renderHistoryEntry(m, HISTORY_BLOCK_CLIP_BYTES, HISTORY_BLOCK_KEEP_BYTES, opts?.cloakUser === true),
+    );
     const historyEntryBytes = historyEntries.map((e) => utf8Bytes(e));
     const totalHistBytes =
       leadBytes + historyEntryBytes.reduce((sum, bytes) => sum + bytes, 0);

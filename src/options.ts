@@ -132,6 +132,18 @@ export function buildProviderOptionSchemas(
   }));
 }
 
+/**
+ * The caller's own `phrase=replacement` pairs for the cloaker.
+ *
+ * Kept out of `OPTION_SPECS` on purpose: Magpie renders those as switches, and this
+ * is a string. It is read from the plugin options record (so it can be written by
+ * hand) or from the environment when the record has none.
+ */
+function readSaidAs(pkgOptions?: Record<string, unknown>): string {
+  const raw = pkgOptions?.cloak_said_as ?? process.env.AGY_MAGPIE_CLOAK_SAID_AS;
+  return typeof raw === "string" ? raw.slice(0, 4096) : "";
+}
+
 export function readProviderOptions(
   pluginInput?: {
     magpie?: {
@@ -147,11 +159,12 @@ export function readProviderOptions(
     cloakPrompts: false,
     minimalAgent: false,
     exposeThinking: false,
+    cloakSaidAs: readSaidAs(pkgOptions),
   };
 
   for (const spec of OPTION_SPECS) {
     const live = pluginInput?.magpie?.option?.(PROVIDER_ID, spec.key);
-    state[spec.stateKey] =
+    ((state as unknown) as Record<string, unknown>)[spec.stateKey] =
       typeof live === "boolean"
         ? live
         : typeof fromMagpie[spec.key] === "boolean"

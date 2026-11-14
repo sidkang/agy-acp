@@ -888,7 +888,12 @@ export class SessionCoordinator {
       currentMessages,
       modelSelection.rawModelId,
       utf8Bytes(
-        buildEffectiveSystemText(req.system, req.workDir, cloakPrompts),
+        buildEffectiveSystemText(
+          req.system,
+          req.workDir,
+          cloakPrompts,
+          this.providerOptions?.cloakSaidAs ?? options?.providerOptions?.cloakSaidAs,
+        ),
       ),
     );
     const workerOptions: WorkerOptions = {
@@ -1023,8 +1028,9 @@ export class SessionCoordinator {
         ? renderMessagesToPrompt(coldPlan.tailPriorMessages, currentMessages, {
             priorSeededInSystem: true,
             imageSourceMessages: priorMessages,
+            cloakUser: cloakPrompts,
           })
-        : renderMessagesToPrompt(priorMessages, currentMessages);
+        : renderMessagesToPrompt(priorMessages, currentMessages, { cloakUser: cloakPrompts });
       appendToolChoiceReminder(promptParts, req);
 
       if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
@@ -1109,7 +1115,12 @@ export class SessionCoordinator {
       // swallow this turn's actual question.
       const prefixLen = matchedPrefixLength ?? worker.committedMessages.length;
       const deltaMessages = req.messages.slice(prefixLen);
-      const promptParts = renderMessagesToPrompt([], deltaMessages);
+      const promptParts = renderMessagesToPrompt([], deltaMessages, {
+        cloakUser:
+          options?.providerOptions?.cloakPrompts ??
+          this.providerOptions?.cloakPrompts ??
+          false,
+      });
       appendToolChoiceReminder(promptParts, req);
 
       // Same rule as the cold path: never advance a warm native session while an
@@ -1337,7 +1348,12 @@ export class SessionCoordinator {
       currentMessages,
       modelSelection.rawModelId,
       utf8Bytes(
-        buildEffectiveSystemText(req.system, req.workDir, cloakPrompts),
+        buildEffectiveSystemText(
+          req.system,
+          req.workDir,
+          cloakPrompts,
+          this.providerOptions?.cloakSaidAs ?? options?.providerOptions?.cloakSaidAs,
+        ),
       ),
     );
     const worker = new AgySessionWorker(
@@ -1386,8 +1402,9 @@ export class SessionCoordinator {
         ? renderMessagesToPrompt(coldPlan.tailPriorMessages, currentMessages, {
             priorSeededInSystem: true,
             imageSourceMessages: priorMessages,
+            cloakUser: cloakPrompts,
           })
-        : renderMessagesToPrompt(priorMessages, currentMessages);
+        : renderMessagesToPrompt(priorMessages, currentMessages, { cloakUser: cloakPrompts });
       appendToolChoiceReminder(promptParts, req);
       if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
         unshiftSystemInstructions(promptParts, worker.effectiveSystemPrompt);

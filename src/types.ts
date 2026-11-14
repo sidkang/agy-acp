@@ -25,6 +25,11 @@ export interface ProviderOptionsState {
   minimalAgent: boolean;
   exposeThinking: boolean;
   cloakPrompts: boolean;
+  /**
+   * Caller-supplied `phrase=replacement` pairs, applied to the system text after
+   * the built-in lines. Empty when the caller set none.
+   */
+  cloakSaidAs: string;
 }
 
 export type EffortLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

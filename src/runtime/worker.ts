@@ -240,6 +240,7 @@ export function buildEffectiveSystemText(
   systemPrompt: string | undefined,
   workDir: string | undefined,
   cloak = false,
+  saidAs?: string | null,
 ): string {
   let systemWithWorkDir = systemPrompt ?? "";
   if (workDir && !/[\r\n\0]/.test(workDir)) {
@@ -255,7 +256,7 @@ export function buildEffectiveSystemText(
   } else {
     systemWithWorkDir = STILL_RUNNING_PROTOCOL_NOTE;
   }
-  return cloakSystemPrompt(systemWithWorkDir, cloak);
+  return cloakSystemPrompt(systemWithWorkDir, cloak, saidAs);
 }
 
 const STILL_RUNNING_PROTOCOL_NOTE =

@@ -2351,7 +2351,8 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           cloakPrompts: true,
           minimalAgent: false,
           exposeThinking: false,
-        },
+        cloakSaidAs: "",
+      },
       },
     )) {
       // consume
@@ -2383,7 +2384,8 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           cloakPrompts: true,
           minimalAgent: true,
           exposeThinking: false,
-        },
+        cloakSaidAs: "",
+      },
       },
     )) {
       // consume

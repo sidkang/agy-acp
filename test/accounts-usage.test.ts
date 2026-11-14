@@ -2103,6 +2103,7 @@ describe("src/options.ts", () => {
           cloakPrompts: false,
           minimalAgent: false,
           exposeThinking: true,
+          cloakSaidAs: "",
         });
 
         expect(readProviderOptions({}, { quota_routing: false }).quotaRouting).toBe(false);

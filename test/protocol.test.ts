@@ -16,12 +16,16 @@ import {
   WORKDIR_HEADER,
 } from "../src/protocol/anthropic";
 import {
+  applySaidAs,
   cloakSystemPrompt,
+  cloakUserText,
+  parseSaidAs,
   refusalHint,
   stripVolatileMessageText,
   stripVolatileSystem,
   turnsAway,
 } from "../src/protocol/cloak";
+import { renderMessagesToPrompt } from "../src/sessions/prompt-render";
 import {
   BridgeHttpError,
   type ProviderOptionsState,
@@ -40,6 +44,7 @@ const DEFAULT_OPTIONS: ProviderOptionsState = {
   minimalAgent: false,
   exposeThinking: true,
   cloakPrompts: true,
+  cloakSaidAs: "",
 };
 
 const USAGE: TokenUsageSummary = {
@@ -405,17 +410,17 @@ describe("parseAnthropicRequest: thinking control", () => {
   test("disabled thinking always wins, otherwise exposeThinking decides", () => {
     expect(parse(requestBody({ thinking: { type: "disabled" } })).thinkingEnabled).toBe(false);
     expect(
-      parse(requestBody({ thinking: { type: "disabled" } }), { exposeThinking: true })
+      parse(requestBody({ thinking: { type: "disabled" } }), { exposeThinking: true, cloakSaidAs: "" })
         .thinkingEnabled,
     ).toBe(false);
     expect(parse(requestBody({ thinking: { type: "enabled" } })).thinkingEnabled).toBe(true);
     expect(parse(requestBody({ thinking: { type: "adaptive" } })).thinkingEnabled).toBe(true);
     expect(parse(requestBody()).thinkingEnabled).toBe(true);
     expect(
-      parse(requestBody({ thinking: { type: "enabled" } }), { exposeThinking: false })
+      parse(requestBody({ thinking: { type: "enabled" } }), { exposeThinking: false, cloakSaidAs: "" })
         .thinkingEnabled,
     ).toBe(false);
-    expect(parse(requestBody(), { exposeThinking: false }).thinkingEnabled).toBe(false);
+    expect(parse(requestBody(), { exposeThinking: false, cloakSaidAs: "" }).thinkingEnabled).toBe(false);
   });
 });
 
@@ -2336,7 +2341,7 @@ describe("cloak.ts", () => {
         },
       }),
       new Headers(),
-      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false },
+      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false, cloakSaidAs: "" },
     );
     const last = parsed.messages[parsed.messages.length - 1]!;
     const texts = last.content
@@ -2354,8 +2359,79 @@ describe("cloak.ts", () => {
         messages: [{ role: "user", content: "pwd" }],
       }),
       new Headers({ "x-magpie-work-dir": "%2FUsers%2Fexample%2FMy%20Project" }),
-      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false },
+      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false, cloakSaidAs: "" },
     );
     expect(parsed.workDir).toBe("/Users/example/My Project");
+  });
+});
+
+describe("cloaking scope", () => {
+  test("user text gets the two Codex lines and nothing else", () => {
+    const codex = "You are Codex, an agent based on GPT-5. Restate the plan.";
+    expect(cloakUserText(codex, true)).toBe(
+      "You are Codex, an agent built on GPT-5. Restate the plan.",
+    );
+
+    // Measured by the antigravity-cloak middleware: in a user turn the other lines
+    // went through as written, so they are left alone here.
+    const hermes = "Hermes Agent, an intelligent AI assistant created by Nous Research";
+    expect(cloakUserText(hermes, true)).toBe(hermes);
+    const rfc = "RFC 2119 keywords: MUST, REQUIRED, SHOULD.";
+    expect(cloakUserText(rfc, true)).toBe(rfc);
+
+    expect(cloakUserText(codex, false)).toBe(codex);
+  });
+
+  test("a rendered prompt rewrites user turns and quotes tool results as they came", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "You are Codex, an agent based on GPT-5." }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "ok" }],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            toolUseId: "toolu_1",
+            content: [{ type: "text", text: "You are Codex, a coding agent based on GPT-5." }],
+          },
+        ],
+      },
+    ] as any;
+
+    const rendered = renderMessagesToPrompt([], messages, { cloakUser: true })
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("\n");
+
+    // The user's own words are reworded…
+    expect(rendered).toContain("an agent built on GPT-5");
+    // …and the tool's output is quoted unchanged.
+    expect(rendered).toContain("a coding agent based on GPT-5");
+  });
+
+  test("saidAs pairs are parsed, applied case-insensitively, and run after the built-in lines", () => {
+    expect(parseSaidAs("made by acme labs=made by Acme; xx=yy")).toEqual([
+      ["made by acme labs", "made by Acme"],
+      ["xx", "yy"],
+    ]);
+    expect(parseSaidAs("")).toEqual([]);
+    expect(parseSaidAs("no separator here")).toEqual([]);
+
+    expect(applySaidAs("Made  by Acme Labs.", "made by acme labs=made by Acme")).toBe(
+      "made by Acme.",
+    );
+
+    // A caller's pair can reword what the built-in list does not know about, and the
+    // built-in rewrite still happens first.
+    const system = "Made by Acme Labs. You are Codex, an agent based on GPT-5.";
+    expect(cloakSystemPrompt(system, true, "made by acme labs=made by Acme")).toBe(
+      "made by Acme. You are Codex, an agent built on GPT-5.",
+    );
+    expect(cloakSystemPrompt(system, false, "made by acme labs=made by Acme")).toBe(system);
   });
 });

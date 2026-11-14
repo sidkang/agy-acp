@@ -317,6 +317,12 @@ mid-conversation system messages, and only the middleware lets a user add a phra
 trigger occurrence, which proves nothing about the vendor: `agy` records the prompt length, never
 its text. So the trigger list and every scope decision rest on other people's reports.
 
+Two scope gaps were closed: the two Codex lines are now reworded in **user-authored text** (never
+in tool results, which the middleware reports pass as written), and `cloak_said_as` accepts
+`phrase=replacement` pairs so an unrecognized phrase can be handled without a release. Two others
+stay open in `docs/plan.md` item 8: mid-conversation system messages, and U+FEFF as a word
+separator (our matcher excludes it to avoid a backtracking blow-up the others never fixed).
+
 The same review found that the refusal hint this plugin emits stated causation it cannot establish:
 the answer a turned-away line draws is the same generic `RESOURCE_EXHAUSTED (code 429)` a real
 account problem draws. The four hints now say the line was present, that this may not have been the

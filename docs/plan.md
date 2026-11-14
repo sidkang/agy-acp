@@ -85,29 +85,27 @@ the recommended decision and how to accept it. When an item ships, delete it her
   `invalid_request`, without changing classification.
 - Acceptance: a fake-ACP `-32602` with `loc` produces a `400` whose detail names the field.
 
-## 8. Close the cloaking scope gaps
+## 8. Finish the cloaking scope
 
-- Problem: the trigger list matches the two upstream implementations line for line, but three scope
-  gaps remain, and the diagnostic that reports a refusal claims more than the evidence supports
-  (fixed in the message text; the 400 itself stays).
-- Evidence: a comparison against `magpie-community/plugins/packages/agy-cli/cloak.mjs` and
-  `packages/antigravity-cloak/` found (a) the middleware also rewrites the two Codex lines in **user
-  messages**, because "since 11-14 Antigravity also answers a bare 429 to Codex's GPT-5 line in a
-  user's turn … 3 of 3 on a real account", while we rewrite only the system text;
-  (b) `agy-cli` also rewrites mid-conversation system/developer messages, which we turn into user
-  text without the rewrite; (c) neither we nor any of the three has a way to add a phrase without a
-  release, while the middleware ships `saidAs` for exactly the "the refusal came back" case.
-  A fourth, narrower gap: our word separator deliberately excludes the invisible characters (it
-  fixed a 12.7 s backtracking blow-up), so a line whose words are separated *only* by U+FEFF is not
-  matched, where the others' `\s+` matches it.
-- Options: (a) rewrite the two Codex lines in rendered user text; (b) rewrite mid-conversation
-  system text; (c) an option of `phrase=replacement` pairs applied to the system text; (d) extend
-  the separator with a bounded invisible run (`{1,8}`), which needs a backtracking test before it
-  lands; (e) none of it, since cloaking is off by default.
-- Decision: open. (a) has direct observation behind it; (c) is the only one that helps when an
-  unknown phrase is the trigger; (b) and (d) are cheap but unobserved.
-- Acceptance: whichever lands, a test that the phrase is rewritten in the scope it was added for and
-  left alone everywhere else, plus a `bun test` timing check for (d).
+- Problem: two scope gaps remain after 0.1.10 closed the other two.
+- Evidence: against `packages/agy-cli/cloak.mjs` and `packages/antigravity-cloak/`, the trigger list
+  matches line for line. Shipped in 0.1.10: the two Codex lines in **user-authored text**, because
+  the middleware measured that "since 11-14 Antigravity also answers a bare 429 to Codex's GPT-5
+  line in a user's turn … 3 of 3 on a real account" while the other lines passed there, and a
+  `saidAs`-style `phrase=replacement` list (`cloak_said_as`), so an unrecognized phrase no longer
+  needs a release.
+- Still open:
+  1. **Mid-conversation system/developer messages.** `agy-cli` rewrites these; this plugin turns
+     them into `<system-reminder>` user text without the rewrite, and only the two Codex lines are
+     handled in user text, so a Hermes or RFC 2119 line arriving mid-conversation goes out as
+     written. Unobserved either way; the middleware only confirmed the Codex lines in a user turn.
+  2. **U+FEFF as a word separator.** Our `SPACE` class excludes the invisible characters because
+     including them produced a 12.7 s backtracking blow-up on a long U+FEFF run; the others' `\s+`
+     matches them, so a line whose words are separated only by U+FEFF is rewritten by them and
+     missed here. Any fix has to be a bounded run plus a timing test, not `\s`.
+- Decision: open, both low priority with cloaking off by default.
+- Acceptance: a test that the phrase is rewritten in the scope it was added for and left alone
+  everywhere else; for (2), a `bun test` timing check with a 3,200-character U+FEFF run.
 
 ## 9. Decisions not yet made
 
