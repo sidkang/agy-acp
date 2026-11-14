@@ -307,6 +307,22 @@ A second probe of the same build found that a `tools/call` to any MCP server not
 rejected by this plugin's own permission handler, and that the turn then ended with an empty answer
 and a 200 — indistinguishable from a model with nothing to say.
 
+### 2026-11-14: how far the prompt cloaking goes
+
+Compared the trigger list here against `agy-cli` and the `antigravity-cloak` middleware: the six
+lines and their rewordings match line for line, and the differences are scope, not vocabulary —
+the middleware also rewrites the two Codex lines in user messages, `agy-cli` also rewrites
+mid-conversation system messages, and only the middleware lets a user add a phrase. A search of
+1,942 account logs and 65 worker logs on the edge host found **no** turn-away line and **no**
+trigger occurrence, which proves nothing about the vendor: `agy` records the prompt length, never
+its text. So the trigger list and every scope decision rest on other people's reports.
+
+The same review found that the refusal hint this plugin emits stated causation it cannot establish:
+the answer a turned-away line draws is the same generic `RESOURCE_EXHAUSTED (code 429)` a real
+account problem draws. The four hints now say the line was present, that this may not have been the
+account, and how a reader can tell — the 400 and its quota-free wording stay. It also found the
+coordinator falling back to cloaking on when no options were passed, fixed in `5838171f`.
+
 ### 2026-11-14: account disablement research
 
 Three lines in parallel: the vendor's own terms and the published enforcement reports; a code

@@ -222,14 +222,37 @@ export function cloakSystemPrompt(system: string | undefined | null, enabled = f
 // `usedUpWords`): it does not read a negation, so "not an account quota limit"
 // still answers failQuota and rests a healthy account. Say what happened without
 // any of them.
+//
+// They also have to stop short of a verdict. The refusal a turned-away line draws
+// is the same generic answer a real account problem draws (`RESOURCE_EXHAUSTED
+// (code 429): Resource has been exhausted`), and this bridge cannot see the
+// account's remaining windows, so "the line did it" is a guess: a genuine failure
+// that coincided with the line would read the same. The reports behind the trigger
+// list say the way to tell them apart is whether the same account still answers
+// other requests, which is advice for the reader, not knowledge held here.
+const ACCOUNT_STILL_WORKS = "If other requests on this account work,";
+const OTHERWISE_ACCOUNT = "if they fail too, it was the account.";
+
 const HINT =
-  "Antigravity turned this request away because of its system prompt (Claude Code / Claude Agent SDK wording), not because of this account: reword or drop that line, or use another provider for this prompt.";
+  "This request failed while its system prompt carried Claude Code / Claude Agent SDK wording. " +
+  "Antigravity is reported to answer such a request with an error that looks like an account problem, " +
+  `so this may not have been the account. ${ACCOUNT_STILL_WORKS} reword or drop that line, or use another ` +
+  `provider for this prompt; ${OTHERWISE_ACCOUNT}`;
 const CODEX_HINT =
-  "Antigravity turned this request away because of the system prompt Codex uses for GPT-5 models, not because of this account: start a fresh chat on this model, or use another provider for it.";
+  "This request failed while its system prompt carried the Codex wording for GPT-5 models. " +
+  "Antigravity is reported to answer such a request with an error that looks like an account problem, " +
+  `so this may not have been the account. ${ACCOUNT_STILL_WORKS} start a fresh chat on this model, or use ` +
+  `another provider for it; ${OTHERWISE_ACCOUNT}`;
 const HERMES_HINT =
-  "Antigravity turned this request away because of the system prompt Hermes Agent used by default, not because of this account: put it in SOUL.md, or use another provider for this prompt.";
+  "This request failed while its system prompt carried the Hermes Agent persona it used by default. " +
+  "Antigravity is reported to answer such a request with an error that looks like an account problem, " +
+  `so this may not have been the account. ${ACCOUNT_STILL_WORKS} put it in SOUL.md, or use another ` +
+  `provider for this prompt; ${OTHERWISE_ACCOUNT}`;
 const RFC_HINT =
-  "Antigravity turned this request away because of the RFC 2119 line in its system prompt, not because of this account: drop that line, or use another provider for this prompt.";
+  "This request failed while its system prompt carried the RFC 2119 line oh-my-pi starts with. " +
+  "Antigravity is reported to answer such a request with an error that looks like an account problem, " +
+  `so this may not have been the account. ${ACCOUNT_STILL_WORKS} drop that line, or use another provider ` +
+  `for this prompt; ${OTHERWISE_ACCOUNT}`;
 
 export function refusalHint(system: string | undefined | null): string {
   const hit = triggerMatches(String(system ?? ""));
