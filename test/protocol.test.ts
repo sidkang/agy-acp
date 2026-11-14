@@ -2416,9 +2416,10 @@ describe("cloaking scope", () => {
   });
 
   test("saidAs pairs are parsed, applied case-insensitively, and run after the built-in lines", () => {
-    expect(parseSaidAs("made by acme labs=made by Acme; xx=yy")).toEqual([
+    // Words are separated by one space however the caller typed them, and a
+    // two-letter phrase is refused: `a=b` would rewrite every article.
+    expect(parseSaidAs("made  by   acme labs=made by Acme; xx=yy")).toEqual([
       ["made by acme labs", "made by Acme"],
-      ["xx", "yy"],
     ]);
     expect(parseSaidAs("")).toEqual([]);
     expect(parseSaidAs("no separator here")).toEqual([]);

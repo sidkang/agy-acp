@@ -17,7 +17,7 @@ router rest the wrong thing, or fail over nowhere.
 | `context_budget` | `400` | "prompt is too long ... maximum context length ... reduce the length of the messages" | `overflowed` (its `tooLongRe` matches these words): asks a member with room, rests no account, tells the agent to compact |
 | `vendor_restricted` | `403` | the vendor's own "disabled in this account for violation of Terms of Service" | plain `403`: retryable, next account asked, nobody rests. Not `googleSuspended`: that predicate needs the account's Agent to be `antigravity`/`gemini`, and Magpie builds plugin accounts with `Agent: "plugin"` (`internal/provider/plugins.go`, `pluginProviderServing`). The sentence is kept for the human reading it |
 | `vendor_policy` | `403` | "policy or region restriction" | plain `403`: retryable, next account asked |
-| `auth` | `401` + `SignInHeader: expired` | expired sign-in | account marked as needing a new sign-in |
+| `auth` | `401` + `SignInHeader: expired` (`409` when failover is off, header unchanged) | expired sign-in | account marked as needing a new sign-in; the header is read whatever the status |
 | `quota` | `429` | "Account quota exhausted" | rests until the window it names renews (`quota_hours`/7-day) |
 | `rate_limit` | `429` | no quota words | brief rate rest, next account asked |
 | `model_unserved` | `404` | "model not found" | only that model rests on that account (`modelRefused`); its other models keep working |
@@ -71,10 +71,20 @@ With `account_failover` off — the default — the verdicts that are about *thi
 | `credit_exhausted` | `402` | `409` |
 | `quota`, `rate_limit` | `429` | `409` |
 
-Words and `error.type` do not change: Magpie's taxonomy (`failure`, `quotaWords`, `failCredit`)
-reads the body, so the account is still recorded as out of quota or credit in the trace, and a
-direct client still sees `rate_limit_error` / `authentication_error`. What changes is routing:
-`409` is not in `retryable`, so the error reaches the agent and nothing is asked on its behalf.
+`error.type` does not change, so a direct client still reads `rate_limit_error` /
+`authentication_error`. What changes is routing: `409` is not in `retryable`, so the error reaches
+the agent and nothing is asked on its behalf.
+
+Two wordings had to change with the status, because Magpie reads the body as well:
+
+- **Credit.** `failure()` reads `creditWords` (`balance`, `credit`, `billing`, `payment`, ...) at
+  *any* `4xx`, and `retryable` follows a `4xx` read as `failCredit` whatever its status. The
+  detailed credit message therefore still walked the pool at `409`; the stopped branch says the
+  same thing without a word of that list (`CREDIT_STOPPED_FAILURE_MESSAGE`).
+- **A bare throttle.** Every `failRate` branch requires `status == 429`, so a `409` carrying the
+  rate-limit wording is recorded as `failOther` rather than a brief rate rest. That is the
+  intended trade: the turn is not failed over, so there is no rest to schedule. `quota` keeps its
+  classification (`usedUpWords` is read below `500`), so a spent window still shows as one.
 
 Two consequences worth stating:
 
@@ -82,9 +92,11 @@ Two consequences worth stating:
   (`gateway.go:5212-5223`), which the answer never enters. `/usage` polling still shows the spent
   window, so the account's state in Magpie is right; it is simply not held out of routing for the
   window's length.
-- **A vendor-wide failure still walks the pool.** Every `5xx` is retryable and a plugin cannot
-  change that, so an `upstream_busy` `503` or an `internal` `500` may still be asked of another
-  account. Those are not account-own failures, which is why they keep their status.
+- **Two non-account verdicts still walk the pool.** Every `5xx` is retryable and a plugin cannot
+  change that, so an `upstream_busy` `503` or an `internal` `500` may be asked of another account;
+  and `model_unserved` answers `404`, which `retryable` also follows, so a model this account is
+  not served is asked of the next one. Both are about the vendor or the model rather than this
+  account's quota, sign-in or policy, which is why they keep their status.
 
 A group's own routing can stop the walk for every provider, plugin or not, without this option:
 `AffinityStrict` keeps a conversation on the account that answered it, and a `Manual` group sends

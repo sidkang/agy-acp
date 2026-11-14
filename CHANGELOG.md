@@ -8,6 +8,26 @@ repository's recorded history; where none is recorded, none is given.
 
 Version in `package.json`; no `v0.1.10` tag exists yet. Work dated 2026-11-14.
 
+- The review of the commits above found the new stopping behaviour incomplete and fixed it: the
+  credit message named `credit` and `balance`, which Magpie follows on any `4xx`
+  (`CREDIT_STOPPED_FAILURE_MESSAGE` replaces it when failover is off, and the detailed wording is
+  kept for the mode that may follow it); a startup sign-in failure still answered `401` and so
+  still walked the pool; a warm worker kept the `account_failover` it was built with, so turning
+  the option off now reaches it (`setAccountFailover`); and the "another signed-in account can
+  answer this turn" wording promised switching that is no longer done.
+- The tool-call relay hands a result over when it lands between the "still running" notice and the
+  model's `await_result`: it was kept for the next prompt, which is not where a model still in this
+  prompt can read it. An already-aborted request now settles on the abort instead of waiting out
+  the relay delay, and a completed call is never reported as cancelled.
+- `cloak_said_as` now reaches the system prompt. It was threaded into the size calculation only,
+  so the replacement changed the budget and not the text. A pair with fewer than three characters
+  is refused (it would rewrite every article), words are separated by one space rather than
+  whatever the caller typed (two `\s+`-ish runs with nothing between them backtrack badly), and a
+  list that doubles its own output past 512 KiB leaves the text as it was. The cold-plan seed,
+  which is sent as system text, now rewords user-authored lines too.
+- The six-hour fast-fail record needs the turn's log to agree when the suspension was read from the
+  model's own answer, because a prompt can ask for that sentence; protocol error text still counts
+  on its own. A turn a client cancelled no longer clears the record.
 - Account switching is off by default (`account_failover`). Why: Magpie follows a `401`, `402`,
   `403` or `429` to the next account of this provider, so one failed turn became a request from
   every account in the pool — the automation the vendor's terms say consumer plans do not support,

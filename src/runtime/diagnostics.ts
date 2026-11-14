@@ -73,14 +73,14 @@ export const GENERIC_FAILURE_MESSAGE =
  * still read healthy and would otherwise look like the best account to route to.
  */
 export const VENDOR_DISABLED_FAILURE_MESSAGE =
-  "Antigravity answered: This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product. Remove the account in Magpie if you are not appealing; other signed-in accounts can answer this turn.";
+  "Antigravity answered: This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product. Remove the account in Magpie if you are not appealing; you can choose another signed-in account yourself.";
 
 /**
  * Public text for a `PERMISSION_DENIED` that is not the Terms-of-Service
  * suspension: a region, project or policy refusal of the whole account.
  */
 export const VENDOR_POLICY_FAILURE_MESSAGE =
-  "Antigravity denied this account permission for the request (not the prompt). Another signed-in account can answer this turn.";
+  "Antigravity denied this account permission for the request (not the prompt). Choose another signed-in account yourself.";
 
 /**
  * Public text for a model this account is not served: the vendor's
@@ -113,7 +113,19 @@ export const CREDIT_EXHAUSTED_FAILURE_MESSAGE =
   "Antigravity says this account's credit balance is too low to continue. Top up or use another signed-in account.";
 
 export const TRANSIENT_LIMIT_FAILURE_MESSAGE =
-  "Antigravity upstream temporarily limited this turn (transient 429) before any answer was produced. Retry shortly; another signed-in account can answer it now.";
+  "Antigravity upstream temporarily limited this turn (transient 429) before any answer was produced. Retry shortly, or choose another account yourself.";
+
+/**
+ * The credit verdict when `account_failover` is off.
+ *
+ * Magpie reads the words of any `4xx` for credit (`creditWords`: balance, credit,
+ * billing, payment) and fails such a request over to the next account whatever its
+ * status is (`fallback.go` `retryable`). So the detailed message above cannot be
+ * sent by an account that must not be followed, and this one says the same thing
+ * without a word of that list.
+ */
+export const CREDIT_STOPPED_FAILURE_MESSAGE =
+  "Antigravity says this account cannot continue on its current plan. Top up in Google's console, or choose another account yourself.";
 
 /**
  * `agy`'s own in-process retry notice for a transient upstream failure:

@@ -44,7 +44,10 @@ import {
 import { decodeWebp } from "../src/protocol/webp";
 import { SessionToolBroker } from "../src/mcp/broker";
 import { getSharedMcpServer } from "../src/mcp/http-server";
-import { renderMessagesToPrompt } from "../src/sessions/prompt-render";
+import {
+  planColdHistoryRender,
+  renderMessagesToPrompt,
+} from "../src/sessions/prompt-render";
 import { CONTEXT_BUDGET_FAILURE_MESSAGE } from "../src/runtime/diagnostics";
 import { encodeAnthropicSseResponse } from "../src/protocol/anthropic";
 import {
@@ -1337,6 +1340,29 @@ describe("Phase 3: inline image fitting & broker/prompt-render wiring", () => {
       },
     ]);
     expect(JSON.stringify(framed)).toContain("truncated middle for prompt budget");
+  });
+
+  test("a cold-plan seed rewords user text, since the seed is sent as system text", () => {
+    // The seed only carries the turns the prompt budget pushes out, so the Codex
+    // line goes in the oldest one and the rest is filler.
+    const filler = "y".repeat(4 * 1024);
+    const prior: any[] = [
+      { role: "user", content: [{ type: "text", text: "You are Codex, an agent based on GPT-5." }] },
+    ];
+    for (let i = 0; i < 40; i += 1) {
+      prior.push({ role: "assistant", content: [{ type: "text", text: filler }] });
+      prior.push({ role: "user", content: [{ type: "text", text: `turn ${i}` }] });
+    }
+    const current = [{ role: "user", content: [{ type: "text", text: "next" }] }] as any;
+
+    const cloaked = planColdHistoryRender(prior, current, "gemini-4-carbon", 0, true)
+      .systemHistorySeed;
+    expect(cloaked).toBeDefined();
+    expect(cloaked).toContain("an agent built on GPT-5");
+
+    const plain = planColdHistoryRender(prior, current, "gemini-4-carbon", 0, false)
+      .systemHistorySeed;
+    expect(plain).toContain("an agent based on GPT-5");
   });
 
   test("SessionToolBroker and renderMessagesToPrompt pass inline images through fitInlineImage", async () => {

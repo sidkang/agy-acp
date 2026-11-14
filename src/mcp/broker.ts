@@ -545,6 +545,19 @@ export class SessionToolBroker {
     const callId = typeof args.call_id === "string" ? args.call_id.trim() : ""
     const call = callId ? this.callsById.get(callId) : undefined
     if (!call) {
+      // The result may have landed between the "still running" notice and this
+      // call. Nothing was waiting at that moment, so it was kept for the next
+      // prompt; this is a better moment than that one, so hand it over now.
+      const at = callId
+        ? this.stranded.findIndex((entry) => entry.callId === callId)
+        : -1
+      if (at >= 0) {
+        const [entry] = this.stranded.splice(at, 1)
+        return {
+          status: 200,
+          body: { jsonrpc: "2.0", id, result: entry!.result },
+        }
+      }
       return {
         status: 200,
         body: {
@@ -587,6 +600,9 @@ export class SessionToolBroker {
       }
       racers.push(
         new Promise<unknown>((resolve) => {
+          // An event that already fired is not replayed: an aborted request must
+          // settle here rather than wait out the relay delay.
+          if (controller.signal.aborted) return resolve(ABORTED)
           controller.signal.addEventListener("abort", () => resolve(ABORTED), { once: true })
         }),
       )

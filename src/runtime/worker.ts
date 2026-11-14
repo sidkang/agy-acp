@@ -23,6 +23,7 @@ import {
   GENERIC_FAILURE_MESSAGE,
   CREDIT_EXHAUSTED_FAILURE_MESSAGE,
   MODEL_UNSERVED_FAILURE_MESSAGE,
+  CREDIT_STOPPED_FAILURE_MESSAGE,
   TRANSIENT_LIMIT_FAILURE_MESSAGE,
   UPSTREAM_BUSY_FAILURE_MESSAGE,
   VENDOR_DISABLED_FAILURE_MESSAGE,
@@ -106,6 +107,8 @@ export interface WorkerOptions {
   minimalAgent?: boolean;
   exposeThinking?: boolean;
   cloakPrompts?: boolean;
+  /** Caller-supplied `phrase=replacement` pairs applied after the built-in lines. */
+  cloakSaidAs?: string;
   /**
    * `account_failover`: may Magpie answer this turn from another account of this
    * provider after this one fails? Undefined keeps the retryable statuses (what a
@@ -567,7 +570,7 @@ export class AgySessionWorker {
     ) {
       await this.close("auth_expired");
       throw new BridgeHttpError(
-        401,
+        this.failoverStatus(401),
         "authentication_error",
         "Antigravity CLI authentication expired. Please sign in again.",
         { signInExpired: true },
@@ -761,6 +764,7 @@ export class AgySessionWorker {
         this.options.systemPrompt,
         this.options.workDir,
         this.options.cloakPrompts === true,
+        this.options.cloakSaidAs,
       );
       this.effectiveSystemPrompt = effectiveSystem;
 
@@ -1102,6 +1106,7 @@ export class AgySessionWorker {
 
   private diagnoseTerminationError(
     rawErr?: unknown,
+    fromAnswer = false,
   ): Extract<TurnStreamEvent, { type: "error" }> {
     const rawErrMsg =
       rawErr instanceof Error
@@ -1130,8 +1135,20 @@ export class AgySessionWorker {
     const verdict = classifyAgentFailure(evidence, redactedRawErr);
 
     // A suspended account refuses every prompt the same way, so remember it and
-    // let later turns fail fast instead of spawning `agy` to be refused again.
-    if (verdict === "vendor_restricted") {
+    // let later turns fail fast instead of spawning `agy` to be refused again. The
+    // answer alone is not enough for that: a model asked to quote the sentence
+    // writes it as the whole answer, and `terminalNoticeIsEvidence` cannot tell that
+    // from a refusal. The turn's log is where a real one shows (the observed ban
+    // left it in `cli-*.log`), so the six-hour record needs the log to agree.
+    // A suspension read from the model's own words ("fromAnswer") is not evidence
+    // that the account is disabled: a prompt can ask for that sentence. The
+    // protocol's error text is evidence, and so is the turn's log.
+    if (
+      verdict === "vendor_restricted" &&
+      (!fromAnswer ||
+        classifyAgentFailure(this.currentTurnLogEvidence(), "") ===
+          "vendor_restricted")
+    ) {
       markPolicyBlocked(this.account.accountRef, VENDOR_DISABLED_FAILURE_MESSAGE);
     }
 
@@ -1232,9 +1249,8 @@ export class AgySessionWorker {
         };
       case "rate_limit":
         // A `429` that names no spent window: `agy` retries these in-process, so
-        // this is what a busy minute looks like. Reported as a plain `429` with
-        // text free of quota wording, so Magpie rests the account briefly and
-        // asks the next one instead of holding it for its whole window.
+        // this is what a busy minute looks like. Reported with text free of quota
+        // wording, on the status `failoverStatus` chooses for it.
         // Nothing asked for the rewording to be off: a turned-away line here is
         // the likeliest explanation, and cloaking that still met a `429` failed at
         // it. Both answer `400`, which stops the next account from being asked.
@@ -1254,11 +1270,17 @@ export class AgySessionWorker {
       case "credit_exhausted":
         // A `402` is out of credit to Magpie: the account is held on that ladder
         // rather than a quota window's, and topping up is what clears it.
+        const followable = this.options.accountFailover !== false;
         return {
           type: "error",
           status: this.failoverStatus(402),
           errorType: "api_error",
-          message: withDetail(CREDIT_EXHAUSTED_FAILURE_MESSAGE, rawDetail),
+          // The detailed wording names credit and balance, which is what Magpie
+          // fails a `4xx` over on whatever the status; an account nobody may follow
+          // says it without those words.
+          message: followable
+            ? withDetail(CREDIT_EXHAUSTED_FAILURE_MESSAGE, rawDetail)
+            : withDetail(CREDIT_STOPPED_FAILURE_MESSAGE),
           ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
         };
       case "invalid_request":
@@ -1327,10 +1349,20 @@ export class AgySessionWorker {
   }
 
   /**
+   * Follows a change to `account_failover` on a live worker. The option is read per
+   * request (`src/index.ts`), but a warm session keeps the worker it built, so
+   * without this a session started with switching on would keep switching after the
+   * user turned it off.
+   */
+  setAccountFailover(enabled: boolean): void {
+    this.options.accountFailover = enabled;
+  }
+
+  /**
    * Ends a turn that is still retrying upstream instead of waiting out `agy`'s
    * full ladder (~8 minutes, far past the client's own timeout). `agy` is told to
-   * cancel so the worker stays reusable, and the caller gets a plain `429` it can
-   * fail over on.
+   * cancel so the worker stays reusable, and the caller gets the diagnosed failure
+   * on the status `failoverStatus` chooses for it.
    */
   private abortUpstreamRetryStorm(): void {
     if (this._state !== "GENERATING" || this.retryStormAborted) return;
@@ -1657,7 +1689,7 @@ export class AgySessionWorker {
     if (terminal !== null && this.terminalNoticeIsEvidence(this.turn.heldText)) {
       // The notice's own words are this turn's evidence: `agy` writes it instead
       // of an answer, and each wording is a different failure.
-      const errorEvent = this.diagnoseTerminationError(this.turn.heldText);
+      const errorEvent = this.diagnoseTerminationError(this.turn.heldText, true);
       this.turn.heldText = "";
       this.turn.finishWith(errorEvent);
       this.setState("IDLE");
@@ -1671,9 +1703,13 @@ export class AgySessionWorker {
 
     // Answered for real: whatever the account said earlier is over (an appeal can
     // restore it), so the fast-fail record no longer applies. Later than the top of
-    // this method on purpose — a cancelled turn returns above without answering,
-    // and a terminal notice returns its own verdict, which may be the same block.
-    clearPolicyBlock(this.account.accountRef);
+    // this method on purpose: a cancelled turn returns above without answering, a
+    // terminal notice returns its own verdict, which may be the same block, and a
+    // client cancel settles as `{stopReason: "cancelled"}` with no answer at all —
+    // a second worker's cancel must not clear what another worker recorded.
+    if (String((result as any)?.stopReason ?? "") !== "cancelled") {
+      clearPolicyBlock(this.account.accountRef);
+    }
 
     if (this.turn.heldText) {
       this.turn.pushEvent({ type: "text_delta", text: this.turn.heldText });

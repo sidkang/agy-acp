@@ -947,6 +947,59 @@ describe("still-running relay", () => {
     expect(bridge.batches).toHaveLength(1)
   })
 
+  test("a result that lands between the notice and the model's question is handed over", async () => {
+    const bridge = startBridge({ relayAfterMs: 25 })
+    bridge.broker.setTools([{ name: "slow_tool", inputSchema: echoToolSchema }])
+    bridge.broker.openTurnWindow()
+
+    const pending = callTool(bridge.url, "slow_tool", {}, 7)
+    const exposed = await waitFor(() => bridge.batches[0]?.[0])
+    await readBody(await pending)
+
+    // The caller answers while nothing is waiting: the result is kept for the next
+    // prompt, but the model is still in this one and asks a moment later.
+    bridge.broker.deliverToolResults([
+      { toolUseId: exposed!.id, isError: false, content: [{ type: "text", text: "late answer" }] },
+    ])
+    await sleep(5)
+
+    const asked = await readBody(
+      await callTool(bridge.url, "await_result", { call_id: exposed!.id }, 8),
+    )
+    expect((asked.result as any)).toEqual({ content: [{ type: "text", text: "late answer" }] })
+    // Handed over once: the next prompt does not repeat it.
+    expect(bridge.broker.takeStrandedResults()).toEqual([])
+    expect(bridge.batches).toHaveLength(1)
+  })
+
+  test("a request already aborted settles instead of waiting out the relay", async () => {
+    const bridge = startBridge({ relayAfterMs: 25 })
+    bridge.broker.setTools([{ name: "slow_tool", inputSchema: echoToolSchema }])
+    bridge.broker.openTurnWindow()
+
+    const pending = callTool(bridge.url, "slow_tool", {}, 7)
+    const exposed = await waitFor(() => bridge.batches[0]?.[0])
+    await readBody(await pending)
+
+    const controller = new AbortController()
+    controller.abort()
+    const started = Date.now()
+    const answered: any = await bridge.broker.handleJsonRpc(
+      {
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: { name: "await_result", arguments: { call_id: exposed!.id } },
+      },
+      { signal: controller.signal },
+    );
+    // An abort event that already fired is not replayed, so the wait must settle on
+    // its own rather than report "still running" again when the timer expires.
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(String(answered.body?.result?.content?.[0]?.text ?? "")).toContain("cancelled")
+    expect(bridge.batches).toHaveLength(1)
+  })
+
   test("an unknown call id says so instead of hanging", async () => {
     const bridge = startBridge({ relayAfterMs: 25 })
     bridge.broker.setTools([{ name: "slow_tool", inputSchema: echoToolSchema }])

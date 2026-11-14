@@ -262,6 +262,10 @@ export function applySaidAs(
   let out = text;
   for (const [from, to] of pairs) {
     out = out.replace(triggerRe(from), () => to);
+    // A list can double its own output: `a=aa` applied n times leaves 2^n
+    // characters. Past the cap the original text is returned rather than a prompt
+    // that has already been half rewritten.
+    if (out.length > MAX_SAID_AS_BYTES) return text;
   }
   return out;
 }
@@ -275,9 +279,18 @@ export function parseSaidAs(
   for (const entry of raw.split(/[;\n]/)) {
     const at = entry.indexOf("=");
     if (at <= 0) continue;
-    const from = entry.slice(0, at).trim();
+    // One space between words: `triggerRe` already tolerates a run of them, and a
+    // literal run here would join two `\s+`-ish pieces with nothing between them,
+    // which backtracks badly on a long run in the prompt.
+    const from = entry
+      .slice(0, at)
+      .split(/\s+/)
+      .filter(Boolean)
+      .join(" ");
     const to = entry.slice(at + 1).trim();
-    if (!from || from.length > 200 || to.length > 200) continue;
+    // Shorter than three characters rewrites far more of the prompt than the caller
+    // meant (`a=b` turns every article into `b`).
+    if (from.length < 3 || from.length > 200 || to.length > 200) continue;
     pairs.push([from, to]);
     if (pairs.length >= MAX_SAID_AS) break;
   }
@@ -285,6 +298,7 @@ export function parseSaidAs(
 }
 
 const MAX_SAID_AS = 32;
+const MAX_SAID_AS_BYTES = 512 * 1024;
 
 // The wording of these hints goes to Magpie in a `400` body, and Magpie reads
 // the whole body for the words that mean a spent window (`quotaWords`,

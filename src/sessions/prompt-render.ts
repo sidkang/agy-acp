@@ -282,6 +282,7 @@ export function planColdHistoryRender(
   currentMessages: NormalizedMessage[],
   modelId: string,
   systemBytes = 0,
+  cloakUser = false,
 ): {
   systemHistorySeed?: string;
   tailPriorMessages: NormalizedMessage[];
@@ -293,6 +294,7 @@ export function planColdHistoryRender(
   const { turnText, prefillText } = renderCurrentTurnParts(
     currentMessages,
     false,
+    cloakUser,
   );
   const currentBytes = utf8Bytes(turnText + prefillText);
   const historyHeader = "<conversation_history>\n";
@@ -303,7 +305,9 @@ export function planColdHistoryRender(
     MAX_PROMPT_BYTES - currentBytes - frameBytes,
   );
 
-  const promptEntries = priorMessages.map((m) => renderHistoryEntry(m));
+  const promptEntries = priorMessages.map((m) =>
+    renderHistoryEntry(m, HISTORY_BLOCK_CLIP_BYTES, HISTORY_BLOCK_KEEP_BYTES, cloakUser),
+  );
   const promptEntryBytes = promptEntries.map((e) => utf8Bytes(e));
   const totalPromptHistBytes = promptEntryBytes.reduce((a, b) => a + b, 0);
 
@@ -338,7 +342,12 @@ export function planColdHistoryRender(
   }
 
   const seedEntries = overflowMessages.map((m) =>
-    renderHistoryEntry(m, SEED_BLOCK_CLIP_BYTES, SEED_BLOCK_KEEP_BYTES),
+    renderHistoryEntry(
+      m,
+      SEED_BLOCK_CLIP_BYTES,
+      SEED_BLOCK_KEEP_BYTES,
+      cloakUser,
+    ),
   );
   const seedEntryBytes = seedEntries.map((e) => utf8Bytes(e));
   const totalSeedBytes = seedEntryBytes.reduce((a, b) => a + b, 0);

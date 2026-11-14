@@ -17,6 +17,7 @@ import {
   CONTEXT_BUDGET_FAILURE_MESSAGE,
   GENERIC_FAILURE_MESSAGE,
   CREDIT_EXHAUSTED_FAILURE_MESSAGE,
+  CREDIT_STOPPED_FAILURE_MESSAGE,
   MODEL_UNSERVED_FAILURE_MESSAGE,
   limitFreeDetail,
   retryAfterSecondsFrom,
@@ -133,6 +134,12 @@ interface DiagnosedTurnCase {
   forbidden?: string[];
   /** Extra assertions over the raw (pre-parse) body. */
   checkRaw?: (raw: string) => void;
+  /**
+   * Whether this turn records the six-hour fast-fail block. Defaults to "yes for a
+   * vendor-disabled `403`"; a refusal read from the model's own words needs the
+   * turn's log to agree before it holds the account out of routing.
+   */
+  expectBlock?: boolean;
 }
 
 function createScriptedFakeAcpChild(
@@ -1412,6 +1419,69 @@ describe("AgySessionWorker diagnostics integration", () => {
       errorType: "rate_limit_error",
       message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
     });
+
+    // A warm session keeps the worker it built, so the option has to reach it.
+    const ws = makeTempDir("worker-failover-live-");
+    const worker = new AgySessionWorker(account, "diag-sess-live", mcpServer, {
+      workspaceDir: ws,
+      accountFailover: true,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          ctx.terminateTurn({
+            name: "agy-acp.log.91014",
+            text: "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 4s\n",
+          });
+        }),
+    });
+    try {
+      await worker.start();
+      worker.setAccountFailover(false);
+      expectErrorEvent(await runTurn(worker, "single retry"), {
+        status: 409,
+        errorType: "rate_limit_error",
+        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+      });
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("a spent credit balance names itself only when another account may answer", async () => {
+    const runWith = async (accountFailover: boolean) => {
+      const ws = makeTempDir("worker-credit-");
+      const worker = new AgySessionWorker(account, "diag-sess-credit", mcpServer, {
+        workspaceDir: ws,
+        accountFailover,
+        spawnFn: () =>
+          createScriptedFakeAcpChild(ws, (ctx) => {
+            ctx.failTurn("⚠ Your AI credits balance is too low to continue.");
+          }),
+      });
+      try {
+        await worker.start();
+        const res = await encodeAnthropicSseResponse(
+          "gemini-4-carbon",
+          worker.startPromptTurn([{ type: "text", text: "hi" }]),
+        );
+        return { status: res.status, body: await res.text() };
+      } finally {
+        await worker.close("test_done");
+      }
+    };
+
+    // Off: `credit` and `balance` are the words Magpie fails any `4xx` over on
+    // (`creditWords`, then `retryable`), so an account nobody may follow says it
+    // without them. The status alone is not enough — that was the defect.
+    const stopped = await runWith(false);
+    expect(stopped.status).toBe(409);
+    expect(stopped.body).toContain(CREDIT_STOPPED_FAILURE_MESSAGE.slice(0, 40));
+    expect(stopped.body.toLowerCase()).not.toContain("credit");
+    expect(stopped.body.toLowerCase()).not.toContain("balance");
+
+    // Asked for: the detailed wording, on the `402` that rests the account.
+    const followable = await runWith(true);
+    expect(followable.status).toBe(402);
+    expect(followable.body).toContain(CREDIT_EXHAUSTED_FAILURE_MESSAGE.slice(0, 40));
   });
 
   test("a trigger line still stops the turn on a bare 429 with cloaking on", async () => {
@@ -1850,6 +1920,37 @@ describe("AgySessionWorker diagnostics integration", () => {
       signInHeader: null,
       errorType: "permission_error",
       message: VENDOR_DISABLED_FAILURE_MESSAGE,
+      // The sentence as the whole answer is also what a prompt asks for, so the
+      // account is not held out of routing for six hours on that alone.
+      expectBlock: false,
+    },
+    {
+      name: "the same sentence in the turn's log is evidence, and holds the account",
+      workspacePrefix: "worker-tos-logged-",
+      sessionId: "diag-tos-logged",
+      script: (ctx) => {
+        // The observed ban left this sentence in `cli-*.log` while the answer was
+        // empty; that is what the six-hour record needs.
+        fs.writeFileSync(
+          path.join(ctx.workspaceDir, "agy-acp.log.92002"),
+          "E1114 18:13:27.454000     500 errorreport.go:273] rpc error: code = PermissionDenied desc = This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.\n",
+        );
+        ctx.emitUpdate({
+          sessionId: NATIVE_SESSION_ID,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              text: "\n⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.\n",
+            },
+          },
+        });
+        ctx.finishTurn();
+      },
+      status: 403,
+      signInHeader: null,
+      errorType: "permission_error",
+      message: VENDOR_DISABLED_FAILURE_MESSAGE,
+      expectBlock: true,
     },
     {
       name: "a model this account is not served answers 404 so only that model rests",
@@ -2078,14 +2179,11 @@ describe("AgySessionWorker diagnostics integration", () => {
       // fails fast instead of spawning `agy` to be refused again; any other
       // outcome leaves the account usable.
       const blocked = policyBlockedMessage(account.accountRef);
-      if (
-        turnCase.status === 403 &&
-        turnCase.message === VENDOR_DISABLED_FAILURE_MESSAGE
-      ) {
-        expect(blocked).toBe(VENDOR_DISABLED_FAILURE_MESSAGE);
-      } else {
-        expect(blocked).toBeNull();
-      }
+      const shouldBlock =
+        turnCase.expectBlock ??
+        (turnCase.status === 403 &&
+          turnCase.message === VENDOR_DISABLED_FAILURE_MESSAGE);
+      expect(blocked).toBe(shouldBlock ? VENDOR_DISABLED_FAILURE_MESSAGE : null);
     } finally {
       await worker.close("test_done");
     }

@@ -903,6 +903,7 @@ export class SessionCoordinator {
           this.providerOptions?.cloakSaidAs ?? options?.providerOptions?.cloakSaidAs,
         ),
       ),
+      cloakPrompts,
     );
     const accountFailover =
       options?.providerOptions?.accountFailover ??
@@ -917,6 +918,8 @@ export class SessionCoordinator {
         false,
       exposeThinking: req.thinkingEnabled,
       cloakPrompts,
+      cloakSaidAs:
+        this.providerOptions?.cloakSaidAs ?? options?.providerOptions?.cloakSaidAs,
       workDir: req.workDir,
       systemPrompt: req.system,
       systemHistorySeed: coldPlan.systemHistorySeed,
@@ -1119,6 +1122,11 @@ export class SessionCoordinator {
       await this.assertImagesSupported(worker, req);
 
       worker.setExposeThinking(req.thinkingEnabled);
+      worker.setAccountFailover(
+        options?.providerOptions?.accountFailover ??
+          this.providerOptions?.accountFailover ??
+          false,
+      );
       await worker.applyModelSelection(modelSelection, signal);
       worker.broker.setToolChoice(req.toolChoice);
 
@@ -1273,6 +1281,11 @@ export class SessionCoordinator {
       }
 
       worker.setExposeThinking(req.thinkingEnabled);
+      worker.setAccountFailover(
+        options?.providerOptions?.accountFailover ??
+          this.providerOptions?.accountFailover ??
+          false,
+      );
       worker.broker.setToolChoice(req.toolChoice);
 
       let yieldedAny = false;
@@ -1368,6 +1381,7 @@ export class SessionCoordinator {
           this.providerOptions?.cloakSaidAs ?? options?.providerOptions?.cloakSaidAs,
         ),
       ),
+      cloakPrompts,
     );
     const worker = new AgySessionWorker(
       account,
@@ -1381,6 +1395,9 @@ export class SessionCoordinator {
           false,
         exposeThinking: req.thinkingEnabled,
         cloakPrompts,
+        cloakSaidAs:
+          this.providerOptions?.cloakSaidAs ??
+          options?.providerOptions?.cloakSaidAs,
         accountFailover:
           options?.providerOptions?.accountFailover ??
           this.providerOptions?.accountFailover ??
