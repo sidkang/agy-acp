@@ -877,10 +877,12 @@ export class SessionCoordinator {
     const { priorMessages, currentMessages } = splitPriorAndCurrent(
       req.messages,
     );
+    // Off unless something said otherwise: the option's own default is false, and
+    // a fallback of `true` here silently cloaked every caller that passed neither.
     const cloakPrompts =
       options?.providerOptions?.cloakPrompts ??
       this.providerOptions?.cloakPrompts ??
-      true;
+      false;
     const coldPlan = planColdHistoryRender(
       priorMessages,
       currentMessages,
@@ -1321,10 +1323,12 @@ export class SessionCoordinator {
   ): AsyncGenerator<TurnStreamEvent> {
     const ephemeralSessionId = `ephemeral-${crypto.randomUUID()}`;
     const spawnFn = options?.spawnFn ?? this.defaultSpawnFn;
+    // Off unless something said otherwise: the option's own default is false, and
+    // a fallback of `true` here silently cloaked every caller that passed neither.
     const cloakPrompts =
       options?.providerOptions?.cloakPrompts ??
       this.providerOptions?.cloakPrompts ??
-      true;
+      false;
     const { priorMessages, currentMessages } = splitPriorAndCurrent(
       req.messages,
     );
