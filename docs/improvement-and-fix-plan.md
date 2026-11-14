@@ -79,3 +79,33 @@ All high- and medium-severity correctness defects identified in the audit were f
 - [ ] **Remaining Opt-In / Future Work**:
   - **[CARRY-1]** `application/pdf` document `embeddedContext` passthrough remains intentionally rejected with HTTP `400` in `src/protocol/anthropic.ts` until native upstream `agy` PDF handling is verified end-to-end.
   - Virtual `StructuredOutput` MCP retry validation and streaming `<tool_call>` text interception remain optional future enhancements.
+
+---
+
+## 5. Phase 4: `v0.1.8` — Default Quota Routing, Probe Governance, WebP & Truthful `429`s (Complete)
+
+| Item | Change | Where |
+| --- | --- | --- |
+| **Quota routing on by default** | `quota_routing` defaults to `true`, so Magpie sees each account's 5-hour/weekly buckets and fails over before an exhausted account is asked. | `src/options.ts`, both READMEs |
+| **Specific-first quota attribution** | Per-model groups (`Gemini 4 Argon`, …) claim their own catalog models before broad vendor pools (`Gemini`), versioned pool names are preserved instead of collapsing into `Gemini`, and `Claude`/`GPT` stay separate so a host alias can never broaden model membership. Empty or fully disabled specific groups no longer steal models from a valid broad pool. | `src/usage/quota.ts` (`parseUsageReport`) |
+| **Probe concurrency governance** | Short-lived `agy` probes (`agy models`, `agy -p /usage`) run through a bounded FIFO pool with queue-inclusive deadlines and single-release accounting, so importing 15–30 accounts cannot spawn dozens of Go processes at once. | `src/usage/catalog.ts`, `src/usage/quota.ts` |
+| **Parallel, ordered account import** | Batch import runs 4-wide with source-order results, abort-aware per-email ownership, and rollback error reporting (a failed batch no longer leaves a half-imported slot reported as success). | `src/accounts/auth.ts` |
+| **Single-flight cancellation isolation** | A cancelled caller no longer kills a shared `agy` probe other callers are waiting on: waits are reference counted and the background catalog refresh keeps its own timeout. | `src/usage/catalog.ts`, `src/usage/quota.ts` |
+| **WebP inline support** | Zero-dependency still WebP decode (`VP8L`, `VP8 `, `VP8X` + `ALPH`) under a `DecodeBudget`, so oversized WebP screenshots and web images downscale like PNG/JPEG instead of being forwarded verbatim; animated WebP passes through untouched. Verified pixel-exact against `libwebp` `dwebp` across 22 `cwebp`/`dwebp` cases (`maxAbsDiff = 0`). | `src/protocol/webp.ts`, `webp-vp8.ts`, `webp-vp8l.ts`, `images.ts` |
+| **`agy` upgrade awareness** | Catalog cache entries are fenced by `getAgyBinaryFingerprint()` (`mtimeMs` + `size` of the resolved binary), so upgrading the CLI exposes new models on the next turn instead of after the 24-hour retention. | `src/accounts/env.ts`, `src/usage/catalog.ts` |
+| **Truthful `429` classification & retry-storm guard** | A bare `429`/`RESOURCE_EXHAUSTED` is reported as a transient limit (plain `429`, no quota wording) instead of `Account quota exhausted`; `agy`'s own retry notices are stripped from the answer and counted, and a turn that has delivered nothing is ended after 2 notices (~12s) rather than waiting out `agy`'s ~8-minute backoff ladder. Notices are only believed when the turn's log shows `Run: attempt N failed`, so a model *quoting* the incident is delivered verbatim. | `src/runtime/diagnostics.ts`, `worker.ts`, `turn-context.ts`; rationale in [error-routing-diagnosis.md](error-routing-diagnosis.md#5-transient-limits-vs-account-quota-observed-incident-v018) |
+
+### Verification
+
+- `bun test`: **343 pass, 0 fail**, including new cases for the quota/`rate_limit` split (`exhausted your capacity` stays `quota`), notice stripping for splits inside the header and after it, a notice burst whose log record lands one chunk late, an answer whose last characters look like a notice start, a quoted incident without corroborating log evidence, and the retry-storm turn ending as `rate_limit` without leaking notices as text — including when `agy` settles the cancelled prompt as an RPC error and keeps streaming into the cancelled turn.
+- `bun x tsc --noEmit`: clean.
+- `bun scripts/check-release.mjs`: `magpie-agy-acp@0.1.8` releasable (packaging, manifest, entrypoints, English-only scan).
+
+### Review outcome
+
+The adversarial pass flagged two items that were checked rather than applied:
+
+- **“Zero base filter level must not disable segment filtering”** — rejected. `libwebp` `src/dec/vp8_dec.c:285` sets `dec->filter_type = (hdr->level == 0) ? 0 : hdr->simple ? 1 : 2;`, i.e. a zero frame filter level disables the loop filter regardless of segment overrides, and `libvpx` skips the pass the same way. `src/protocol/webp-vp8.ts` matches `dwebp`.
+- **VP8L Huffman-group budget, truncated-partition tolerance, empty specific quota groups, and import rollback bookkeeping** — confirmed and fixed before this record was written.
+
+Still open by choice: **[CARRY-1]** PDF `embeddedContext` passthrough, and the optional virtual `StructuredOutput` / streaming `<tool_call>` work.

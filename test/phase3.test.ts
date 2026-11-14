@@ -41,6 +41,7 @@ import {
   getFittedImageCacheSize,
   readImageDimensions,
 } from "../src/protocol/images";
+import { decodeWebp } from "../src/protocol/webp";
 import { SessionToolBroker } from "../src/mcp/broker";
 import { getSharedMcpServer } from "../src/mcp/http-server";
 import { renderMessagesToPrompt } from "../src/sessions/prompt-render";
@@ -1037,7 +1038,7 @@ describe("Phase 3: inline image fitting & broker/prompt-render wiring", () => {
     }
   });
 
-  test("fast path, downscale (>2000px), LRU cache, WebP passthrough, and bomb guard", () => {
+  test("fast path, downscale (>2000px), LRU cache, WebP downscale/passthrough, and bomb guard", () => {
     // 1. Small/unreadable passthrough untouched
     expect(fitInlineImage("image/png", "AAAA")).toEqual({
       mediaType: "image/png",
@@ -1112,7 +1113,7 @@ describe("Phase 3: inline image fitting & broker/prompt-render wiring", () => {
       MAX_INLINE_IMAGE_BASE64_BYTES,
     );
 
-    // 6. Oversized WebP passes through safely
+    // 6. Truncated/chunkless VP8X WebP passes through safely, while valid oversized WebP downscales
     const vp8x = new Uint8Array(30);
     vp8x.set(Buffer.from("RIFF"), 0);
     vp8x.set([22, 0, 0, 0], 4);
@@ -1127,6 +1128,176 @@ describe("Phase 3: inline image fitting & broker/prompt-render wiring", () => {
     expect(fitInlineImage("image/webp", webpB64)).toEqual({
       mediaType: "image/webp",
       data: webpB64,
+    });
+
+    const bigWebpB64 =
+      "UklGRrIAAABXRUJQVlA4TKUAAAAvX8krEQ9QqJPAHwX5gf9RgUzaZv5Nz0HfRPR/Ah51UfmP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iP//iPWgAA";
+    const fittedWebp = fitInlineImage("image/webp", bigWebpB64);
+    expect(fittedWebp.mediaType).toBe("image/png");
+    const fittedWebpPng = decodeImageRgba(Buffer.from(fittedWebp.data, "base64"));
+    expect(fittedWebpPng?.width).toBe(2000);
+    expect(fittedWebpPng?.height).toBe(1000);
+    // Left half had alpha=128, right half had alpha=255
+    expect(fittedWebpPng?.rgba[3]).toBe(128);
+    expect(fittedWebpPng?.rgba[(1999) * 4 + 3]).toBe(255);
+  });
+
+  test("decodeWebp and fitInlineImage cover VP8L, VP8, VP8X+ALPH, animation passthrough, noisy JPEG fallback, and budget guards", () => {
+    const sha256Hex = (bytes: Uint8Array): string =>
+      crypto.createHash("sha256").update(bytes).digest("hex");
+
+    // 1. VP8L lossless (19x13 spatial/color/subtract-green/color-cache/alpha) — 0-bit diff vs dwebp
+    const vp8lRaw = Buffer.from(
+      "UklGRkYAAABXRUJQVlA4TDkAAAAvEgADELkKRPQ/dlGH6H/ASNtIaApq4vybfPhUSJBiG0mBQJI/4xQTCASSVSNbtQcr/X29M4zgvwAA",
+      "base64",
+    );
+    const vp8lDec = decodeWebp(vp8lRaw);
+    expect(vp8lDec?.width).toBe(19);
+    expect(vp8lDec?.height).toBe(13);
+    expect(sha256Hex(vp8lDec!.rgba)).toBe(
+      "d2ef07c708383883fa3012b21259f41ae259ed8d4a5279a9e7f230e876fea68f",
+    );
+
+    // 2. VP8L lossless palette (11x9 7-color packed widthBits=1 + alpha) — 0-bit diff vs dwebp
+    const vp8lPalRaw = Buffer.from(
+      "UklGRmAAAABXRUJQVlA4TFQAAAAvCgACEDcgECD850mwYmJGpkcgkGQw+soJ/G6wjWSrrSx9/odYrgJc7HNfgKiASBH9Dxf1jmx9wmwCrPyE5nTWzI/XSdiydIs4zJX5mGYdouCZfwQ=",
+      "base64",
+    );
+    const vp8lPalDec = decodeWebp(vp8lPalRaw);
+    expect(vp8lPalDec?.width).toBe(11);
+    expect(vp8lPalDec?.height).toBe(9);
+    expect(sha256Hex(vp8lPalDec!.rgba)).toBe(
+      "51e68fce6c327f50a2dbef04fd67e74d5d0aaa7523d6a3eb15e5c3705dbce642",
+    );
+
+    // 3. VP8 lossy keyframe (17x15) — exact pixel match vs dwebp
+    const vp8Raw = Buffer.from(
+      "UklGRmgAAABXRUJQVlA4IFwAAAAQBACdASoRAA8APm0skkWkIqGYBABABsS1AE6ZQjgPcAAszmJ/mU7BQAD+ozRRvxnjc/SrOwiEd5zuI3/5ciSbLukfLJg2f/1C8bYC6kh9zVE6DkueWiRotQgAAA==",
+      "base64",
+    );
+    const vp8Dec = decodeWebp(vp8Raw);
+    expect(vp8Dec?.width).toBe(17);
+    expect(vp8Dec?.height).toBe(15);
+    expect(sha256Hex(vp8Dec!.rgba)).toBe(
+      "385407d49a4e38381abaca59fc5c8b80374d6c9c9136eeaa9d15f09e6a060115",
+    );
+
+    // 4. VP8X + ALPH extended still (16x16 compressed + gradient-filtered alpha) — exact match vs dwebp
+    const vp8xAlphRaw = Buffer.from(
+      "UklGRpAAAABXRUJQVlA4WAoAAAAQAAAADwAADwAAQUxQSBcAAAABuQpE9D+gtG0Dpmz+f3NhacQEJNaiuwBWUDggUgAAADACAJ0BKhAAEAABQCYlsAJ0ugADO5Rju9VgAP79YIwDvanxHSNbNMlxOm4HTWIyTvY7RIcP/XJmpPtH3ii3PezqTv98Ef3C9/P+tPzh5/mMAAA=",
+      "base64",
+    );
+    const vp8xAlphDec = decodeWebp(vp8xAlphRaw);
+    expect(vp8xAlphDec?.width).toBe(16);
+    expect(vp8xAlphDec?.height).toBe(16);
+    expect(sha256Hex(vp8xAlphDec!.rgba)).toBe(
+      "4aa8b0e450c8a6690e9cb12d5c66c9f9b26f324f0b06b9f2eaa211601ace7ac3",
+    );
+    expect(decodeImageRgba(vp8xAlphRaw)?.rgba).toEqual(vp8xAlphDec!.rgba);
+
+    // 5. Oversized noisy WebP (2004x1200) -> PNG exceeds 5 MiB -> falls back to image/jpeg
+    const encodeUncompressedVp8lWebp = (w: number, h: number, rgba: Uint8Array): Uint8Array => {
+      const rev8 = new Uint8Array(256);
+      for (let i = 0; i < 256; i += 1) {
+        let v = i, r = 0;
+        for (let b = 0; b < 8; b += 1) { r = (r << 1) | (v & 1); v >>>= 1; }
+        rev8[i] = r;
+      }
+      const bits: number[] = [];
+      const push = (val: number, n: number): void => {
+        for (let i = 0; i < n; i += 1) bits.push((val >>> i) & 1);
+      };
+      push(w - 1, 14); push(h - 1, 14); push(0, 1); push(0, 3);
+      push(0, 1); push(0, 1); push(0, 1); // no transform, no cache, no meta
+      // G, R, B: normal Huffman where symbols 0..255 all have length 8 (clLengths[8] = 1, max_symbol = 256)
+      for (let ch = 0; ch < 3; ch += 1) {
+        push(0, 1); // normal
+        push(8, 4); // numCodeLengths = 12 (covers index 11 -> codeLen 8)
+        for (let k = 0; k < 12; k += 1) push(k === 11 ? 1 : 0, 3);
+        push(1, 1); push(3, 3); push(254, 8); // length_nbits=8, max_symbol = 2 + 254 = 256
+      }
+      push(1, 1); push(0, 1); push(1, 1); push(255, 8); // A = 255
+      push(1, 1); push(0, 1); push(0, 1); push(0, 1); // Dist = 0
+      const headerByteLen = 1 + Math.ceil(bits.length / 8);
+      // Pad to byte boundary? No, emit packed bits directly via small byte writer:
+      const totalBits = bits.length + w * h * 24;
+      const vp8lPayload = new Uint8Array(1 + Math.ceil(totalBits / 8));
+      vp8lPayload[0] = 0x2f;
+      let bitPos = 0;
+      for (let i = 0; i < bits.length; i += 1) {
+        if (bits[i]!) vp8lPayload[1 + (bitPos >> 3)]! |= 1 << (bitPos & 7);
+        bitPos += 1;
+      }
+      for (let p = 0; p < w * h; p += 1) {
+        const g = rev8[rgba[p * 4 + 1]!]!;
+        const r = rev8[rgba[p * 4]!]!;
+        const b = rev8[rgba[p * 4 + 2]!]!;
+        const trio = g | (r << 8) | (b << 16);
+        const byteIdx = 1 + (bitPos >> 3);
+        const shift = bitPos & 7;
+        vp8lPayload[byteIdx]! |= (trio << shift) & 0xff;
+        vp8lPayload[byteIdx + 1]! |= (trio >>> (8 - shift)) & 0xff;
+        vp8lPayload[byteIdx + 2]! |= (trio >>> (16 - shift)) & 0xff;
+        if (shift > 0) vp8lPayload[byteIdx + 3]! |= (trio >>> (24 - shift)) & 0xff;
+        bitPos += 24;
+      }
+      void headerByteLen;
+      const pad = vp8lPayload.length & 1;
+      const riffSize = 12 + vp8lPayload.length + pad;
+      const out = new Uint8Array(8 + riffSize);
+      out.set(Buffer.from("RIFF"), 0);
+      new DataView(out.buffer).setUint32(4, riffSize, true);
+      out.set(Buffer.from("WEBP"), 8);
+      out.set(Buffer.from("VP8L"), 12);
+      new DataView(out.buffer).setUint32(16, vp8lPayload.length, true);
+      out.set(vp8lPayload, 20);
+      return out;
+    };
+
+    const noisyWebp = encodeUncompressedVp8lWebp(2004, 1200, makeNoisyRgba(2004, 1200));
+    const noisyWebpB64 = Buffer.from(noisyWebp).toString("base64");
+    const fittedNoisyWebp = fitInlineImage("image/webp", noisyWebpB64);
+    expect(fittedNoisyWebp.mediaType).toBe("image/jpeg");
+    expect(fittedNoisyWebp.data.length).toBeLessThanOrEqual(MAX_INLINE_IMAGE_BASE64_BYTES);
+    expect(readImageDimensions(Buffer.from(fittedNoisyWebp.data, "base64"))).toEqual({
+      width: 2000,
+      height: 1198,
+      format: "jpeg",
+    });
+
+    // 6. Animated VP8X (animation flag 0x02 + ANMF chunk) passes through byte-for-byte
+    const animChunkPayload = new Uint8Array(16); // minimal ANMF header
+    const animRiffSize = 4 + 18 + 8 + animChunkPayload.length;
+    const animWebp = new Uint8Array(8 + animRiffSize);
+    animWebp.set(Buffer.from("RIFF"), 0);
+    new DataView(animWebp.buffer).setUint32(4, animRiffSize, true);
+    animWebp.set(Buffer.from("WEBP"), 8);
+    animWebp.set(Buffer.from("VP8X"), 12);
+    new DataView(animWebp.buffer).setUint32(16, 10, true);
+    animWebp[20] = 0x02; // animation flag
+    animWebp[24] = 0xb7; animWebp[25] = 0x0b; // width = 3000
+    animWebp[27] = 0xdb; animWebp[28] = 0x05; // height = 1500
+    animWebp.set(Buffer.from("ANMF"), 30);
+    new DataView(animWebp.buffer).setUint32(34, animChunkPayload.length, true);
+    expect(decodeWebp(animWebp)).toBeNull();
+    const animB64 = Buffer.from(animWebp).toString("base64");
+    expect(fitInlineImage("image/webp", animB64)).toEqual({
+      mediaType: "image/webp",
+      data: animB64,
+    });
+
+    // 7. Truncated, corrupted, and maxHoldBytes-exceeding WebP inputs return null without throwing
+    expect(decodeWebp(vp8lRaw.subarray(0, vp8lRaw.length - 10))).toBeNull();
+    expect(decodeWebp(vp8Raw.subarray(0, 25))).toBeNull();
+    expect(decodeWebp(vp8lRaw, 512)).toBeNull(); // raw + ARGB/RGBA buffers exceed 512-byte budget
+
+    const forgedBombWebp = new Uint8Array(vp8xAlphRaw);
+    forgedBombWebp[24] = 0x0f; forgedBombWebp[25] = 0x27; forgedBombWebp[26] = 0x00; // width = 10000
+    forgedBombWebp[27] = 0x0f; forgedBombWebp[28] = 0x27; forgedBombWebp[29] = 0x00; // height = 10000
+    const forgedBombB64 = Buffer.from(forgedBombWebp).toString("base64");
+    expect(fitInlineImage("image/webp", forgedBombB64)).toEqual({
+      mediaType: "image/webp",
+      data: forgedBombB64,
     });
   });
 

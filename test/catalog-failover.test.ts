@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import plugin from "../src/index";
 import type { AccountDescriptor } from "../src/types";
+import { getAgyBinaryFingerprint } from "../src/accounts/env";
+import { withEnv } from "./fixtures/helpers";
 import {
   CatalogService,
   STATIC_FALLBACK_MODELS,
@@ -335,5 +337,128 @@ describe("Per-account catalog & loader isolation", () => {
     expect(resBForFlash.status).toBe(400);
     const bodyB: any = await resBForFlash.json();
     expect(bodyB?.error?.message).toContain("Unknown or unavailable Antigravity model");
+  });
+});
+
+async function catalogCheckpoint(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("Catalog checkpoint timed out");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+function catalogAccount(name: string): AccountDescriptor {
+  const home = path.join(TEMP_ROOT, name);
+  fs.mkdirSync(home, { recursive: true });
+  return { accountRef: crypto.randomUUID(), slotKey: name, mode: "isolated", label: name, isolatedHomeDir: home };
+}
+
+function catalogProbe(bin: string, log: string, model: string, delay: number, fail = false): void {
+  fs.writeFileSync(bin, `#!${process.execPath}
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(log)}, "start ${model}\\n");
+setTimeout(() => {
+  fs.appendFileSync(${JSON.stringify(log)}, "end ${model}\\n");
+  ${fail ? "process.exit(1);" : `console.log(${JSON.stringify(`${model}\t${model}`)});`}
+}, ${delay});
+`, { mode: 0o755 });
+}
+
+describe("Catalog refresh cancellation and binary fencing", () => {
+  test("caller abort is local, pre-aborted calls do not probe, and abandoned callers leave a bounded refresh running", async () => {
+    const bin = path.join(TEMP_ROOT, "abort-catalog-probe");
+    const log = path.join(TEMP_ROOT, "abort-catalog.log");
+    catalogProbe(bin, log, "gemini-live-medium", 180);
+    await withEnv({ AGY_PATH: bin }, async () => {
+      const svc = new CatalogService(), account = catalogAccount("abort-catalog");
+      const a = new AbortController();
+      const first = svc.getCatalogWithMeta(account, { signal: a.signal });
+      const second = svc.getCatalogWithMeta(account);
+      await catalogCheckpoint(() => fs.existsSync(log));
+      a.abort();
+      expect((await first).fellBack).toBe(true);
+      const live = await second;
+      expect(live.fellBack).toBe(false);
+      expect(live.catalog.rawIds.has("gemini-live-medium")).toBe(true);
+      expect(fs.readFileSync(log, "utf8").match(/start/g)).toHaveLength(1);
+      const pre = new AbortController(); pre.abort();
+      const preFresh = await svc.getCatalogWithMeta(account, { signal: pre.signal });
+      expect(preFresh.fellBack).toBe(true);
+      expect(preFresh.catalog).toBe(live.catalog);
+      await svc.getCatalogWithMeta(catalogAccount("pre-aborted-catalog"), { signal: pre.signal });
+      expect(fs.readFileSync(log, "utf8").match(/start/g)).toHaveLength(1);
+
+      const backgroundAccount = catalogAccount("background-catalog");
+      const b = new AbortController(), c = new AbortController();
+      const third = svc.getCatalogWithMeta(backgroundAccount, { signal: b.signal });
+      const fourth = svc.getCatalogWithMeta(backgroundAccount, { signal: c.signal });
+      await catalogCheckpoint(() => fs.readFileSync(log, "utf8").match(/start/g)?.length === 2);
+      b.abort(); c.abort();
+      expect((await third).fellBack).toBe(true);
+      expect((await fourth).fellBack).toBe(true);
+      // Catalog probes are intentionally not owned by callers: no one caller,
+      // or collection of short-lived callers, can cancel the bounded refresh.
+      const completed = await svc.getCatalogWithMeta(backgroundAccount);
+      expect(completed.fellBack).toBe(false);
+      expect(fs.readFileSync(log, "utf8").match(/start/g)).toHaveLength(2);
+    });
+  });
+
+  test("in-place binary size/mtime changes refresh immediately and failed upgrades retain real catalogs without refreshing their fingerprint", async () => {
+    const bin = path.join(TEMP_ROOT, "upgrade-catalog-probe");
+    const log = path.join(TEMP_ROOT, "upgrade-catalog.log");
+    catalogProbe(bin, log, "gemini-original-medium", 0);
+    await withEnv({ AGY_PATH: bin }, async () => {
+      const svc = new CatalogService(), account = catalogAccount("upgrade-catalog");
+      const original = await svc.getCatalogWithMeta(account);
+      expect(original.fellBack).toBe(false);
+      const fingerprint = getAgyBinaryFingerprint();
+      catalogProbe(bin, log, "gemini-upgraded-long-name-medium", 0);
+      expect(getAgyBinaryFingerprint()).not.toBe(fingerprint);
+      const upgraded = await svc.getCatalogWithMeta(account);
+      expect(upgraded.fellBack).toBe(false);
+      expect(upgraded.catalog.rawIds.has("gemini-upgraded-long-name-medium")).toBe(true);
+      const beforeMtime = getAgyBinaryFingerprint();
+      const newMtime = new Date(Date.now() + 10_000);
+      fs.utimesSync(bin, newMtime, newMtime);
+      expect(getAgyBinaryFingerprint()).not.toBe(beforeMtime);
+      const mtimeRefreshed = await svc.getCatalogWithMeta(account);
+      expect(mtimeRefreshed.fellBack).toBe(false);
+      expect(fs.readFileSync(log, "utf8").match(/start/g)).toHaveLength(3);
+
+      catalogProbe(bin, log, "failed-upgrade", 0, true);
+      for (let i = 0; i < 2; i++) {
+        const failed = await svc.getCatalogWithMeta(account);
+        expect(failed.fellBack).toBe(true);
+        expect(failed.catalog).toBe(mtimeRefreshed.catalog);
+        expect(failed.catalog.rawIds.has("gemini-upgraded-long-name-medium")).toBe(true);
+      }
+      // A failed probe must not mark the old catalog fresh for the new binary.
+      expect(fs.readFileSync(log, "utf8").match(/start/g)).toHaveLength(5);
+    });
+    await withEnv({ AGY_PATH: path.join(TEMP_ROOT, "missing-binary") }, () => {
+      expect(getAgyBinaryFingerprint()).toBe("missing");
+    });
+  });
+
+  test("an old-binary refresh neither publishes nor clears a newer in-flight generation", async () => {
+    const bin = path.join(TEMP_ROOT, "generation-catalog-probe");
+    const log = path.join(TEMP_ROOT, "generation-catalog.log");
+    catalogProbe(bin, log, "gemini-old-medium", 100);
+    await withEnv({ AGY_PATH: bin }, async () => {
+      const svc = new CatalogService(), account = catalogAccount("generation-catalog");
+      const old = svc.getCatalogWithMeta(account);
+      await catalogCheckpoint(() => fs.existsSync(log));
+      catalogProbe(bin, log, "gemini-new-long-medium", 300);
+      const fresh = svc.getCatalogWithMeta(account);
+      expect((await old).catalog.rawIds.has("gemini-old-medium")).toBe(true);
+      const joined = svc.getCatalogWithMeta(account);
+      const [newResult, joinedResult] = await Promise.all([fresh, joined]);
+      expect(newResult.catalog.rawIds.has("gemini-new-long-medium")).toBe(true);
+      expect(joinedResult.catalog).toBe(newResult.catalog);
+      expect((await svc.getCatalogWithMeta(account)).catalog).toBe(newResult.catalog);
+      expect(fs.readFileSync(log, "utf8").match(/start/g)).toHaveLength(2);
+    });
   });
 });

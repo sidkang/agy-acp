@@ -1,4 +1,5 @@
 import { BridgeHttpError, type TurnStreamEvent } from "../types";
+import { splitAgentRetryNotices } from "./diagnostics";
 
 /**
  * The per-turn event plumbing of a session worker, in one place.
@@ -19,6 +20,13 @@ import { BridgeHttpError, type TurnStreamEvent } from "../types";
 
 /** 16 MiB is far above any legitimate single-turn event burst for this bridge. */
 export const DEFAULT_MAX_TURN_QUEUE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Ceiling on text held while waiting for log corroboration of a retry notice.
+ * A real notice burst is a few hundred bytes; past this the hold stops and the
+ * text is delivered, so a hostile or chatty stream cannot buffer without bound.
+ */
+const MAX_NOTICE_HOLD_BYTES = 4096;
 
 const DEFAULT_EVENT_OVERHEAD_BYTES = 128;
 
@@ -174,6 +182,9 @@ export class TurnContext {
   private thinking = "";
   private held = "";
   private prompt: Promise<any> | null = null;
+  private delivered = false;
+  private retryNotices = 0;
+  private noticeTail = "";
 
   /**
    * While true, `session/update` text is dropped and prompt callbacks only bank
@@ -210,6 +221,68 @@ export class TurnContext {
     return this.thinking;
   }
 
+  /**
+   * True once this turn has handed the caller anything the model actually
+   * produced (text, thought or a tool call). Suppressed `agy` retry notices do
+   * not count: they are diagnostics, not work that a retry would lose.
+   */
+  get deliveredWork(): boolean {
+    return this.delivered;
+  }
+
+  /** `agy` retry notices seen in this turn's stream so far. */
+  get upstreamRetryNotices(): number {
+    return this.retryNotices;
+  }
+
+  /**
+   * Holds a notice fragment that arrived split across two chunks, and counts the
+   * complete notices of the chunk that just arrived.
+   */
+  absorbRetryNotices(chunk: string): { text: string; notices: number } {
+    const scan = splitAgentRetryNotices(this.noticeTail + chunk);
+    this.noticeTail = scan.hold;
+    this.retryNotices += scan.count;
+    return { text: scan.text, notices: scan.count };
+  }
+
+  /** Text held while the turn's log is asked whether `agy` really retried. */
+  get pendingNoticeText(): string {
+    return this.noticeTail;
+  }
+
+  /**
+   * Holds notice-shaped text instead of delivering it, so a log record that
+   * becomes readable one chunk later can still turn the whole burst into
+   * notices. Refuses (and the caller delivers it as answer text) once the hold
+   * would pass {@link MAX_NOTICE_HOLD_BYTES}.
+   */
+  holdNoticeCandidate(text: string): boolean {
+    if (this.noticeTail.length + text.length > MAX_NOTICE_HOLD_BYTES) {
+      return false;
+    }
+    this.noticeTail += text;
+    return true;
+  }
+
+  /**
+   * Marker for work that reaches the caller without passing through
+   * `pushEvent` (the tool-call batch is pushed straight onto the turn queue).
+   */
+  markDelivered(): void {
+    this.delivered = true;
+  }
+
+  /**
+   * Hands back a held notice fragment. Call it when the turn's text is flushed:
+   * a fragment held at the very end of a stream is answer text, not a notice.
+   */
+  flushRetryNoticeHold(): string {
+    const hold = this.noticeTail;
+    this.noticeTail = "";
+    return hold;
+  }
+
   get pendingPrompt(): Promise<any> | null {
     return this.prompt;
   }
@@ -232,6 +305,9 @@ export class TurnContext {
   ): AsyncEventQueue<TurnStreamEvent> {
     this.thinking = "";
     this.held = "";
+    this.delivered = false;
+    this.retryNotices = 0;
+    this.noticeTail = "";
     const queue = new AsyncEventQueue<TurnStreamEvent>({
       maxBufferedBytes: options.maxBufferedBytes,
       onOverflow: options.onOverflow,
@@ -266,6 +342,14 @@ export class TurnContext {
   }
 
   pushEvent(event: TurnStreamEvent): void {
+    if (event.type === "text_delta") {
+      // Whitespace alone is not work: it is what a stripped retry notice leaves.
+      if (String(event.text ?? "").trim() !== "") this.delivered = true;
+    } else if (event.type === "thinking_delta") {
+      if (String(event.thinking ?? "").trim() !== "") this.delivered = true;
+    } else if (event.type === "tool_use") {
+      this.delivered = true;
+    }
     this.quietQueue?.push(event);
   }
 
@@ -275,6 +359,7 @@ export class TurnContext {
    */
   appendThinking(delta: string): void {
     this.thinking += delta;
+    if (delta.trim() !== "") this.delivered = true;
     this.quietQueue?.push({ type: "thinking_delta", thinking: delta });
   }
 

@@ -59,7 +59,7 @@ magpie quota agy-acp
 
 | 开关 | 默认值 | 说明 |
 |---|---|---|
-| `quota_routing` | `false` | 将 5 小时 / 周配额接入 Magpie 路由，单账号耗尽时自动切到其他账号 |
+| `quota_routing` | `true` | 将 5 小时 / 周配额接入 Magpie 路由，单账号耗尽时自动切到其他账号 |
 | `cloak_prompts` | `true` | 剥离旋转计费头并对触发上游伪 429 的第三方客户端标识句做零宽字符脱敏 |
 | `minimal_agent` | `false` | 为隔离桥接 Agent 开启 `excludeDefaultComponents`，精简内置系统提示词开销 |
 | `expose_thinking` | `true` | 将 ACP 思考摘要作为 Anthropic `thinking` 块返回 |

@@ -18,9 +18,12 @@ import { measureProcessTreeRssBytes } from "./rss";
 import {
   CONTEXT_BUDGET_FAILURE_MESSAGE,
   GENERIC_FAILURE_MESSAGE,
+  TRANSIENT_LIMIT_FAILURE_MESSAGE,
   TurnLogWatch,
   classifyAgentFailure,
   extractErrorEvidence,
+  hasUpstreamRetryEvidence,
+  looksLikeAgentRetryNotice,
   stderrDelta,
 } from "./diagnostics";
 import {
@@ -105,6 +108,18 @@ const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n";
 /** `ps`-based RSS sampling is throttled to this window on non-Linux hosts. */
 const RSS_SAMPLE_COOLDOWN_MS = 10_000;
 const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim();
+
+/**
+ * How many `agy` retry notices a turn may emit before it is ended as a
+ * transient limit, while it has delivered nothing the caller could lose.
+ *
+ * `agy` retries a per-minute `429` in-process with exponential backoff: eight
+ * observed attempts spanned ~8 minutes, well past the 300s client timeout that
+ * pi and most agents use, so a caller saw one dead turn and then a cooled key
+ * instead of a quick failover. Two notices (≈12s of backoff) is long enough to
+ * let a blip recover and short enough to keep the caller inside its own timeout.
+ */
+const MAX_UPSTREAM_RETRY_NOTICES = 2;
 
 function flattenOptions(opts: any[]): any[] {
   const result: any[] = [];
@@ -282,6 +297,8 @@ export class AgySessionWorker {
    * the worker down so its native session state is never reused half-written.
    */
   private createTurnQueue(): AsyncEventQueue<TurnStreamEvent> {
+    this.retryStormAborted = false;
+    this.upstreamRetryCorroborated = false;
     return this.turn.beginTurnQueue({
       maxBufferedBytes: this.options.maxTurnBufferBytes,
       onOverflow: () => {
@@ -310,6 +327,10 @@ export class AgySessionWorker {
   private readonly toolCommitWaiters = new Set<() => void>();
   private turnLogs: TurnLogWatch | null = null;
   private turnStderrBaseline: string = "";
+  /** One retry-storm abort per turn; later notices of the same turn are moot. */
+  private retryStormAborted = false;
+  /** Set once this turn's log proves `agy` retried upstream (see diagnostics). */
+  private upstreamRetryCorroborated = false;
   private readonly ownsWorkspaceDir: boolean;
 
   constructor(
@@ -730,7 +751,9 @@ export class AgySessionWorker {
 
   private handleSessionUpdate(rawParams: any): void {
     if (!rawParams) return;
-    if (this.turn.suppressingSteerCancel) {
+    // A steered-cancel turn and an aborted retry-storm turn both drop output:
+    // the caller was already told, or is about to be, that this turn is over.
+    if (this.turn.suppressingSteerCancel || this.retryStormAborted) {
       const update = rawParams?.update ?? rawParams;
       if (update?.sessionUpdate === "tool_call_update") {
         const callId = update.toolCallId ?? update.id;
@@ -757,7 +780,37 @@ export class AgySessionWorker {
       const chunk = update.content?.text ?? update.text ?? "";
       if (!chunk) return;
 
-      let text = this.turn.heldText + chunk;
+      // `agy` streams its own retry notices into the reply. They are
+      // diagnostics, not model output, so they are counted and kept out of the
+      // answer; a storm of them ends the turn as a transient limit. A model can
+      // also *quote* the same lines ("explain this error"), so nothing is
+      // stripped, counted or cancelled unless this turn's own log says `agy`
+      // really retried. That record may land one chunk late, so a notice-shaped
+      // chunk is held rather than delivered while the question is open.
+      // A held candidate plus this chunk decides together: the second half of a
+      // split notice is usually ordinary prose on its own.
+      const pending = this.turn.pendingNoticeText;
+      const looksNotice = looksLikeAgentRetryNotice(pending + chunk);
+      if (looksNotice && !this.upstreamRetryCorroborated) {
+        // Reading the turn log is only worth it when a notice is in play.
+        this.hasCorroboratedUpstreamRetry();
+      }
+
+      let absorbed: { text: string; notices: number } = { text: "", notices: 0 };
+      if (this.upstreamRetryCorroborated) {
+        absorbed = this.turn.absorbRetryNotices(chunk);
+      } else if (
+        looksNotice &&
+        !this.turn.deliveredWork &&
+        this.turn.holdNoticeCandidate(chunk)
+      ) {
+        return;
+      } else {
+        // Anything held while in doubt is answer text now.
+        absorbed.text = this.turn.flushRetryNoticeHold() + chunk;
+      }
+
+      let text = this.turn.heldText + absorbed.text;
       this.turn.heldText = "";
 
       const marker = text.lastIndexOf(AGENT_ERROR_CORE);
@@ -784,7 +837,14 @@ export class AgySessionWorker {
         }
       }
 
+      // Deliver whatever text survived this chunk first: a chunk that also
+      // carried real output has already given the caller something, so the
+      // storm guard below must see it and stand down.
       if (text) this.turn.pushEvent({ type: "text_delta", text });
+
+      if (absorbed.notices > 0 && this.shouldAbortUpstreamRetryStorm()) {
+        this.abortUpstreamRetryStorm();
+      }
     } else if (updateType === "agent_thought_chunk") {
       const thinking = update.content?.text ?? update.text ?? "";
       if (
@@ -870,6 +930,24 @@ export class AgySessionWorker {
     }
   }
 
+  /**
+   * True once this turn's raw log (unfiltered, `I` records included) shows
+   * `agy` retrying upstream. Checked lazily the first time a notice-shaped line
+   * arrives in the stream, then cached for the rest of the turn.
+   */
+  private hasCorroboratedUpstreamRetry(): boolean {
+    if (this.upstreamRetryCorroborated) return true;
+    try {
+      const watch = this.turnLogs ?? new TurnLogWatch(this.workspaceDir);
+      this.upstreamRetryCorroborated = hasUpstreamRetryEvidence(
+        watch.readTurnEvidence(),
+      );
+    } catch {
+      this.upstreamRetryCorroborated = false;
+    }
+    return this.upstreamRetryCorroborated;
+  }
+
   private diagnoseTerminationError(
     rawErr?: unknown,
   ): Extract<TurnStreamEvent, { type: "error" }> {
@@ -932,6 +1010,20 @@ export class AgySessionWorker {
           errorType: "rate_limit_error",
           message: "Account quota exhausted",
         };
+      case "rate_limit":
+        // A `429` that names no spent window: `agy` retries these in-process, so
+        // this is what a busy minute looks like. Reported as a plain `429` with
+        // text free of quota wording, so Magpie rests the account briefly and
+        // asks the next one instead of holding it for its whole window.
+        if (turnsAway(this.systemPrompt) && !this.options.cloakPrompts) {
+          return {
+            type: "error",
+            status: 400,
+            errorType: "invalid_request_error",
+            message: refusalHint(this.systemPrompt),
+          };
+        }
+        return this.transientLimitError();
       case "invalid_request":
         return {
           type: "error",
@@ -950,6 +1042,73 @@ export class AgySessionWorker {
           message: GENERIC_FAILURE_MESSAGE,
         };
     }
+  }
+
+  /**
+   * The turn is only spinning through `agy`'s in-process retry ladder: at least
+   * {@link MAX_UPSTREAM_RETRY_NOTICES} notices seen and nothing delivered yet, so
+   * ending it loses no work the caller could have had.
+   */
+  private shouldAbortUpstreamRetryStorm(): boolean {
+    return (
+      !this.retryStormAborted &&
+      !this.turn.deliveredWork &&
+      this.turn.upstreamRetryNotices >= MAX_UPSTREAM_RETRY_NOTICES
+    );
+  }
+
+  /** The fixed `429` event for a transient upstream limit (see the message doc). */
+  private transientLimitError(): Extract<TurnStreamEvent, { type: "error" }> {
+    return {
+      type: "error",
+      status: 429,
+      errorType: "rate_limit_error",
+      message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+    };
+  }
+
+  /**
+   * Ends a turn that is still retrying upstream instead of waiting out `agy`'s
+   * full ladder (~8 minutes, far past the client's own timeout). `agy` is told to
+   * cancel so the worker stays reusable, and the caller gets a plain `429` it can
+   * fail over on.
+   */
+  private abortUpstreamRetryStorm(): void {
+    if (this._state !== "GENERATING" || this.retryStormAborted) return;
+    this.retryStormAborted = true;
+
+    // Detach the turn's queue *before* cancelling. `agy` settles the cancelled
+    // `session/prompt` as an error (`context canceled`) whose only log evidence
+    // is the `I`-severity retry records, so letting that settlement finish the
+    // turn would report a generic 500 and climb the caller's failure backoff.
+    // Taking the queue also means nothing `agy` streams while the cancel travels
+    // can reach the caller ahead of the `429`.
+    const queue = this.turn.takeQueue();
+    const prompt = this.turn.pendingPrompt;
+    this.turn.nextPromptEpoch();
+
+    try {
+      this.conn.notify("session/cancel", {
+        sessionId: this.nativeSessionId,
+      });
+      this.broker.cancelAll("Upstream retry storm");
+    } catch {}
+
+    void (async () => {
+      // Wait for the native cancel so a retry on this worker does not meet a
+      // stale GENERATING state, then hand over the fixed error and close.
+      const settled = await this.settleOrTimeout(prompt, 1500);
+      this.turn.pendingPrompt = null;
+      if (queue) {
+        queue.push(this.transientLimitError());
+        queue.close();
+      }
+      if (!settled) {
+        await this.close("retry_storm_cancel_timeout");
+      } else if (this._state === "GENERATING") {
+        this.setState("IDLE");
+      }
+    })();
   }
 
   private handleFatalToolLoop(reason: string): void {
@@ -982,6 +1141,7 @@ export class AgySessionWorker {
 
     // 2. Yield tool_use events
     for (const call of calls) {
+      this.turn.markDelivered();
       q.push({
         type: "tool_use",
         id: call.id,
@@ -1206,6 +1366,10 @@ export class AgySessionWorker {
       return;
     }
 
+    // A notice fragment held back for the next chunk belongs to the answer when
+    // the stream ends here, so it is flushed with the rest of the held text.
+    this.turn.heldText = this.turn.heldText + this.turn.flushRetryNoticeHold();
+
     if (this.turn.heldText) {
       this.turn.pushEvent({ type: "text_delta", text: this.turn.heldText });
       this.turn.heldText = "";
@@ -1416,6 +1580,7 @@ export class AgySessionWorker {
           this.broker.cancelAll("Skipped due to user steering message");
         } else {
           for (const call of delivery.newlyExposedCalls) {
+            this.turn.markDelivered();
             yield {
               type: "tool_use",
               id: call.id,

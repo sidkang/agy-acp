@@ -8,11 +8,11 @@
  * `2000` px a side, JPEG written again as JPEG at quality 85, any other format as
  * PNG, then as JPEG at a lower quality if that still exceeds `5 MiB` of base64.
  *
- * This module is the same policy without a dependency: a small PNG/JPEG/GIF decoder
- * (enough to get RGBA pixels out of anything a tool result can carry), an area-average
- * downscaler, and PNG/baseline-JPEG encoders. WebP is probed for its dimensions but
- * not decoded: like the Go implementation, an unreadable format is passed through
- * untouched rather than corrupted.
+ * This module is the same policy without a dependency: small PNG/JPEG/GIF/WebP
+ * decoders (enough to get RGBA pixels out of anything a tool result can carry),
+ * an area-average downscaler, and PNG/baseline-JPEG encoders. Animated WebP and
+ * any unreadable or malformed input are passed through untouched rather than
+ * corrupted.
  *
  * The image that already fits is never touched, byte for byte, and an image this
  * module cannot read is likewise returned exactly as it arrived: a wrong re-encode
@@ -26,6 +26,7 @@
 import { createHash } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
 import type { NormalizedContentPart } from "../types";
+import { decodeWebp } from "./webp";
 
 export type ImageMediaType = Extract<
   NormalizedContentPart,
@@ -1647,10 +1648,17 @@ function decodeCheckedImageRgba(raw: Uint8Array, dimensions: ImageDimensions): R
         return decodeJpeg(raw);
       case "gif":
         return decodeGif(raw);
-      case "webp":
-        // WebP needs a VP8 decoder this module does not carry; the image is
-        // passed through untouched instead of being corrupted.
-        return null;
+      case "webp": {
+        const decoded = decodeWebp(raw, MAX_DECODE_HOLD_BYTES);
+        if (
+          decoded === null ||
+          decoded.width !== dimensions.width ||
+          decoded.height !== dimensions.height
+        ) {
+          return null;
+        }
+        return decoded;
+      }
     }
   } catch {
     return null;
@@ -1658,7 +1666,7 @@ function decodeCheckedImageRgba(raw: Uint8Array, dimensions: ImageDimensions): R
 }
 
 /**
- * Decodes any PNG, JPEG or GIF this module understands into RGBA8.
+ * Decodes any PNG, JPEG, GIF or still WebP this module understands into RGBA8.
  *
  * Never throws: image bytes are untrusted caller input, so an unexpected
  * allocation or malformed chunk surfaces as `null` (the image is passed

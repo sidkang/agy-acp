@@ -18,7 +18,7 @@ export class UsageError extends Error {
 
 export interface QuotaWindow {
   name: string;
-  /** Magpie host.js bucket pool: "Gemini" or "Claude & GPT". */
+  /** Stable vendor pool label or a specific/versioned model pool name. */
   pool: string;
   aside: boolean;
   used: number | null;
@@ -112,13 +112,78 @@ export function formatCodeAssistPlan(load: unknown): string | undefined {
   return label || undefined;
 }
 
+/** A flight belongs to its active callers, not to the first caller's signal. */
+interface SharedFlight<T> {
+  promise: Promise<T>;
+  controller: AbortController;
+  activeWaiters: number;
+  abandoned: boolean;
+  settled: boolean;
+  onAbandon: () => void;
+}
+
+function createSharedFlight<T>(
+  task: (signal: AbortSignal) => Promise<T>,
+  failureValue: T,
+  onAbandon: () => void,
+  publish: (value: T) => void,
+  finish: () => void,
+): SharedFlight<T> {
+  const flight: SharedFlight<T> = {
+    promise: undefined!,
+    controller: new AbortController(),
+    activeWaiters: 0,
+    abandoned: false,
+    settled: false,
+    onAbandon,
+  };
+  // Defer execution until the entry and its initial waiter are registered.
+  flight.promise = Promise.resolve()
+    .then(() => task(flight.controller.signal))
+    .catch(() => failureValue)
+    .then((value) => {
+      flight.settled = true;
+      if (!flight.abandoned) publish(value);
+      return value;
+    })
+    .finally(finish);
+  return flight;
+}
+
+function waitForFlight<T>(
+  flight: SharedFlight<T>,
+  signal: AbortSignal | undefined,
+  abortValue: T,
+): Promise<T> {
+  flight.activeWaiters++;
+  return new Promise((resolve) => {
+    let done = false;
+    const complete = (value: T) => {
+      if (done) return;
+      done = true;
+      signal?.removeEventListener("abort", onAbort);
+      flight.activeWaiters--;
+      if (!flight.settled && flight.activeWaiters === 0) {
+        flight.abandoned = true;
+        flight.onAbandon();
+        flight.controller.abort();
+      }
+      resolve(value);
+    };
+    const onAbort = () => complete(abortValue);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    flight.promise.then(complete);
+  });
+}
+
 interface PlanCacheEntry {
   timestamp: number;
-  plan?: string;
-  inFlight?: Promise<string | undefined>;
+  plan: string;
 }
 
 const planCache = new Map<string, PlanCacheEntry>();
+const planInFlight = new Map<string, SharedFlight<string | undefined>>();
 const refreshedTokenCache = new Map<
   string,
   { accessToken: string; expiresAtMs: number }
@@ -199,21 +264,23 @@ export async function queryAccountPlan(
   account: AccountDescriptor,
   signal?: AbortSignal,
 ): Promise<string | undefined> {
+  if (signal?.aborted) return undefined;
   const key = `${account.accountRef}::${account.slotKey}`;
   const now = Date.now();
   pruneQuotaCaches(now);
   const existing = planCache.get(key);
-  if (existing?.plan && now - existing.timestamp < PLAN_CACHE_TTL_MS) {
+  if (existing && now - existing.timestamp < PLAN_CACHE_TTL_MS) {
     return existing.plan;
   }
-  if (existing?.inFlight) {
-    return await existing.inFlight;
+  const activeFlight = planInFlight.get(key);
+  if (activeFlight) {
+    return await waitForFlight(activeFlight, signal, undefined);
   }
 
   const creds = readStoredAgyOAuthCredentials(account);
   if (!creds) return undefined;
 
-  const task = (async (): Promise<string | undefined> => {
+  const task = async (signal: AbortSignal): Promise<string | undefined> => {
     try {
       const nowMs = Date.now();
       let tok =
@@ -247,24 +314,29 @@ export async function queryAccountPlan(
     } catch {
       return undefined;
     }
-  })();
+  };
 
-  const entry: PlanCacheEntry = { timestamp: now, inFlight: task };
-  planCache.set(key, entry);
-  try {
-    const plan = await task;
-    if (plan) {
-      entry.plan = plan;
-      entry.timestamp = Date.now();
-    } else if (planCache.get(key) === entry) {
-      planCache.delete(key);
-    }
-    return plan;
-  } finally {
-    delete entry.inFlight;
-    // Trim once the entry is settled so the map never rests above its cap.
-    pruneQuotaCaches(Date.now());
-  }
+  const flight = createSharedFlight(
+    task,
+    undefined,
+    () => {
+      if (planInFlight.get(key) === flight) planInFlight.delete(key);
+    },
+    (plan) => {
+      if (planInFlight.get(key) !== flight) return;
+      if (plan) {
+        planCache.set(key, { plan, timestamp: Date.now() });
+      } else {
+        planCache.delete(key);
+      }
+    },
+    () => {
+      if (planInFlight.get(key) === flight) planInFlight.delete(key);
+      pruneQuotaCaches(Date.now());
+    },
+  );
+  planInFlight.set(key, flight);
+  return await waitForFlight(flight, signal, undefined);
 }
 
 /**
@@ -377,29 +449,70 @@ export function parseUsageReport(
   const windows: QuotaWindow[] = [];
   const quotaRouting = Boolean(options.quotaRouting);
 
-  for (const group of groups) {
-    if (!group || typeof group !== "object") continue;
-    const rawName = String(
-      group["displayName"] || group["display_name"] || group["name"] || "Quota"
-    ).trim();
-    const pool = rawName.replace(/\s+models$/i, "").replace(/\s+and\s+/gi, " & ");
-    const poolLower = pool.toLowerCase();
-    // host.js expects a stable pool label, not the raw group display name.
-    const windowPool = poolLower.includes("gemini")
-      ? "Gemini"
-      : poolLower.includes("claude") || poolLower.includes("gpt")
-        ? "Claude & GPT"
-        : pool;
+  const broadPools: Record<string, string> = {
+    gemini: "Gemini",
+    "claude & gpt": "Claude & GPT",
+    claude: "Claude",
+    gpt: "GPT",
+  };
+  const validGroups = groups
+    .filter((group) => group && typeof group === "object" && Array.isArray(group.buckets))
+    .map((group) => {
+      const enabledBuckets = (group.buckets as unknown[]).filter(
+        (bucket): bucket is Record<string, any> => {
+          if (!bucket || typeof bucket !== "object") return false;
+          const id = String(
+            (bucket as Record<string, any>)["bucketId"] ||
+              (bucket as Record<string, any>)["bucket_id"] ||
+              (bucket as Record<string, any>)["id"] ||
+              ""
+          ).trim();
+          return Boolean(id) && (bucket as Record<string, any>)["disabled"] !== true;
+        }
+      );
+      const rawName = String(group.displayName || group.display_name || group.name || "Quota");
+      const pool = rawName
+        .trim()
+        .replace(/\s+/g, " ")
+        .replace(/\s+models$/i, "")
+        .replace(/\s+and\s+/gi, " & ")
+        .trim();
+      const poolLower = pool.toLowerCase();
+      return { enabledBuckets, pool, poolLower, poolModels: [] as string[] };
+    })
+    .filter((item) => item.enabledBuckets.length > 0);
+  const claimedBySpecificPool = new Set<string>();
+  const specificGroups = validGroups.filter(({ poolLower }) => !Object.hasOwn(broadPools, poolLower))
+    .sort((a, b) => b.poolLower.length - a.poolLower.length);
+  for (const item of specificGroups) {
+    item.poolModels = catalogModelIds.filter((id) => {
+      if (claimedBySpecificPool.has(id)) return false;
+      const normalized = id.toLowerCase().replace(/-/g, " ");
+      return normalized === item.poolLower || normalized.startsWith(item.poolLower + " ") ||
+        (item.poolLower === "gemini 4 argon" && id.toLowerCase() === "gemini-pro-orchestrator-argon");
+    });
+    for (const id of item.poolModels) claimedBySpecificPool.add(id);
+  }
+  const vendorPatterns: Record<string, RegExp> = {
+    gemini: /^gemini-/i,
+    "claude & gpt": /^(?:claude|gpt)-/i,
+    claude: /^claude-/i,
+    gpt: /^gpt-/i,
+  };
+  for (const item of validGroups) {
+    const pattern = Object.hasOwn(vendorPatterns, item.poolLower) ? vendorPatterns[item.poolLower] : undefined;
+    if (pattern) {
+      item.poolModels = catalogModelIds.filter((id) => !claimedBySpecificPool.has(id) && pattern.test(id));
+    }
+  }
 
-    const buckets = group["buckets"];
-    if (!Array.isArray(buckets)) continue;
+  for (const { enabledBuckets, pool, poolLower, poolModels } of validGroups) {
+    const windowPool = Object.hasOwn(broadPools, poolLower) ? broadPools[poolLower]! : pool;
 
-    for (const bucket of buckets) {
-      if (!bucket || typeof bucket !== "object") continue;
+    for (const bucket of enabledBuckets) {
       const id = String(
         bucket["bucketId"] || bucket["bucket_id"] || bucket["id"] || ""
       ).trim();
-      if (!id || bucket["disabled"] === true) continue;
 
       const label = String(
         bucket["displayName"] || bucket["display_name"] || bucket["name"] || id
@@ -407,16 +520,6 @@ export function parseUsageReport(
       const period = cadence(bucket, id, label);
       const fraction = extractRemainingFraction(bucket);
       const resetsAt = parseResetTime(bucket["reset_time"] ?? bucket["resetTime"]);
-
-      // Models scoping
-      let matchedModels: string[];
-      if (poolLower.includes("gemini")) {
-        matchedModels = catalogModelIds.filter((m) => /^gemini-/i.test(m));
-      } else if (poolLower.includes("claude") || poolLower.includes("gpt")) {
-        matchedModels = catalogModelIds.filter((m) => /^(?:claude|gpt)-/i.test(m));
-      } else {
-        matchedModels = catalogModelIds.filter((m) => m.toLowerCase().includes(poolLower));
-      }
 
       const windowName = windowPool ? period.name : `${pool} · ${period.name}`;
       // Unknown quota stays unmeasurable and aside: Magpie must never read it as
@@ -429,7 +532,7 @@ export function parseUsageReport(
             : Math.min(99.9, Math.max(0, Math.round((1 - fraction) * 100 * 10) / 10));
       // A pool with no catalog model to gate can never be an account-wide
       // routing block: Magpie would otherwise mark every model exhausted.
-      const aside = used === null || !quotaRouting || matchedModels.length === 0;
+      const aside = used === null || !quotaRouting || poolModels.length === 0;
 
       windows.push({
         name: windowName,
@@ -439,7 +542,7 @@ export function parseUsageReport(
         ...(used === null ? { display: "Limits not available" } : {}),
         ...(period.span ? { span: period.span } : {}),
         ...(resetsAt ? { resetsAt } : {}),
-        ...(matchedModels.length > 0 ? { models: matchedModels } : {}),
+        ...(!aside ? { models: [...poolModels] } : {}),
       });
     }
   }
@@ -456,11 +559,11 @@ export function parseUsageReport(
 
 interface CacheEntry {
   timestamp: number;
-  inFlight?: Promise<AccountUsageResult>;
-  data?: AccountUsageResult;
+  data: AccountUsageResult;
 }
 
 const usageCache = new Map<string, CacheEntry>();
+const usageInFlight = new Map<string, SharedFlight<AccountUsageResult>>();
 const CACHE_TTL_MS = 30_000;
 
 /** Upper bound on retained cache entries; long-lived gateways see many slots. */
@@ -469,28 +572,23 @@ const MAX_USAGE_CACHE_ENTRIES = 128;
 /**
  * Lazily drops expired cache entries before each use so a gateway process that
  * has seen many re-authenticated slots cannot grow these maps without bound.
- * In-flight work is never evicted: it would strand its promise.
+ * Active probes live in separate `usageInFlight` / `planInFlight` maps so
+ * transient or failing refreshes never evict valid cached entries.
  */
 function pruneQuotaCaches(now: number): void {
   for (const [key, entry] of Array.from(usageCache)) {
-    if (entry.inFlight) continue;
-    if (!entry.data || now - entry.timestamp >= CACHE_TTL_MS) {
+    if (now - entry.timestamp >= CACHE_TTL_MS) {
       usageCache.delete(key);
     }
   }
-  evictOldestEntries(usageCache, (entry) => !entry.inFlight, (entry) =>
-    entry.inFlight ? Number.POSITIVE_INFINITY : entry.timestamp,
-  );
+  evictOldestEntries(usageCache, () => true, (entry) => entry.timestamp);
 
   for (const [key, entry] of Array.from(planCache)) {
-    if (entry.inFlight) continue;
     if (now - entry.timestamp >= PLAN_CACHE_TTL_MS) {
       planCache.delete(key);
     }
   }
-  evictOldestEntries(planCache, (entry) => !entry.inFlight, (entry) =>
-    entry.inFlight ? Number.POSITIVE_INFINITY : entry.timestamp,
-  );
+  evictOldestEntries(planCache, () => true, (entry) => entry.timestamp);
 
   for (const [key, entry] of Array.from(refreshedTokenCache)) {
     if (entry.expiresAtMs - now <= 2 * 60 * 1000) {
@@ -566,6 +664,20 @@ function isCacheableUsageResult(result: AccountUsageResult): boolean {
   return result.signIn === "kept" && result.error === undefined && result.windows.length > 0;
 }
 
+function cloneUsageResult(result: AccountUsageResult): AccountUsageResult {
+  return {
+    ...result,
+    windows: result.windows.map((w) => ({
+      ...w,
+      ...(w.models ? { models: [...w.models] } : {}),
+    })),
+  };
+}
+
+function cancelledUsage(): AccountUsageResult {
+  return { windows: [], signIn: "kept", error: "Usage query cancelled" };
+}
+
 /**
  * Queries account usage from `agy -p /usage --output-format json`.
  * Single-flights concurrent queries and caches successful measured results for 30s.
@@ -575,23 +687,28 @@ export async function queryAccountUsage(
   catalogModelIds: string[],
   options: { quotaRouting: boolean; signal?: AbortSignal }
 ): Promise<AccountUsageResult> {
+  if (options.signal?.aborted) return cancelledUsage();
   // Scope by account identity *and* slot: a re-authenticated slot gets a new
   // accountRef, and two descriptors must never share cached quota/expiry state.
   const cacheScopeKey = `${account.accountRef}::${account.slotKey}`;
-  const cacheKey = `${cacheScopeKey}:${options.quotaRouting}`;
+  const signature = [...new Set(catalogModelIds)].sort().join(",");
+  const cacheKey = `${cacheScopeKey}:${options.quotaRouting}:${signature}`;
   const now = Date.now();
   pruneQuotaCaches(now);
   const cached = usageCache.get(cacheKey);
 
-  if (cached?.data && now - cached.timestamp < CACHE_TTL_MS) {
-    return structuredClone(cached.data);
+  if (cached && now - cached.timestamp < CACHE_TTL_MS) {
+    return cloneUsageResult(cached.data);
   }
 
-  if (cached?.inFlight) {
-    return await cached.inFlight;
+  const activeFlight = usageInFlight.get(cacheKey);
+  if (activeFlight) {
+    return cloneUsageResult(
+      await waitForFlight(activeFlight, options.signal, cancelledUsage()),
+    );
   }
 
-  const queryPromise = (async (): Promise<AccountUsageResult> => {
+  const task = async (signal: AbortSignal): Promise<AccountUsageResult> => {
     const tempRoot = os.tmpdir();
     let tempDir: string | undefined;
 
@@ -610,10 +727,10 @@ export async function queryAccountUsage(
           {
             cwd: tempDir,
             timeoutMs: 15_000,
-            signal: options.signal,
+            signal,
           }
         ),
-        queryAccountPlan(account, options.signal),
+        queryAccountPlan(account, signal),
       ]);
 
       const allOutput = `${res.stdout}\n${res.stderr}`.trim();
@@ -673,28 +790,35 @@ export async function queryAccountUsage(
         } catch {}
       }
     }
-  })();
-
-  const entry: CacheEntry = {
-    timestamp: now,
-    inFlight: queryPromise,
   };
-  usageCache.set(cacheKey, entry);
 
-  try {
-    const result = await queryPromise;
-    if (isCacheableUsageResult(result)) {
-      entry.data = result;
-      entry.timestamp = Date.now();
-    }
-    return result;
-  } finally {
-    delete entry.inFlight;
-    // Failures are never replayed: drop the entry so the next call re-queries.
-    if (!entry.data && usageCache.get(cacheKey) === entry) {
-      usageCache.delete(cacheKey);
-    }
-    // Trim once the entry is settled so the map never rests above its cap.
-    pruneQuotaCaches(Date.now());
-  }
+  const flight = createSharedFlight(
+    task,
+    {
+      windows: [],
+      signIn: "kept",
+      error: "Usage query failed",
+    } as AccountUsageResult,
+    () => {
+      if (usageInFlight.get(cacheKey) === flight) {
+        usageInFlight.delete(cacheKey);
+      }
+    },
+    (result) => {
+      if (usageInFlight.get(cacheKey) !== flight) return;
+      if (isCacheableUsageResult(result)) {
+        usageCache.set(cacheKey, { data: result, timestamp: Date.now() });
+      }
+    },
+    () => {
+      if (usageInFlight.get(cacheKey) === flight) {
+        usageInFlight.delete(cacheKey);
+      }
+      pruneQuotaCaches(Date.now());
+    },
+  );
+  usageInFlight.set(cacheKey, flight);
+  return cloneUsageResult(
+    await waitForFlight(flight, options.signal, cancelledUsage()),
+  );
 }

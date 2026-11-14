@@ -58,7 +58,7 @@ const OPTION_SPECS: readonly ProviderOptionSpec[] = [
     key: "quota_routing",
     stateKey: "quotaRouting",
     envName: "AGY_MAGPIE_QUOTA_ROUTING",
-    fallback: false,
+    fallback: true,
     label: "Quota-aware multi-account routing",
     description:
       "Gate exhausted 5-hour/weekly model buckets so Magpie routes new turns to other signed-in accounts.",

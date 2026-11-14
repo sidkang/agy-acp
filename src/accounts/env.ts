@@ -114,6 +114,17 @@ export function resolveAgyBinary(): string {
   throw new Error("Antigravity CLI (agy) binary not found. Please install agy or set AGY_PATH.");
 }
 
+/** Identifies in-place CLI upgrades without throwing when the binary is missing. */
+export function getAgyBinaryFingerprint(): string {
+  try {
+    const bin = resolveAgyBinary();
+    const stat = fs.statSync(bin);
+    return `${bin}:${stat.size}:${Math.trunc(stat.mtimeMs)}`;
+  } catch {
+    return "missing";
+  }
+}
+
 /**
  * Resolves isolated home directory for an account reference.
  * Strictly validates that accountRef is a UUID to prevent path traversal.
@@ -440,56 +451,117 @@ function registerBoundedExitHookOnce(): void {
   });
 }
 
-/**
- * Executes `agy` with bounded output and timeout, killing the process tree on timeout/abort.
- * Resolves promptly without hanging on descendant open pipes.
- */
-export function execAgyBounded(
+interface ProbeWaiter {
+  grant: () => void;
+}
+const probeWaiters: ProbeWaiter[] = [];
+let activeProbeCount = 0;
+
+function maxConcurrentProbes(): number {
+  const raw = process.env.AGY_ACP_MAX_CONCURRENT_PROBES ?? "";
+  const n = /^[1-9]\d*$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(n) && n >= 1 && n <= 64 ? n : 6;
+}
+
+function drainProbeWaiters(): void {
+  while (probeWaiters.length && activeProbeCount < maxConcurrentProbes()) {
+    probeWaiters.shift()!.grant();
+  }
+}
+
+function acquireProbeSlot(deadline: number, signal?: AbortSignal): Promise<(() => void) | undefined> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", cancel);
+    };
+    const cancel = () => {
+      const index = probeWaiters.indexOf(waiter);
+      if (index < 0) return;
+      probeWaiters.splice(index, 1);
+      cleanup();
+      resolve(undefined);
+      drainProbeWaiters();
+    };
+    const waiter: ProbeWaiter = {
+      grant: () => {
+        cleanup();
+        activeProbeCount++;
+        let released = false;
+        resolve(() => {
+          if (released) return;
+          released = true;
+          activeProbeCount--;
+          drainProbeWaiters();
+        });
+      },
+    };
+    probeWaiters.push(waiter);
+    timer = setTimeout(cancel, Math.max(0, deadline - performance.now()));
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (signal?.aborted) cancel();
+    else drainProbeWaiters();
+  });
+}
+
+/** Executes a short-lived probe; queue time counts toward its deadline. */
+export async function execAgyBounded(
   account: AccountDescriptor,
   args: string[],
   options?: ExecBoundedOptions
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+  const timeoutMs = options?.timeoutMs ?? 15_000;
+  const deadline = performance.now() + timeoutMs;
+  const signal = options?.signal;
+  const empty = (timedOut: boolean) => ({ exitCode: null, stdout: "", stderr: "", timedOut });
+  if (signal?.aborted) return empty(false);
+  if (timeoutMs <= 0) return empty(true);
+  const release = await acquireProbeSlot(deadline, signal);
+  if (!release) return empty(!signal?.aborted);
+  const remainingMs = deadline - performance.now();
+  if (signal?.aborted || remainingMs <= 0) {
+    release();
+    return empty(!signal?.aborted);
+  }
+
   return new Promise((resolve) => {
-    const timeoutMs = options?.timeoutMs ?? 15_000;
     const maxBytes = options?.maxBytes ?? 1024 * 1024;
-    const signal = options?.signal;
-
     registerBoundedExitHookOnce();
-
     let child: ChildProcessWithoutNullStreams;
     try {
       child = spawnAgy(account, args, { cwd: options?.cwd, extraEnv: options?.extraEnv });
       activeBoundedProbes.add(child);
     } catch (err: any) {
-      resolve({
-        exitCode: -1,
-        stdout: "",
-        stderr: err?.message ?? String(err),
-        timedOut: false,
-      });
+      release();
+      resolve({ exitCode: -1, stdout: "", stderr: err?.message ?? String(err), timedOut: false });
       return;
     }
 
     let settled = false;
     let timedOut = false;
     let totalBytes = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    let exitTimer: ReturnType<typeof setTimeout> | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
-    let timer: NodeJS.Timeout | undefined;
-
-    const cleanup = () => {
+    const releaseChild = () => {
+      clearTimeout(killTimer);
       activeBoundedProbes.delete(child);
-      if (timer) clearTimeout(timer);
-      if (signal && onAbort) {
-        signal.removeEventListener("abort", onAbort);
-      }
+      release();
     };
-
-    const finish = (exitCode: number | null) => {
+    const finish = (exitCode: number | null, kill = false) => {
       if (settled) return;
       settled = true;
-      cleanup();
-      killProcessTree(child);
+      clearTimeout(timer);
+      clearTimeout(exitTimer);
+      signal?.removeEventListener("abort", onAbort);
+      if (kill) {
+        // Do not admit a replacement until the dying child actually closes.
+        killTimer = setTimeout(releaseChild, 500);
+        killProcessTree(child);
+      }
       resolve({
         exitCode,
         stdout: Buffer.concat(stdoutChunks).toString("utf8"),
@@ -497,57 +569,31 @@ export function execAgyBounded(
         timedOut,
       });
     };
-
-    const onAbort = () => {
-      timedOut = false;
-      finish(null);
-    };
-
-    if (signal?.aborted) {
-      finish(null);
-      return;
-    }
-
-    if (signal) {
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-
+    const onAbort = () => finish(null, true);
     timer = setTimeout(() => {
       timedOut = true;
-      finish(null);
-    }, timeoutMs);
-
-    child.stdout.on("data", (chunk: Buffer) => {
+      finish(null, true);
+    }, remainingMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
       if (settled) return;
       totalBytes += chunk.length;
-      if (totalBytes > maxBytes) {
-        finish(null);
-        return;
-      }
-      stdoutChunks.push(chunk);
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      totalBytes += chunk.length;
-      if (totalBytes > maxBytes) {
-        finish(null);
-        return;
-      }
-      stderrChunks.push(chunk);
-    });
-
+      if (totalBytes > maxBytes) finish(null, true);
+      else chunks.push(chunk);
+    };
+    child.stdout.on("data", collect(stdoutChunks));
+    child.stderr.on("data", collect(stderrChunks));
     child.on("error", () => {
+      releaseChild();
       finish(null);
     });
-
-    child.on("exit", (code) => {
-      // Drain brief descendants then finish
-      setTimeout(() => finish(code), 50);
-    });
-
     child.on("close", (code) => {
+      releaseChild();
       finish(code);
+    });
+    child.on("exit", (code) => {
+      if (!settled) exitTimer = setTimeout(() => finish(code, true), 50);
     });
   });
 }

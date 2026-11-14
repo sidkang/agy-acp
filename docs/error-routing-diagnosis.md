@@ -64,12 +64,12 @@ Earlier log matching ran `/429|RESOURCE_EXHAUSTED|exhausted your quota|quota/i` 
 - **`quotaProject=` Metadata**: Routine OAuth/login metadata contains `quotaProject=<id>`. `isBenignEvidence()` treats `quotaProject=` records as benign unless accompanied by a real quota/429 signal, and `normalizeRuntimeText()` strips `quotaProject=...` values.
 - **glog Prefixes**: `GLOG_PREFIX_RE` (`^([IWEF])(\d{4} \d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+.*?)\]\s?([\s\S]*)$`) strips severity, timestamps, PIDs, and source line numbers before keyword matching so numeric `429` substrings in PIDs, ports, or timestamps never trigger `429` classification.
 - **Severity & Wording Gates (`extractErrorEvidence`)**:
-  - `I` (info) glog records are discarded unconditionally.
+  - `I` (info) glog records are discarded unconditionally, with one anchored exception: `Run: attempt N failed` that also names a limit. `agy` logs its in-process retry at info severity, and that record is the only evidence a single-retry `429` termination carries; without it the turn read as a generic `500`.
   - `W` (warning) records require an unambiguous signal (`STRONG_SIGNAL_RE` or `STATUS_429_RE`).
   - `STATUS_429_RE` requires HTTP/status/gRPC context (e.g., `HTTP/1.1 429`, `status: 429`, `code=429`, `(429)`, `429 Too Many Requests`), never bare numbers.
   - Unprefixed prose must match `FAILURE_WORDING_RE` or `hasVerdictSignal()`, and benign launcher messages (`failed to open browser`, `xdg-open`) are ignored.
 - **Auth Chatter Separation (`AUTH_RE` vs `RPC_AUTH_RE`)**: Healthy `agy` processes routinely log `You are not logged into Antigravity.` during background startup quirk polling. Logs are matched against `AUTH_RE` (which excludes that ambient chatter), while `RPC_AUTH_RE` applies only to the turn's own ACP RPC error text (`normalizeRuntimeText` having stripped any `Stderr tail:`).
-- **Classification Precedence**: `context_budget` (500) -> `auth` (401) -> `quota` (429) -> `invalid_request` (400) -> `internal` (500). A zero-budget trajectory failure is never misreported as `429` or `401`.
+- **Classification Precedence**: `context_budget` (500) -> `auth` (401) -> `quota` (429) -> `invalid_request` (400) -> `internal` (500). A zero-budget trajectory failure is never misreported as `429` or `401`. Within the `429` family the wording decides: a named spent quota is `quota`, a bare `429`/`RESOURCE_EXHAUSTED` is `rate_limit` (see §5).
 
 ---
 
@@ -90,4 +90,28 @@ Previously, `STATIC_FALLBACK_MODELS` in `src/usage/catalog.ts` omitted Carbon, H
 - **Claude Sonnet 5.5**: `claude-sonnet-5-5-high`, `claude-sonnet-5-5-medium`, `claude-sonnet-5-5-low`
 - **GPT-OSS 120B**: `gpt-oss-120b-medium`
 
-In addition, `catalog.ts` caches successful real `agy models` lists for 24 hours (capped at 128 accounts) so transient probe timeouts do not downgrade an account to a narrower catalog. Account catalogs remain strictly isolated per account—the plugin never merges model lists across accounts or reads another account's credentials to bypass Magpie's router.
+In addition, `catalog.ts` caches successful real `agy models` lists for 24 hours (capped at 128 accounts: the cache is fenced by `getAgyBinaryFingerprint()` — the resolved `agy` binary's `mtimeMs` + `size` — so upgrading the CLI refreshes the catalog on the next turn instead of after the TTL) so transient probe timeouts do not downgrade an account to a narrower catalog. Account catalogs remain strictly isolated per account—the plugin never merges model lists across accounts or reads another account's credentials to bypass Magpie's router.
+
+---
+
+## 5. Transient Limits vs. Account Quota (Observed Incident, `v0.1.8`)
+
+### What went wrong
+
+A `gemini-4-carbon` turn through Magpie → `agy-acp` → `agy 1.5.8` failed as follows:
+
+1. Antigravity answered the request with `RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).`, which is Google's generic 429 boilerplate.
+2. `agy` retried it **in-process with exponential backoff** — its own changelog states that transient `502`/`503`/`504` and *per-minute* `429` failures "automatically retry in-process with exponential backoff". Eight observed attempts spanned ~8 minutes, streaming `⚠ API error (attempt N): …` notices into the reply.
+3. The plugin classified `resource_exhausted` as `quota` and answered `429 {"error":{"message":"Account quota exhausted"}}`.
+4. Magpie's `quotaWords` regex (`fallback.go`) matched that text, and the sole downstream relay (CLIProxyAPI) cooled its only key for the provider: every later attempt was answered `503 auth_unavailable: no auth available (providers=…; last upstream error: api_error: Account quota exhausted)` — the error the user actually saw.
+
+Measured while that account was failing: `Gemini · 5 hours` had `58.4%` left and `Gemini · 7 days` `84.6%` left, and live probes (small, `reasoning_effort: high`, 8 concurrent, 3.3 MB body) all answered `200`. The 429 was a per-minute limit, not a spent window.
+
+### The fix
+
+- **Split the verdicts** (`src/runtime/diagnostics.ts`): `EXHAUSTED_QUOTA_RE` claims only wording that names a spent quota (`exhausted your quota`, `quota exceeded`, `insufficient quota`); everything else 429-shaped is `rate_limit`. `classifyAgentFailure` therefore answers `quota` only for a named window, and `rate_limit` for a bare 429.
+- **Say nothing of quota** (`TRANSIENT_LIMIT_FAILURE_MESSAGE`): the `rate_limit` answer is a plain `429` whose text contains neither `quota` nor `rate limit`, so Magpie holds the account briefly and asks the next one instead of holding it for a window.
+- **Stop the storm** (`src/runtime/worker.ts`, `src/runtime/turn-context.ts`): `agy` retry notices are stripped from the stream and counted (`splitAgentRetryNotices`, `TurnContext.absorbRetryNotices`), so they never reach the agent as model text. Only a newline-terminated line counts as a complete notice — a header whose body is still to come is held with it, so a split after `(attempt 1):` cannot let the body through as answer text. When a turn has delivered nothing meaningful (no text, thought or tool call) and reaches `MAX_UPSTREAM_RETRY_NOTICES` (2, ≈12s of backoff), the turn's queue is detached, the turn is cancelled via `session/cancel`, and it is finished as `rate_limit` once the native cancel lands, which keeps the caller inside its own request timeout and lets failover happen. Detaching first matters: `agy` settles a cancelled prompt as an error whose only log evidence is the `I`-severity retry record, so a turn finished by that settlement would answer `500` and climb the caller's backoff instead of failing over.
+- **Corroborate before believing the text** (`hasUpstreamRetryEvidence`): the same words reach the stream when a model *quotes* the incident ("explain this error"), so nothing is stripped, counted or cancelled unless the turn's own log shows `Run: attempt N failed` — the record `agy` writes when it really retries. A turn that merely talks about the notice delivers every line as answer text, and a chunk that also carried real output is delivered before the guard is consulted. A notice-shaped chunk that arrives before that record is readable is *held* (bounded to 4 KiB) rather than delivered, because delivering it would mark the turn as having produced work and disable the guard for the rest of the turn; the hold is released as answer text at turn end or when the buffer is exceeded. The trade-off is deliberate: if a turn's log is missing the record (an unwritable `--log-file`, or a read that lands before the write), the notices come through as text and the turn waits out `agy`'s ladder, exactly as it did before `v0.1.8` — noise, never a cancelled answer.
+
+`quota` remains for the case it describes: a 429/403 whose own words say a quota is spent, which is what Magpie should hold until the window renews.

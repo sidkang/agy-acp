@@ -48,6 +48,7 @@ const LISTENER_MAX_LIFETIME_MS = BROWSER_SIGN_IN_TIMEOUT_MS + 30_000;
 // abandoned after being shown the authorization URL.
 const TERMINAL_SIGN_IN_FLOW_TIMEOUT_MS = 10 * 60 * 1000;
 const IMPORT_MAX_ACCOUNTS = 100;
+const IMPORT_CONCURRENCY = 4;
 
 export const IMPORT_FROM_EN =
   "Choose an exported Antigravity account JSON file (refresh_token, token object, accounts array, Antigravity Switcher / CLIProxyAPI export, or antigravity-oauth-token), or a text file with one refresh token per line.";
@@ -63,9 +64,46 @@ export const IMPORT_FROMS: Record<string, string> = {
 const accountProvisionLocks = new Map<string, Promise<void>>();
 const ACCOUNT_FILE_LOCK_STALE_MS = 60_000;
 
+function waitForProvisionTurn(
+  task: Promise<unknown>,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("Sign-in cancelled"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("Timed out waiting for concurrent sign-in lock on this account"));
+      }, timeoutMs);
+    }
+    task.then(() => {
+      cleanup();
+      resolve();
+    }, (err) => {
+      cleanup();
+      reject(err);
+    });
+  });
+}
+
 async function acquireAccountFileLock(
   accountRef: string,
-  timeoutMs: number = ACCOUNT_FILE_LOCK_STALE_MS
+  timeoutMs: number = ACCOUNT_FILE_LOCK_STALE_MS,
+  signal?: AbortSignal
 ): Promise<() => void> {
   const accountsDir = path.join(getPluginDataRoot(), "accounts");
   fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
@@ -105,6 +143,7 @@ async function acquireAccountFileLock(
   };
 
   while (true) {
+    if (signal?.aborted) throw new Error("Sign-in cancelled");
     if (publishLockAtomically()) {
       return () => {
         try {
@@ -120,7 +159,7 @@ async function acquireAccountFileLock(
       const ownerPid = Number(firstRead.split(":")[0]);
       if (firstRead && ownerPid > 1 && !isPidAlive(ownerPid)) {
         // Guard against concurrent dead-lock sweepers: jitter + re-verify identical dead token
-        await new Promise((r) => setTimeout(r, 20 + Math.floor(Math.random() * 40)));
+        await waitForProvisionTurn(new Promise((r) => setTimeout(r, 20 + Math.floor(Math.random() * 40))), signal);
         const secondRead = fs.readFileSync(lockPath, "utf8").trim();
         if (secondRead === firstRead) {
           fs.unlinkSync(lockPath);
@@ -132,14 +171,14 @@ async function acquireAccountFileLock(
     if (Date.now() >= deadline) {
       throw new Error("Timed out waiting for concurrent sign-in lock on this account");
     }
-    await new Promise((r) => setTimeout(r, 15));
+    await waitForProvisionTurn(new Promise((r) => setTimeout(r, 15)), signal);
   }
 }
 
 async function withAccountProvisionLock<T>(
   accountRef: string,
   fn: () => Promise<T>,
-  options?: { fileLockTimeoutMs?: number }
+  options?: { fileLockTimeoutMs?: number; signal?: AbortSignal }
 ): Promise<T> {
   const prev = accountProvisionLocks.get(accountRef) ?? Promise.resolve();
   let releaseMem!: () => void;
@@ -148,22 +187,24 @@ async function withAccountProvisionLock<T>(
   });
   const chained = prev.then(() => gate);
   accountProvisionLocks.set(accountRef, chained);
-  await prev;
+  const deadline = Date.now() + (options?.fileLockTimeoutMs ?? ACCOUNT_FILE_LOCK_STALE_MS);
   // Acquired inside the guarded scope: a failed/timed-out file lock must still
   // release the in-process gate, otherwise every later provisioning of this
   // accountRef would wait on a lock owner that never runs its `finally`.
   let releaseFile: (() => void) | undefined;
   try {
-    releaseFile = await acquireAccountFileLock(accountRef, options?.fileLockTimeoutMs);
+    await waitForProvisionTurn(prev, options?.signal, Math.max(0, deadline - Date.now()));
+    releaseFile = await acquireAccountFileLock(accountRef, Math.max(0, deadline - Date.now()), options?.signal);
     return await fn();
   } finally {
     try {
       releaseFile?.();
     } catch {}
     releaseMem();
-    if (accountProvisionLocks.get(accountRef) === chained) {
-      accountProvisionLocks.delete(accountRef);
-    }
+    // An aborted waiter must not remove a predecessor that still owns the lock.
+    void chained.then(() => {
+      if (accountProvisionLocks.get(accountRef) === chained) accountProvisionLocks.delete(accountRef);
+    });
   }
 }
 
@@ -667,6 +708,7 @@ export interface OAuthCodeFlowResult {
 }
 
 export interface AuthRuntimeDeps {
+  importConcurrency?: number;
   fetchFn?: typeof fetch;
   verifyAccountFn?: (
     account: AccountDescriptor,
@@ -922,6 +964,13 @@ async function defaultVerifyIsolatedAccount(
   return { ok: true };
 }
 
+interface BatchOwnedAccount {
+  dir: string;
+  stamps: Set<string>;
+  resultIndices: Set<number>;
+  externallyTouched: boolean;
+}
+
 interface ProvisionInternalResult {
   outcome: AuthMethodSuccess | AuthMethodFailed;
   createdNewDir?: { accountRef: string; dir: string; commitStamp: string };
@@ -934,7 +983,11 @@ async function provisionIsolatedAccountFromTokens(
     expiresIn?: number;
     emailHint?: string;
   },
-  options?: { signal?: AbortSignal },
+  options?: {
+    signal?: AbortSignal;
+    batchOwned?: Map<string, BatchOwnedAccount>;
+    slotIndex?: number;
+  },
   deps?: AuthRuntimeDeps
 ): Promise<ProvisionInternalResult> {
   const doFetch = deps?.fetchFn ?? fetch;
@@ -1060,6 +1113,12 @@ async function provisionIsolatedAccountFromTokens(
       "antigravity-cli",
       "antigravity-oauth-token"
     );
+    const batchEntry = options?.batchOwned?.get(accountRef);
+    if (dirExistedBefore && batchEntry) {
+      const diskStamp = path.join(expectedDir, ".commit-stamp");
+      const stamp = fs.existsSync(diskStamp) ? fs.readFileSync(diskStamp, "utf8").trim() : "";
+      if (!batchEntry.stamps.has(stamp)) batchEntry.externallyTouched = true;
+    }
     let previousTokenBytes: Buffer | null = null;
     if (dirExistedBefore && fs.existsSync(tokenFile)) {
       try {
@@ -1118,6 +1177,19 @@ async function provisionIsolatedAccountFromTokens(
       fs.writeFileSync(stampTmp, `${commitStamp}\n`, { mode: 0o600 });
       fs.renameSync(stampTmp, stampPath);
       recordAccountIndexMapping(verifiedEmail, accountRef);
+      if (options?.batchOwned && options.slotIndex !== undefined) {
+        if (!dirExistedBefore) {
+          options.batchOwned.set(accountRef, {
+            dir: isolatedHomeDir,
+            stamps: new Set([commitStamp]),
+            resultIndices: new Set([options.slotIndex]),
+            externallyTouched: false,
+          });
+        } else if (batchEntry) {
+          batchEntry.stamps.add(commitStamp);
+          batchEntry.resultIndices.add(options.slotIndex);
+        }
+      }
 
       const metadata: PersistedAuthMetadata = {
         schemaVersion: 1,
@@ -1147,7 +1219,7 @@ async function provisionIsolatedAccountFromTokens(
         },
       };
     }
-  }, { fileLockTimeoutMs: deps?.accountFileLockTimeoutMs });
+  }, { fileLockTimeoutMs: deps?.accountFileLockTimeoutMs, signal: options?.signal });
 }
 
 /**
@@ -1160,99 +1232,96 @@ export async function importAccountFiles(
   deps?: AuthRuntimeDeps
 ): Promise<Array<AuthMethodSuccess | AuthMethodFailed>> {
   const fileList = Array.isArray(texts) ? texts : [texts];
-  const candidates: ImportedTokenCandidate[] = [];
+  type Outcome = AuthMethodSuccess | AuthMethodFailed;
+  const slots: Array<{ candidate?: ImportedTokenCandidate; result?: Outcome }> = [];
   const seenRefresh = new Set<string>();
-  const results: Array<AuthMethodSuccess | AuthMethodFailed> = [];
-  const newlyCreatedDirs: Array<{
-    accountRef: string;
-    dir: string;
-    commitStamp: string;
-    resultIndex: number;
-  }> = [];
+  const batchOwned = new Map<string, BatchOwnedAccount>();
 
   for (const raw of fileList) {
-    if (results.length >= IMPORT_MAX_ACCOUNTS) break;
+    if (slots.length >= IMPORT_MAX_ACCOUNTS) break;
     if (typeof raw !== "string" || !raw.trim()) continue;
     try {
       const parsed = parseImportedAccounts(raw);
       if (parsed.length === 0) {
-        results.push({
-          type: "failed",
-          error: "No refresh_token found in file",
-        });
-        continue;
+        slots.push({ result: { type: "failed", error: "No refresh_token found in file" } });
       }
       for (const item of parsed) {
+        if (slots.length >= IMPORT_MAX_ACCOUNTS) break;
         if (seenRefresh.has(item.refreshToken)) continue;
         seenRefresh.add(item.refreshToken);
-        candidates.push(item);
+        slots.push({ candidate: item });
       }
     } catch (err: any) {
-      results.push({
-        type: "failed",
-        error: redactSecrets(err?.message ?? String(err)),
-      });
+      slots.push({ result: { type: "failed", error: redactSecrets(err?.message ?? String(err)) } });
     }
   }
 
   const cleanupBatchOnAbort = async () => {
-    for (const item of newlyCreatedDirs.splice(0)) {
-      await withAccountProvisionLock(item.accountRef, async () => {
-        try {
-          let rolledBack = false;
-          if (!fs.existsSync(item.dir)) {
-            rolledBack = true;
-          } else {
-            const stampPath = path.join(item.dir, ".commit-stamp");
-            const currentStamp = fs.existsSync(stampPath)
-              ? fs.readFileSync(stampPath, "utf8").trim()
-              : "";
-            if (currentStamp === item.commitStamp) {
-              fs.rmSync(item.dir, { recursive: true, force: true });
-              if (!fs.existsSync(item.dir)) rolledBack = true;
+    for (const [accountRef, entry] of batchOwned) {
+      let cleanupError: string | undefined;
+      let rolledBack = false;
+      try {
+        // Rollback deliberately does not inherit the cancelled caller signal.
+        await withAccountProvisionLock(accountRef, async () => {
+          if (!entry.externallyTouched) {
+            const stampPath = path.join(entry.dir, ".commit-stamp");
+            if (!fs.existsSync(entry.dir)) {
+              rolledBack = true;
+            } else if (
+              fs.existsSync(stampPath) &&
+              entry.stamps.has(fs.readFileSync(stampPath, "utf8").trim())
+            ) {
+              fs.rmSync(entry.dir, { recursive: true, force: true });
+              if (fs.existsSync(entry.dir)) {
+                throw new Error("Account directory still exists after rollback");
+              }
+              rolledBack = true;
             }
           }
-          // Only a directory that really went away invalidates the result; an
-          // account that pre-existed the batch keeps its `success` entry.
-          if (rolledBack && results[item.resultIndex]?.type === "success") {
-            results[item.resultIndex] = {
+        }, { fileLockTimeoutMs: 10_000 });
+      } catch (err: any) {
+        cleanupError = `Sign-in cancellation cleanup failed: ${redactSecrets(err?.message ?? String(err))}`;
+      }
+      if (cleanupError || rolledBack) {
+        for (const index of entry.resultIndices) {
+          if (slots[index]?.result?.type === "success") {
+            slots[index]!.result = {
               type: "failed",
-              error: "Sign-in cancelled",
-              accountId: item.accountRef,
+              error: cleanupError ?? "Sign-in cancelled",
+              accountId: accountRef,
             };
           }
-        } catch {}
-      });
+        }
+      }
     }
   };
 
-  for (const candidate of candidates) {
-    if (results.length >= IMPORT_MAX_ACCOUNTS) break;
-    if (options?.signal?.aborted) {
-      await cleanupBatchOnAbort();
-      break;
-    }
-    const provisioned = await provisionIsolatedAccountFromTokens(
-      {
-        refreshToken: candidate.refreshToken,
-        emailHint: candidate.email,
-      },
-      options,
-      deps
-    );
-    if (!options?.signal?.aborted || provisioned.outcome.type === "success") {
-      const resultIndex = results.push(provisioned.outcome) - 1;
-      if (provisioned.createdNewDir) {
-        newlyCreatedDirs.push({ ...provisioned.createdNewDir, resultIndex });
+  const requested = deps?.importConcurrency ?? IMPORT_CONCURRENCY;
+  const concurrency = Number.isInteger(requested) ? Math.min(16, Math.max(1, requested)) : IMPORT_CONCURRENCY;
+  let nextIndex = 0;
+  const worker = async () => {
+    while (!options?.signal?.aborted && nextIndex < slots.length) {
+      const slotIndex = nextIndex++;
+      const slot = slots[slotIndex]!;
+      if (!slot.candidate) continue;
+      try {
+        const provisioned = await provisionIsolatedAccountFromTokens({
+          refreshToken: slot.candidate.refreshToken, emailHint: slot.candidate.email,
+        }, { ...options, batchOwned, slotIndex }, deps);
+        if (!options?.signal?.aborted || provisioned.outcome.type === "success") {
+          slot.result = provisioned.outcome;
+        }
+      } catch (err: any) {
+        if (!options?.signal?.aborted) {
+          slot.result = { type: "failed", error: redactSecrets(err?.message ?? String(err)) };
+        }
       }
     }
-    if (options?.signal?.aborted) {
-      await cleanupBatchOnAbort();
-      break;
-    }
-  }
-
-  return results;
+  };
+  const workers = Array.from({ length: concurrency }, worker);
+  await Promise.allSettled(workers);
+  if (options?.signal?.aborted) await cleanupBatchOnAbort();
+  return slots.flatMap((slot) => slot.result ? [slot.result] : []);
 }
 
 /**

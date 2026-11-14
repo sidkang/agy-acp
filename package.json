@@ -1,6 +1,6 @@
 {
   "name": "magpie-agy-acp",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Multi-account Antigravity CLI (agy acp) model provider plugin for Magpie and OpenCode",
   "type": "module",
   "main": "./opencode.mjs",

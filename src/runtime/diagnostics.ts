@@ -55,9 +55,153 @@ export const CONTEXT_BUDGET_FAILURE_MESSAGE =
 export const GENERIC_FAILURE_MESSAGE =
   "Agent execution terminated due to error";
 
+/**
+ * Public text for a `429`-shaped refusal that names no spent quota window.
+ *
+ * It must state nothing of quota: Magpie scans error text with `quotaWords`
+ * (`fallback.go`) and holds an account for its whole window on a match, while a
+ * plain `429` holds it briefly and lets the next account answer. That is why
+ * neither "quota" nor "rate limit" appears here.
+ */
+export const TRANSIENT_LIMIT_FAILURE_MESSAGE =
+  "Antigravity upstream temporarily limited this turn (transient 429) before any answer was produced. Retry shortly; another signed-in account can answer it now.";
+
+/**
+ * `agy`'s own in-process retry notice for a transient upstream failure:
+ *
+ *   `⚠ API error (attempt 2): RESOURCE_EXHAUSTED (code 429): Resource has been
+ *    exhausted (e.g. check quota).`
+ *
+ * It is diagnostic text, not model output, so it is kept out of the answer and
+ * counted instead: a storm of them means the turn is only spinning through
+ * `agy`'s exponential backoff (observed 8 attempts over ~8 minutes).
+ */
+const RETRY_NOTICE_PREFIXES: ReadonlyArray<string> = [
+  "API error (attempt",
+  "⚠ API error (attempt",
+  "⚠️ API error (attempt",
+];
+
+const RETRY_NOTICE_LINE_RE = /^\s*(?:⚠\ufe0f?\s*)?API error \(attempt \d+\):/i;
+
+/**
+ * Independent evidence that `agy` itself retried upstream during this turn.
+ *
+ * The same words also reach the stream when a model *quotes* the incident, so a
+ * notice-shaped line is only treated as diagnostic — stripped, counted, or able
+ * to end a turn — when the turn's own log says `agy` really retried. Without this
+ * the very troubleshooting task that motivates the guard ("explain this error")
+ * would cancel the answer to it.
+ */
+const UPSTREAM_RETRY_EVIDENCE_RE = /Run: attempt \d+ failed|API error \(attempt \d+\)/i;
+
+/**
+ * `agy` logs its in-process retry at info severity:
+ *   `I1114 16:08:30.490505 370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): …)`
+ * Info records are normally noise (and `I… quotaProject=` forged a 429 once), so
+ * this exact phrasing is the one exception: an anchored retry record that also
+ * names a limit is the only evidence a single-retry `429` termination has.
+ */
+const INFO_RETRY_EVIDENCE_RE = /^[Rr]un: attempt \d+ failed\b/;
+
+export function hasUpstreamRetryEvidence(rawLog: string): boolean {
+  if (!rawLog) return false;
+  return UPSTREAM_RETRY_EVIDENCE_RE.test(rawLog);
+}
+
+/**
+ * Shortest fragment worth holding back for the next chunk. A real split of a
+ * notice always carries a recognizable run of it; without a floor the ordinary
+ * end of an answer (" A", "API") looked like the start of a notice and was held
+ * instead of delivered.
+ */
+const RETRY_NOTICE_HOLD_MIN = 6;
+
+export interface RetryNoticeScan {
+  /** The chunk with every complete notice line removed. */
+  text: string;
+  /** Complete, newline-terminated notices found in this chunk. */
+  count: number;
+  /** A trailing partial notice, to be prepended to the next chunk. */
+  hold: string;
+}
+
+/**
+ * True when a line is a notice that has begun (header only, body still to come)
+ * or a fragment that could become one. Used only for the last, unterminated line
+ * of a chunk and for text waiting on log corroboration.
+ */
+function isNoticeFragment(line: string): boolean {
+  const candidate = line.replace(/^[ \t]+/, "");
+  if (candidate.length === 0) return false;
+  return RETRY_NOTICE_PREFIXES.some(
+    (prefix) =>
+      prefix.startsWith(candidate) ||
+      (candidate.length >= RETRY_NOTICE_HOLD_MIN &&
+        candidate.startsWith(prefix)),
+  );
+}
+
+/**
+ * True when the text carries a notice that has begun — a complete line or a
+ * header whose body has not arrived yet. The worker uses it to hold a
+ * notice-shaped chunk while it waits for the log to corroborate the retry,
+ * instead of forwarding it and blinding the storm guard.
+ */
+export function looksLikeAgentRetryNotice(text: string): boolean {
+  if (!text) return false;
+  const lines = text.split("\n");
+  return lines.some(
+    (line) => RETRY_NOTICE_LINE_RE.test(line) || isNoticeFragment(line),
+  );
+}
+
+/**
+ * Splits `agy` retry notices out of a streamed text chunk.
+ *
+ * Only a newline-terminated line is a complete notice. A header whose body is
+ * still to come (`⚠ API error (attempt 1):` at the end of a chunk) must not be
+ * consumed, or its body would arrive as model text and the guard would read that
+ * text as delivered work. Such a line, and any fragment that could begin a
+ * notice, is held back (`hold`) for the next chunk; the caller flushes whatever
+ * is still held when the turn ends.
+ */
+export function splitAgentRetryNotices(text: string): RetryNoticeScan {
+  if (!text) return { text: "", count: 0, hold: "" };
+  const segments = text.split("\n");
+  const unterminated = segments.pop() ?? "";
+
+  let count = 0;
+  const kept: string[] = [];
+  for (const line of segments) {
+    if (RETRY_NOTICE_LINE_RE.test(line)) {
+      count += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+
+  let hold = "";
+  if (isNoticeFragment(unterminated)) {
+    // The separator belongs to the held segment: releasing it later must
+    // reproduce the original bytes (`"hello\nAPI"` -> `"hello"` + `"\nAPI"`).
+    hold = text.includes("\n") ? `\n${unterminated}` : unterminated;
+  } else {
+    // Restores the trailing newline of a chunk that ended with one.
+    kept.push(unterminated);
+  }
+
+  let out = kept.join("\n");
+  // Whitespace around a stripped notice is that notice's own padding, not a
+  // whitespace-only answer the model meant to send.
+  if (count > 0 && out.trim() === "") out = "";
+  return { text: out, count, hold };
+}
+
 type AgentFailureKind =
   | "auth"
   | "quota"
+  | "rate_limit"
   | "invalid_request"
   | "context_budget"
   | "internal";
@@ -132,8 +276,30 @@ const AUTH_RE =
 const RPC_AUTH_RE =
   /please (?:sign|log) in|not (?:logged|signed)[ -]?in(?:to)?\b|sign[- ]in (?:again|required)|authentication expired|login required|unauthenticated|invalid_grant|token (?:has )?expired|reauthenticate|invalid credentials?|missing credentials?/i;
 
-const QUOTA_RE =
-  /resource_exhausted|resource has been exhausted|exhausted (?:your|the|its|this) quota|quota (?:exceeded|exhausted)|insufficient quota|rate[ _-]?limit(?:ed|_exceeded)?|too many requests|throttl(?:ed|ing)/i;
+/**
+ * Quota wording that names exhaustion itself, in any vendor's phrasing seen so
+ * far: `You have exhausted your quota for this model.`, `quota exceeded`.
+ *
+ * Google's generic `429` boilerplate is deliberately *not* here even though it
+ * ends with `(e.g. check quota)`: it is what every throttled request returns,
+ * including the per-minute limits `agy` retries in-process, so reading it as
+ * account exhaustion rests a healthy account for its whole window.
+ */
+const EXHAUSTED_QUOTA_RE =
+  /exhausted (?:your|the|its|this) (?:quota|capacity)|quota (?:exceeded|exhausted|limit reached|will reset)|insufficient quota|out of quota/i;
+
+/**
+ * A `429`-shaped refusal: `agy`'s `RESOURCE_EXHAUSTED (code 429): Resource has
+ * been exhausted (e.g. check quota).`, a per-minute rate limit, a vendor
+ * throttle. None of it states that a plan window is spent.
+ */
+const LIMIT_SIGNAL_RE =
+  /resource_exhausted|resource has been exhausted|rate[ _-]?limit(?:ed|_exceeded)?|too many requests|throttl(?:ed|ing)|check quota/i;
+
+const QUOTA_RE = new RegExp(
+  `${EXHAUSTED_QUOTA_RE.source}|${LIMIT_SIGNAL_RE.source}`,
+  "i",
+);
 
 const INVALID_REQUEST_RE =
   /invalid_request|invalid argument|invalid_argument|bad request|failed_precondition|400 bad request/i;
@@ -164,6 +330,11 @@ function isBenignEvidence(body: string): boolean {
 
 function isQuotaSignal(text: string): boolean {
   return QUOTA_RE.test(text) || STATUS_429_RE.test(text);
+}
+
+/** True only when the text itself says a quota is spent, not merely throttled. */
+function isExhaustedQuotaSignal(text: string): boolean {
+  return EXHAUSTED_QUOTA_RE.test(text);
 }
 
 /**
@@ -216,8 +387,20 @@ export function extractErrorEvidence(raw: string): string {
 
     const glog = GLOG_PREFIX_RE.exec(line);
     if (glog) {
-      if (glog[1] === "I") continue;
-      const body = (glog[3] ?? "").trim();
+      const gbody = (glog[3] ?? "").trim();
+      if (glog[1] === "I") {
+        // Only `agy`'s own retry record survives, and only when it also names a
+        // limit; everything else at info severity stays noise.
+        if (
+          !INFO_RETRY_EVIDENCE_RE.test(gbody) ||
+          (!STRONG_SIGNAL_RE.test(gbody) && !STATUS_429_RE.test(gbody))
+        ) {
+          continue;
+        }
+        kept.push(gbody);
+        continue;
+      }
+      const body = gbody;
       if (!body || isBenignEvidence(body)) continue;
       if (
         glog[1] === "W" &&
@@ -241,10 +424,15 @@ export function extractErrorEvidence(raw: string): string {
 }
 
 /**
- * Classifies evidence, most-specific first so a zero-token-budget refusal can
- * never be reported as an exhausted quota. When nothing survives filtering the
- * answer is `"internal"`; the raw text is never consulted again, which is what
- * let benign metadata fake a verdict.
+ * Classifies evidence, most-specific first: `context_budget` -> `auth` ->
+ * `quota` (a named exhausted quota) -> `rate_limit` (a `429`-shaped refusal that
+ * names no spent window) -> `invalid_request` -> `internal`.
+ *
+ * `quota` and `rate_limit` are separate on purpose. `agy` retries a per-minute
+ * `429` in-process with exponential backoff, so an upstream `resource_exhausted`
+ * is the common case of a busy minute, not a spent plan window: reporting it as
+ * `quota` made Magpie rest the account for its whole window and CPA cool the
+ * only key, turning a short throttle into a dead session.
  */
 export function classifyAgentFailure(
   evidence: string,
@@ -262,7 +450,10 @@ export function classifyAgentFailure(
     return "context_budget";
   }
   if (AUTH_RE.test(text) || RPC_AUTH_RE.test(rpc)) return "auth";
-  if (isQuotaSignal(text) || isQuotaSignal(rpc)) return "quota";
+  if (isExhaustedQuotaSignal(text) || isExhaustedQuotaSignal(rpc)) {
+    return "quota";
+  }
+  if (isQuotaSignal(text) || isQuotaSignal(rpc)) return "rate_limit";
   if (INVALID_REQUEST_RE.test(text) || INVALID_REQUEST_RE.test(rpc)) {
     return "invalid_request";
   }

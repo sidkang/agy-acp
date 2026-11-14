@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import type { AccountDescriptor } from "../src/types";
 import {
+  execAgyBounded,
   buildAgyEnvAndArgs,
   getBrowserShimDir,
   getPluginDataRoot,
@@ -38,6 +39,7 @@ import {
   parseResetTime,
   parseUsageReport,
   queryAccountUsage,
+  queryAccountPlan,
 } from "../src/usage/quota";
 import { readConversationStepUsages } from "../src/usage/step-usage";
 import { withEnv } from "./fixtures/helpers";
@@ -838,7 +840,10 @@ describe("src/accounts/auth.ts", () => {
         fetchFn: mockFetch,
         verifyAccountFn: async () => {
           seenBatchCalls++;
-          if (seenBatchCalls === 2) batchAbort.abort();
+          if (seenBatchCalls === 2) {
+            await new Promise((r) => setTimeout(r, 20));
+            batchAbort.abort();
+          }
           return { ok: true };
         },
       }
@@ -962,7 +967,10 @@ describe("src/accounts/auth.ts", () => {
       {
         fetchFn: mockFetch,
         verifyAccountFn: async () => {
-          if (++verifyCalls === 3) batchAbort.abort();
+          if (++verifyCalls === 3) {
+            await new Promise((r) => setTimeout(r, 20));
+            batchAbort.abort();
+          }
           return { ok: true };
         },
       }
@@ -1137,17 +1145,11 @@ exit 1
       accountFileLockTimeoutMs: 150,
     };
 
-    let lockError = "";
-    try {
-      await importAccountFiles(
-        [JSON.stringify({ refresh_token: "1//04lock_release_d1" })],
-        undefined,
-        deps
-      );
-    } catch (err: any) {
-      lockError = err?.message ?? String(err);
-    }
-    expect(lockError).toContain("Timed out waiting for concurrent sign-in lock");
+    const lockFailure = await importAccountFiles(
+      [JSON.stringify({ refresh_token: "1//04lock_release_d1" })], undefined, deps
+    );
+    expect(lockFailure[0]?.type).toBe("failed");
+    expect((lockFailure[0] as any)?.error).toContain("Timed out waiting for concurrent sign-in lock");
 
     // The stale lock is gone: the same account must provision instead of hanging
     // forever behind the leaked in-memory lock.
@@ -1616,7 +1618,7 @@ describe("src/usage/quota.ts", () => {
     expect(gemini5h?.used).toBe(22.9);
     expect(gemini5h?.span).toBe(18000);
     expect(gemini5h?.resetsAt).toBe("2026-11-13T04:25:05.000Z");
-    expect(gemini5h?.models).toEqual(["gemini-3.8-flash", "gemini-3.8-flash-low", "gemini-4-hydrogen"]);
+    expect(gemini5h?.models).toBeUndefined();
 
     // Check Claude & GPT weekly bucket: remaining 1.0 -> used = 0%
     const claudeWeekly = resNoQr.windows.find((w) => w.pool === "Claude & GPT" && w.name === "7 days");
@@ -1624,11 +1626,17 @@ describe("src/usage/quota.ts", () => {
     expect(claudeWeekly?.pool).toBe("Claude & GPT");
     expect(claudeWeekly?.used).toBe(0);
     expect(claudeWeekly?.span).toBe(604800);
-    expect(claudeWeekly?.models).toEqual(["claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b"]);
+    expect(claudeWeekly?.models).toBeUndefined();
 
     // quotaRouting: true -> aside: false
     const resQr = parseUsageReport(REAL_USAGE_JSON, catalogModelIds, { quotaRouting: true });
     expect(resQr.windows.every((w) => w.aside === false)).toBe(true);
+    expect(resQr.windows.find((w) => w.pool === "Gemini")?.models).toEqual([
+      "gemini-3.8-flash", "gemini-3.8-flash-low", "gemini-4-hydrogen",
+    ]);
+    expect(resQr.windows.find((w) => w.pool === "Claude & GPT")?.models).toEqual([
+      "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b",
+    ]);
   });
 
   test("parseUsageReport handles missing/null remaining_fraction with display message and aside: true", () => {
@@ -2045,12 +2053,14 @@ describe("src/options.ts", () => {
       () => {
         const defaults = readProviderOptions({}, undefined);
         expect(defaults).toEqual({
-          quotaRouting: false,
+          quotaRouting: true,
           cloakPrompts: true,
           minimalAgent: false,
           exposeThinking: true,
         });
 
+        expect(readProviderOptions({}, { quota_routing: false }).quotaRouting).toBe(false);
+        expect(readProviderOptions({ magpie: { option: () => false } }).quotaRouting).toBe(false);
         const defaultByKey: Record<string, boolean> = {
           quota_routing: defaults.quotaRouting,
           cloak_prompts: defaults.cloakPrompts,
@@ -2065,3 +2075,479 @@ describe("src/options.ts", () => {
   });
 });
 
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for test checkpoint");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function writeProbe(name: string, body: string): string {
+  const bin = path.join(TEST_DIR, name);
+  fs.writeFileSync(bin, `#!${process.execPath}\n${body}\n`, { mode: 0o755 });
+  return bin;
+}
+
+function testAccount(slotKey: string, withCredentials = false): AccountDescriptor {
+  const accountRef = crypto.randomUUID();
+  const home = resolveIsolatedHomeDir(accountRef);
+  if (withCredentials) fs.writeFileSync(path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+    JSON.stringify({ access_token: "test-access", expiry: new Date(Date.now() + 3_600_000).toISOString() }));
+  return { slotKey, accountRef, mode: "isolated", label: slotKey, isolatedHomeDir: home };
+}
+
+function importFetch(emailFor: (token: string) => string): typeof fetch {
+  return (async (input: any, init: any) => {
+    if (String(input).includes("oauth2.googleapis.com/token")) {
+      const token = new URLSearchParams(init.body).get("refresh_token")!;
+      return Response.json({ access_token: token, expires_in: 3600 });
+    }
+    return Response.json({ email: emailFor(new Headers(init.headers).get("Authorization")!.slice(7)) });
+  }) as typeof fetch;
+}
+
+describe("Slice A routing and concurrency regressions", () => {
+  test("specific pools claim only their models before broad pools, preserving report order", () => {
+    const group = (name: string) => ({ name, buckets: [{ id: "5h", window: "5h", remaining_fraction: 0 }] });
+    const ids = ["gemini-4-argon", "gemini-4-argon-high", "gemini-pro-orchestrator-argon",
+      "gemini-3.8-flash-low", "gemini-4-carbon-high", "gemini-4-hydrogen-low",
+      "gemini-pro-orchestrator", "claude-opus-5-5", "gpt-oss-120b"];
+    const report = { status: "SUCCESS", command: { name: "usage", data: { groups: [
+      group(" Gemini   Models "), group("Gemini 4 Argon Models"), group("Claude and GPT models"),
+      group("Claude"), group("GPT"), group("Unknown"),
+      { name: "Gemini 4 Carbon" }, // Invalid groups cannot steal broad-pool models.
+    ] } } };
+    const { windows } = parseUsageReport(report, ids, { quotaRouting: true });
+    expect(windows.map((w) => w.pool)).toEqual(["Gemini", "Gemini 4 Argon", "Claude & GPT", "Claude", "GPT", "Unknown"]);
+    expect(windows[0]?.models).toEqual(ids.slice(3, 7));
+    expect(windows[1]?.models).toEqual(ids.slice(0, 3));
+    expect(windows[1]?.name).toBe("5 hours");
+    expect(windows[2]?.models).toEqual(ids.slice(7));
+    expect(windows[3]?.models).toEqual([ids[7]!]);
+    expect(windows[4]?.models).toEqual([ids[8]!]);
+    expect(windows[5]?.aside).toBe(true);
+    expect(windows[5]?.models).toBeUndefined();
+    expect(windows.every((w) => w.aside || !!w.models?.length)).toBe(true);
+
+    report.command.data.groups = [group("Gemini 4"), group("Gemini 4 Argon"), group("Gemini Models")];
+    const overlap = parseUsageReport(report, ids, { quotaRouting: true }).windows;
+    expect(overlap[0]?.models).toEqual(ids.slice(4, 6));
+    expect(overlap[1]?.models).toEqual(ids.slice(0, 3));
+    expect(overlap[2]?.models).toEqual([ids[3]!, ids[6]!]);
+    const unknown = group("Gemini");
+    (unknown.buckets[0] as any).remaining_fraction = null;
+    report.command.data.groups = [unknown];
+    expect(() => parseUsageReport(report, ids, { quotaRouting: true })).toThrow("no enabled, measured");
+  });
+
+  test("usage cache tracks catalog attribution and clones every caller's windows and model lists", async () => {
+    const log = path.join(TEST_DIR, "catalog-key.log");
+    const bin = writeProbe("catalog-key-probe", `
+      const fs = require("node:fs"); fs.appendFileSync(${JSON.stringify(log)}, "probe\\n");
+      setTimeout(() => console.log(${JSON.stringify(JSON.stringify(REAL_USAGE_JSON))}), 40);
+    `);
+    await withEnv({ AGY_PATH: bin }, async () => {
+      const account = testAccount("catalog-key");
+      const ids = ["gemini-4-argon", "gemini-3.8-flash"];
+      const [a, b] = await Promise.all([
+        queryAccountUsage(account, ids, { quotaRouting: true }),
+        queryAccountUsage(account, ids, { quotaRouting: true }),
+      ]);
+      a.windows[0]!.models!.push("mutation");
+      a.windows[0]!.used = 100;
+      expect(b.windows[0]?.models).toEqual(ids);
+      expect(b.windows[0]?.used).not.toBe(100);
+      const cached = await queryAccountUsage(account, [ids[1]!, ids[0]!, ids[0]!], { quotaRouting: true });
+      expect(cached.windows[0]?.models).toEqual(ids);
+      cached.windows.length = 0;
+      expect((await queryAccountUsage(account, ids, { quotaRouting: true })).windows).toHaveLength(4);
+      expect(fs.readFileSync(log, "utf8").trim().split("\n")).toHaveLength(1);
+      const live = await queryAccountUsage(account, [ids[1]!], { quotaRouting: true });
+      expect(live.windows[0]?.models).toEqual([ids[1]!]);
+      expect(fs.readFileSync(log, "utf8").trim().split("\n")).toHaveLength(2);
+    });
+  });
+
+  test("probe semaphore caps six children at two and removes aborted/expired queued probes", async () => {
+    const log = path.join(TEST_DIR, "semaphore.log");
+    const bin = writeProbe("semaphore-probe", `
+      const fs = require("node:fs"); const id = process.argv[2];
+      fs.appendFileSync(${JSON.stringify(log)}, "start " + id + "\\n");
+      setTimeout(() => { fs.appendFileSync(${JSON.stringify(log)}, "end " + id + "\\n"); }, 180);
+    `);
+    await withEnv({ AGY_PATH: bin, AGY_ACP_MAX_CONCURRENT_PROBES: "2" }, async () => {
+      const account = testAccount("semaphore");
+      const runs = Array.from({ length: 6 }, (_, i) => execAgyBounded(account, [String(i)], { timeoutMs: 3_000 }));
+      await waitUntil(() => fs.existsSync(log) && fs.readFileSync(log, "utf8").includes("start 1"));
+      const abort = new AbortController();
+      const cancelled = execAgyBounded(account, ["aborted"], { signal: abort.signal, timeoutMs: 2_000 });
+      const expired = execAgyBounded(account, ["expired"], { timeoutMs: 30 });
+      abort.abort();
+      const abortResult = await cancelled;
+      expect(abortResult).toEqual({ exitCode: null, stdout: "", stderr: "", timedOut: false });
+      expect((await expired).timedOut).toBe(true);
+      const pre = new AbortController(); pre.abort();
+      expect((await execAgyBounded(account, ["pre-aborted"], { signal: pre.signal })).timedOut).toBe(false);
+      expect((await execAgyBounded(account, ["zero"], { timeoutMs: 0 })).timedOut).toBe(true);
+      expect((await Promise.all(runs)).every((r) => r.exitCode === 0)).toBe(true);
+      let active = 0, peak = 0;
+      const events = fs.readFileSync(log, "utf8").trim().split("\n");
+      for (const event of events) { active += event.startsWith("start") ? 1 : -1; peak = Math.max(peak, active); }
+      expect(peak).toBe(2);
+      expect(active).toBe(0);
+      expect(events).toHaveLength(12);
+      expect(events.join("\n")).not.toMatch(/aborted|expired|zero/);
+    });
+  });
+
+  test("probe slots stay FIFO, include queue time in execution deadlines, and recover after spawn/overflow failures", async () => {
+    const log = path.join(TEST_DIR, "fifo-probes.log");
+    const bin = writeProbe("fifo-probe", `
+      const fs = require("node:fs");
+      fs.appendFileSync(${JSON.stringify(log)}, process.argv[2] + "\\n");
+      if (process.argv[2] === "overflow") process.stdout.write("x".repeat(4096));
+      setTimeout(() => console.log("done"), Number(process.argv[3] || 0));
+    `);
+    await withEnv({ AGY_PATH: bin, AGY_ACP_MAX_CONCURRENT_PROBES: "1" }, async () => {
+      const account = testAccount("fifo-probes");
+      const first = execAgyBounded(account, ["first", "150"]);
+      await waitUntil(() => fs.existsSync(log));
+      const second = execAgyBounded(account, ["second", "0"]);
+      const third = execAgyBounded(account, ["third", "0"]);
+      expect((await Promise.all([first, second, third])).every((r) => r.exitCode === 0)).toBe(true);
+      expect(fs.readFileSync(log, "utf8").trim().split("\n")).toEqual(["first", "second", "third"]);
+      const blocker = execAgyBounded(account, ["blocker", "200"]);
+      await waitUntil(() => fs.readFileSync(log, "utf8").includes("blocker"));
+      const budgeted = execAgyBounded(account, ["budgeted", "200"], { timeoutMs: 300 });
+      expect((await blocker).exitCode).toBe(0);
+      expect((await budgeted).timedOut).toBe(true);
+      expect((await execAgyBounded(account, ["overflow", "1000"], { maxBytes: 10 })).exitCode).toBeNull();
+      await withEnv({ AGY_PATH: path.join(TEST_DIR, "nonexistent-probe") }, async () => {
+        expect((await execAgyBounded(account, [])).exitCode).toBe(-1);
+      });
+      const invalid = path.join(TEST_DIR, "invalid-executable");
+      fs.writeFileSync(invalid, "not executable", { mode: 0o600 });
+      await withEnv({ AGY_PATH: invalid }, async () => {
+        expect((await execAgyBounded(account, [])).exitCode).toBeNull();
+      });
+      // The granted-but-not-yet-spawned cancellation must release its slot too.
+      const abort = new AbortController();
+      const granted = execAgyBounded(account, ["must-not-spawn"], { signal: abort.signal });
+      abort.abort();
+      expect((await granted).timedOut).toBe(false);
+      expect((await execAgyBounded(account, ["recovered"])).exitCode).toBe(0);
+      expect(fs.readFileSync(log, "utf8")).not.toContain("must-not-spawn");
+    });
+  });
+
+  test("invalid probe-limit strings fall back to six instead of accepting numeric prefixes", async () => {
+    const log = path.join(TEST_DIR, "default-limit.log");
+    const gate = path.join(TEST_DIR, "default-limit.gate");
+    const bin = writeProbe("default-limit-probe", `
+      const fs = require("node:fs");
+      fs.appendFileSync(${JSON.stringify(log)}, "start\\n");
+      const timer = setInterval(() => {
+        if (fs.existsSync(${JSON.stringify(gate)})) clearInterval(timer);
+      }, 5);
+    `);
+    await withEnv({ AGY_PATH: bin, AGY_ACP_MAX_CONCURRENT_PROBES: "02" }, async () => {
+      const account = testAccount("default-limit");
+      const probes = Array.from({ length: 7 }, () => execAgyBounded(account, [], { timeoutMs: 3_000 }));
+      try {
+        await waitUntil(() => fs.existsSync(log) && fs.readFileSync(log, "utf8").trim().split("\n").length >= 6);
+        expect(fs.readFileSync(log, "utf8").trim().split("\n")).toHaveLength(6);
+      } finally { fs.writeFileSync(gate, "release"); }
+      expect((await Promise.all(probes)).every((r) => r.exitCode === 0)).toBe(true);
+      expect(fs.readFileSync(log, "utf8").trim().split("\n")).toHaveLength(7);
+    });
+  });
+
+  test("parallel import stays within four workers and preserves source order around errors", async () => {
+    let active = 0, peak = 0;
+    const outcomes = await importAccountFiles([
+      '{"refresh_token":"order-0"}', "{", '{"accounts":[{"refresh_token":"order-1"},{"refresh_token":"order-2"}]}',
+      '{}', ...Array.from({ length: 6 }, (_, i) => JSON.stringify({ refresh_token: `order-${i + 3}` })),
+    ], undefined, {
+      fetchFn: importFetch((token) => `${token}@example.com`),
+      verifyAccountFn: async (account) => {
+        active++; peak = Math.max(peak, active);
+        const i = Number(account.label.match(/order-(\d+)/)![1]);
+        await new Promise((r) => setTimeout(r, i === 0 ? 60 : 5));
+        active--; return { ok: true };
+      },
+    });
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(4);
+    expect(outcomes.map((o) => o.type === "success" ? o.accountId : "error")).toEqual([
+      "order-0@example.com", "error", "order-1@example.com", "order-2@example.com", "error",
+      ...Array.from({ length: 6 }, (_, i) => `order-${i + 3}@example.com`),
+    ]);
+  });
+
+  test("import's 100-slot limit counts errors and unique tokens in source order", async () => {
+    let calls = 0;
+    const outcomes = await importAccountFiles(["{", JSON.stringify({ accounts: [
+      { refresh_token: "limit-0" }, { refresh_token: "limit-0" },
+      ...Array.from({ length: 105 }, (_, i) => ({ refresh_token: `limit-${i + 1}` })),
+    ] }), "{"], undefined, {
+      importConcurrency: 16,
+      fetchFn: importFetch((token) => `${token}@example.com`),
+      verifyAccountFn: async () => { calls++; return { ok: true }; },
+    });
+    expect(outcomes).toHaveLength(100);
+    expect(outcomes[0]?.type).toBe("failed");
+    expect(outcomes[99]?.accountId).toBe("limit-98@example.com");
+    expect(calls).toBe(99);
+  });
+
+  test("abort rolls back every committed same-email token and waits for simultaneous in-flight tasks", async () => {
+    const abort = new AbortController();
+    const pendingStarted = new Set<string>();
+    let finishSlow!: () => void;
+    const slowGate = new Promise<void>((r) => { finishSlow = r; });
+    let slowFinished = false;
+    const emailFor = (token: string) => token.startsWith("dup-") ? "batch-duplicate@example.com" : `${token}@example.com`;
+    const batch = importAccountFiles([JSON.stringify({ accounts: [
+      "dup-a", "dup-b", "slow-a", "slow-b", "unstarted",
+    ].map((refresh_token) => ({ refresh_token })) })], { signal: abort.signal }, {
+      importConcurrency: 2,
+      fetchFn: importFetch(emailFor),
+      verifyAccountFn: async (account, signal) => {
+        if (account.label.startsWith("slow-")) {
+          pendingStarted.add(account.label);
+          await slowGate; // Deliberately ignores abort until the test permits completion.
+          slowFinished = true;
+          expect(signal?.aborted).toBe(true);
+        }
+        return { ok: true };
+      },
+    });
+    const dupRef = accountRefFromEmail(emailFor("dup-a"));
+    const dupDir = path.join(TEST_DIR, "accounts", dupRef);
+    const tokenFile = path.join(dupDir, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+    await waitUntil(() => pendingStarted.size === 2 && fs.existsSync(tokenFile) &&
+      fs.readFileSync(tokenFile, "utf8").includes("dup-b") && fs.existsSync(path.join(dupDir, ".commit-stamp")));
+    // Both workers reached their next slot, so both same-email commits are complete.
+    abort.abort();
+    let settled = false; void batch.then(() => { settled = true; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settled).toBe(false);
+    finishSlow();
+    const results = await batch;
+    expect(slowFinished).toBe(true);
+    expect(results).toEqual([
+      { type: "failed", error: "Sign-in cancelled", accountId: dupRef },
+      { type: "failed", error: "Sign-in cancelled", accountId: dupRef },
+    ]);
+    for (const email of [emailFor("dup-a"), emailFor("slow-a"), emailFor("slow-b"), emailFor("unstarted")]) {
+      expect(fs.existsSync(path.join(TEST_DIR, "accounts", accountRefFromEmail(email)))).toBe(false);
+    }
+  });
+
+  test("aborted import lock waiter detaches promptly without bypassing a live predecessor", async () => {
+    let release!: () => void;
+    let verifies = 0;
+    const gate = new Promise<void>((r) => { release = r; });
+    const deps = {
+      fetchFn: importFetch(() => "abort-lock@example.com"),
+      verifyAccountFn: async () => { verifies++; await gate; return { ok: true }; },
+    };
+    const first = importAccountFiles('{"refresh_token":"lock-a"}', undefined, deps);
+    await waitUntil(() => verifies === 1);
+    const abort = new AbortController();
+    const second = importAccountFiles('{"refresh_token":"lock-b"}', { signal: abort.signal }, deps);
+    await new Promise((r) => setTimeout(r, 10));
+    abort.abort();
+    expect(await second).toEqual([]);
+    const third = importAccountFiles('{"refresh_token":"lock-c"}', undefined, deps);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(verifies).toBe(1);
+    release();
+    expect((await first)[0]?.type).toBe("success");
+    expect((await third)[0]?.type).toBe("success");
+  });
+
+  test("abort cleanup preserves accounts touched by another batch between same-email commits", async () => {
+    const abort = new AbortController();
+    const email = "externally-touched@example.com";
+    const baseFetch = importFetch(() => email);
+    let externalRef = "";
+    const deps = {
+      importConcurrency: 1,
+      fetchFn: (async (input: any, init: any) => {
+        if (String(input).includes("oauth2.googleapis.com/token") &&
+            new URLSearchParams(init.body).get("refresh_token") === "external-second") {
+          const outside = await importAccountFiles('{"refresh_token":"external-outside"}', undefined, {
+            fetchFn: baseFetch, verifyAccountFn: async () => ({ ok: true }),
+          });
+          externalRef = (outside[0] as any).metadata.accountRef;
+        }
+        return baseFetch(input, init);
+      }) as typeof fetch,
+      verifyAccountFn: async (account: AccountDescriptor) => {
+        const token = readStoredAgyOAuthCredentials(account)?.refreshToken;
+        if (token === "external-abort") abort.abort();
+        return { ok: true };
+      },
+    };
+    const results = await importAccountFiles(JSON.stringify({ accounts: [
+      "external-first", "external-second", "external-abort",
+    ].map((refresh_token) => ({ refresh_token })) }), { signal: abort.signal }, deps);
+    expect(externalRef).toBe(accountRefFromEmail(email));
+    expect(results.map((r) => r.type)).toEqual(["success", "success"]);
+    const dir = path.join(TEST_DIR, "accounts", externalRef);
+    expect(fs.existsSync(path.join(dir, ".commit-stamp"))).toBe(true);
+    expect(fs.readFileSync(path.join(dir, ".gemini", "antigravity-cli", "antigravity-oauth-token"), "utf8"))
+      .toContain("external-second");
+  });
+
+  test("abort cleanup surfaces deletion failures instead of reporting clean cancellation", async () => {
+    const abort = new AbortController();
+    const firstRef = accountRefFromEmail("cleanup-first@example.com");
+    const firstDir = path.join(TEST_DIR, "accounts", firstRef);
+    const originalRm = fs.rmSync;
+    fs.rmSync = ((target: fs.PathLike, options: any) => {
+      if (String(target) === firstDir) throw new Error("simulated rollback failure");
+      return originalRm(target, options);
+    }) as typeof fs.rmSync;
+    try {
+      const results = await importAccountFiles(JSON.stringify({ accounts: [
+        { refresh_token: "cleanup-first" }, { refresh_token: "cleanup-abort" },
+      ] }), { signal: abort.signal }, {
+        importConcurrency: 1,
+        fetchFn: importFetch((token) => `${token}@example.com`),
+        verifyAccountFn: async (account) => {
+          if (account.label === "cleanup-abort@example.com") abort.abort();
+          return { ok: true };
+        },
+      });
+      expect(results).toHaveLength(1);
+      expect(results[0]?.type).toBe("failed");
+      expect((results[0] as any).error).toContain("Sign-in cancellation cleanup failed: simulated rollback failure");
+      expect(fs.existsSync(firstDir)).toBe(true);
+    } finally {
+      fs.rmSync = originalRm;
+      fs.rmSync(firstDir, { recursive: true, force: true });
+    }
+  });
+
+  test("abort also interrupts cross-process file-lock polling without deleting its owner's lock", async () => {
+    const email = "file-lock-abort@example.com";
+    const lockPath = path.join(TEST_DIR, "accounts", `${accountRefFromEmail(email)}.lock`);
+    fs.writeFileSync(lockPath, `${process.pid}:live-owner\n`);
+    const abort = new AbortController();
+    let verified = false;
+    try {
+      const batch = importAccountFiles('{"refresh_token":"file-lock-abort"}', { signal: abort.signal }, {
+        fetchFn: importFetch(() => email),
+        verifyAccountFn: async () => { verified = true; return { ok: true }; },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      abort.abort();
+      expect(await batch).toEqual([]);
+      expect(verified).toBe(false);
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(`${process.pid}:live-owner\n`);
+    } finally { fs.rmSync(lockPath, { force: true }); }
+  });
+
+  test("usage waiters isolate cancellation, abandon all-cancelled flights, and start fresh immediately", async () => {
+    const log = path.join(TEST_DIR, "usage-abort.log");
+    const bin = writeProbe("usage-abort-probe", `
+      require("node:fs").appendFileSync(${JSON.stringify(log)}, process.pid + "\\n");
+      setTimeout(() => console.log(${JSON.stringify(JSON.stringify(REAL_USAGE_JSON))}), 180);
+    `);
+    await withEnv({ AGY_PATH: bin }, async () => {
+      const account = testAccount("usage-abort");
+      const a = new AbortController();
+      const one = queryAccountUsage(account, ["gemini-4-argon"], { quotaRouting: true, signal: a.signal });
+      const two = queryAccountUsage(account, ["gemini-4-argon"], { quotaRouting: true });
+      await waitUntil(() => fs.existsSync(log));
+      a.abort();
+      expect((await one).error).toBe("Usage query cancelled");
+      expect((await two).windows).toHaveLength(4);
+      expect(fs.readFileSync(log, "utf8").trim().split("\n")).toHaveLength(1);
+
+      const another = testAccount("usage-abandon");
+      const b = new AbortController(), c = new AbortController();
+      const three = queryAccountUsage(another, [], { quotaRouting: true, signal: b.signal });
+      const four = queryAccountUsage(another, [], { quotaRouting: true, signal: c.signal });
+      await waitUntil(() => fs.readFileSync(log, "utf8").trim().split("\n").length === 2);
+      const killedPid = Number(fs.readFileSync(log, "utf8").trim().split("\n")[1]);
+      b.abort(); c.abort();
+      const fresh = queryAccountUsage(another, [], { quotaRouting: true });
+      expect((await three).error).toBe("Usage query cancelled");
+      expect((await four).error).toBe("Usage query cancelled");
+      expect((await fresh).error).toBeUndefined();
+      await waitUntil(() => { try { process.kill(killedPid, 0); return false; } catch { return true; } });
+      expect(fs.readFileSync(log, "utf8").trim().split("\n")).toHaveLength(3);
+      const pre = new AbortController(); pre.abort();
+      expect((await queryAccountUsage(testAccount("pre-abort"), [], { quotaRouting: true, signal: pre.signal })).error)
+        .toBe("Usage query cancelled");
+      expect(fs.readFileSync(log, "utf8").trim().split("\n")).toHaveLength(3);
+    });
+  });
+
+  test("plan waiters isolate abort and abandon only when every active caller leaves", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ signal: AbortSignal; finish: () => void }> = [];
+    globalThis.fetch = ((_: any, init: any) => new Promise<Response>((resolve, reject) => {
+      const signal = init.signal as AbortSignal;
+      requests.push({ signal, finish: () => resolve(Response.json({ paidTier: { name: "Test Pro" } })) });
+      if (signal.aborted) reject(new Error("aborted"));
+      else signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    })) as typeof fetch;
+    try {
+      const account = testAccount("plan-abort", true);
+      const a = new AbortController();
+      const one = queryAccountPlan(account, a.signal);
+      const two = queryAccountPlan(account);
+      await waitUntil(() => requests.length === 1);
+      a.abort();
+      expect(await one).toBeUndefined();
+      expect(requests[0]!.signal.aborted).toBe(false);
+      requests[0]!.finish();
+      expect(await two).toBe("Test Pro");
+      const other = testAccount("plan-abandon", true);
+      const b = new AbortController(), c = new AbortController();
+      const three = queryAccountPlan(other, b.signal), four = queryAccountPlan(other, c.signal);
+      await waitUntil(() => requests.length === 2);
+      b.abort(); c.abort();
+      expect(requests[1]!.signal.aborted).toBe(true);
+      const fresh = queryAccountPlan(other);
+      expect(await three).toBeUndefined(); expect(await four).toBeUndefined();
+      await waitUntil(() => requests.length === 3);
+      requests[2]!.finish();
+      expect(await fresh).toBe("Test Pro");
+      const pre = new AbortController(); pre.abort();
+      expect(await queryAccountPlan(testAccount("plan-pre", true), pre.signal)).toBeUndefined();
+      expect(requests).toHaveLength(3);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  test("abandoning usage does not cancel an independent plan waiter", async () => {
+    const bin = writeProbe("usage-plan-abort-probe", "setTimeout(() => {}, 1000);");
+    const originalFetch = globalThis.fetch;
+    let planSignal: AbortSignal | undefined;
+    let finish!: () => void;
+    globalThis.fetch = ((_: any, init: any) => new Promise<Response>((resolve) => {
+      planSignal = init.signal;
+      finish = () => resolve(Response.json({ paidTier: { name: "Independent Pro" } }));
+    })) as typeof fetch;
+    try {
+      await withEnv({ AGY_PATH: bin }, async () => {
+        const account = testAccount("usage-plan-abort", true);
+        const abort = new AbortController();
+        const usage = queryAccountUsage(account, [], { quotaRouting: true, signal: abort.signal });
+        const plan = queryAccountPlan(account);
+        await waitUntil(() => !!planSignal);
+        abort.abort();
+        expect((await usage).error).toBe("Usage query cancelled");
+        expect(planSignal!.aborted).toBe(false);
+        finish();
+        expect(await plan).toBe("Independent Pro");
+      });
+    } finally { globalThis.fetch = originalFetch; }
+  });
+});

@@ -15,9 +15,13 @@ import { AgySessionWorker } from "../src/runtime/worker";
 import {
   CONTEXT_BUDGET_FAILURE_MESSAGE,
   GENERIC_FAILURE_MESSAGE,
+  TRANSIENT_LIMIT_FAILURE_MESSAGE,
   TurnLogWatch,
   classifyAgentFailure,
   extractErrorEvidence,
+  hasUpstreamRetryEvidence,
+  looksLikeAgentRetryNotice,
+  splitAgentRetryNotices,
   stderrDelta,
 } from "../src/runtime/diagnostics";
 
@@ -27,6 +31,17 @@ const TEMP_ROOT = fs.mkdtempSync(
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(TEMP_ROOT, prefix));
+}
+
+/**
+ * Stages the log line `agy` writes when it retries upstream. The plugin only
+ * treats notice-shaped stream text as diagnostic when this evidence exists.
+ */
+function writeUpstreamRetryEvidence(workspaceDir: string): void {
+  fs.writeFileSync(
+    path.join(workspaceDir, "agy-acp.log.90001"),
+    "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 4s\n",
+  );
 }
 
 interface FakeAcpScriptContext {
@@ -44,6 +59,10 @@ interface FakeAcpScriptContext {
   terminateTurn: (log?: { name: string; text: string; append?: boolean }) => void;
   /** Answers the in-flight `session/prompt` with a JSON-RPC error. */
   failTurn: (message: string, code?: number) => void;
+  /** Answers the in-flight `session/prompt` as cancelled, without logging. */
+  cancelTurn: () => void;
+  /** Answers the in-flight `session/prompt` with a plain `end_turn`. */
+  finishTurn: () => void;
 }
 
 /** The chunk agy emits as the only content of a turn that failed internally. */
@@ -126,6 +145,12 @@ function createScriptedFakeAcpChild(
     },
     failTurn: (message, code = -32000) => {
       ctx.sendError(promptRequestId, code, message);
+    },
+    cancelTurn: () => {
+      ctx.sendResult(promptRequestId, { stopReason: "cancelled" });
+    },
+    finishTurn: () => {
+      ctx.sendResult(promptRequestId, { stopReason: "end_turn" });
     },
   };
 
@@ -397,18 +422,115 @@ describe("extractErrorEvidence and classifyAgentFailure", () => {
     expect(classifyAgentFailure(line)).toBe("internal");
   });
 
-  test("classifies real RESOURCE_EXHAUSTED and HTTP 429 errors as quota", () => {
+  test("recognizes upstream retry evidence in raw logs, including info records", () => {
+    expect(
+      hasUpstreamRetryEvidence(
+        "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429)), retrying in 4s",
+      ),
+    ).toBe(true);
+    // A bare failure is not evidence that `agy` retried upstream.
+    expect(hasUpstreamRetryEvidence("E1113 20:17:00.000001 910 http.go:100] HTTP 429")).toBe(
+      false,
+    );
+    expect(hasUpstreamRetryEvidence("")).toBe(false);
+  });
+
+  test("separates agy retry notices from streamed text and holds a split prefix", () => {
+    const notice =
+      "\n⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n\n";
+    const onlyNotice = splitAgentRetryNotices(notice);
+    expect(onlyNotice.count).toBe(1);
+    expect(onlyNotice.text.trim()).toBe("");
+    expect(onlyNotice.hold).toBe("");
+
+    const mixed = splitAgentRetryNotices(
+      "before\n⚠ API error (attempt 2): boom\nafter",
+    );
+    expect(mixed.count).toBe(1);
+    expect(mixed.text).toBe("before\nafter");
+    expect(mixed.hold).toBe("");
+
+    // A notice that starts in the last bytes of a chunk is held for the next one,
+    // with the newline that separated it so the original bytes can be restored.
+    const split = splitAgentRetryNotices("text\n⚠ API error (att");
+    expect(split.count).toBe(0);
+    expect(split.text).toBe("text");
+    expect(split.hold).toBe("\n⚠ API error (att");
+
+    // A header whose body is still to come is not a complete notice: consuming
+    // it here would let the body arrive as model text.
+    const headerOnly = splitAgentRetryNotices("\n⚠ API error (attempt 1):");
+    expect(headerOnly.count).toBe(0);
+    expect(headerOnly.text).toBe("");
+    expect(headerOnly.hold).toBe("\n⚠ API error (attempt 1):");
+
+    // …and it is counted exactly once when its newline arrives.
+    const completed = splitAgentRetryNotices(
+      headerOnly.hold + " RESOURCE_EXHAUSTED (code 429).\n",
+    );
+    expect(completed.count).toBe(1);
+    expect(completed.text).toBe("");
+    expect(completed.hold).toBe("");
+
+    // A complete notice followed by the next one's header counts only the first.
+    const pair = splitAgentRetryNotices(
+      "⚠ API error (attempt 1): boom\n⚠ API error (attempt 2): ",
+    );
+    expect(pair.count).toBe(1);
+    expect(pair.hold).toBe("\n⚠ API error (attempt 2): ");
+    expect(looksLikeAgentRetryNotice(pair.hold)).toBe(true);
+    expect(looksLikeAgentRetryNotice("API docs are in README")).toBe(false);
+
+    // Releasing a held candidate reproduces the original bytes, newline included.
+    const held = splitAgentRetryNotices("hello\nAPI");
+    expect(held.text).toBe("hello");
+    expect(held.hold).toBe("\nAPI");
+    const released = splitAgentRetryNotices(held.hold + " documentation");
+    expect(released.hold).toBe("");
+    expect(released.text).toBe("\nAPI documentation");
+  });
+
+  test("holds only a fragment that could begin a notice, never ordinary answer text", () => {
+    // A fragment that is a prefix of the notice start is held for the next chunk.
+    expect(splitAgentRetryNotices("API").hold).toBe("API");
+    // A fragment that already holds a notice start but has no newline yet is
+    // held too: the attempt number or body is still to come.
+    expect(splitAgentRetryNotices("\n⚠ API error (attempt ").hold).toBe(
+      "\n⚠ API error (attempt ",
+    );
+    // The caller flushes a held fragment when the turn ends, so an answer that
+    // merely begins like a notice is still delivered.
+    expect(splitAgentRetryNotices("the answer is Option A").hold).toBe("");
+    expect(splitAgentRetryNotices("API docs are in README").hold).toBe("");
+  });
+
+  test("classifies a named exhausted quota as quota and a bare 429 as rate_limit", () => {
     const rpcQuota =
       "E1113 20:15:00.123456     500 errorreport.go:273] agent executor error: rpc error: code = ResourceExhausted desc = You have exhausted your quota for this model.";
     const http429 =
       "E1113 20:15:01.123456     500 http_helpers.go:100] HTTP 429 Too Many Requests";
     const warn429 =
       "W1113 20:15:02.123456     500 http_helpers.go:100] rate_limit_exceeded: RESOURCE_EXHAUSTED";
+    // The exact per-minute limit line `agy` writes while it backs off.
+    const agyGeneric429 =
+      "⚠ API error (attempt 8): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).";
+    // Code Assist's own wording for a spent window names a reset, so it is quota.
+    const capacityReset =
+      "You have exhausted your capacity on this model. Your quota will reset after 2h.";
 
     expect(classifyAgentFailure(rpcQuota)).toBe("quota");
-    expect(classifyAgentFailure(http429)).toBe("quota");
+    expect(classifyAgentFailure(capacityReset)).toBe("quota");
+    expect(classifyAgentFailure(http429)).toBe("rate_limit");
     expect(extractErrorEvidence(warn429)).toContain("RESOURCE_EXHAUSTED");
-    expect(classifyAgentFailure(warn429)).toBe("quota");
+    expect(classifyAgentFailure(warn429)).toBe("rate_limit");
+    expect(classifyAgentFailure(agyGeneric429)).toBe("rate_limit");
+    // `agy` writes its in-process retry at info severity; that record is the
+    // only evidence a single-retry 429 termination carries.
+    expect(
+      classifyAgentFailure(
+        "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 4s",
+      ),
+    ).toBe("rate_limit");
   });
 
   test("classifies explicit raw RPC 401 / auth failures as auth", () => {
@@ -460,12 +582,12 @@ describe("extractErrorEvidence and classifyAgentFailure", () => {
     expect(extractErrorEvidence(extractErrorEvidence(glogStatus429))).toBe("status: 429");
     expect(extractErrorEvidence(extractErrorEvidence(glogSignIn))).toBe("Please sign in");
 
-    expect(classifyAgentFailure(extractErrorEvidence(glog429))).toBe("quota");
-    expect(classifyAgentFailure(extractErrorEvidence(glogStatus429))).toBe("quota");
+    expect(classifyAgentFailure(extractErrorEvidence(glog429))).toBe("rate_limit");
+    expect(classifyAgentFailure(extractErrorEvidence(glogStatus429))).toBe("rate_limit");
     expect(classifyAgentFailure(extractErrorEvidence(glogSignIn))).toBe("auth");
 
-    expect(classifyAgentFailure("HTTP 429")).toBe("quota");
-    expect(classifyAgentFailure("status: 429")).toBe("quota");
+    expect(classifyAgentFailure("HTTP 429")).toBe("rate_limit");
+    expect(classifyAgentFailure("status: 429")).toBe("rate_limit");
     expect(classifyAgentFailure("Please sign in")).toBe("auth");
   });
 
@@ -657,6 +779,298 @@ describe("AgySessionWorker diagnostics integration", () => {
     }
   });
 
+  test("ends a turn that only spins through agy retry notices, without leaking them as text", async () => {
+    const ws = makeTempDir("worker-retry-storm-");
+    const worker = new AgySessionWorker(account, "diag-sess-storm", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          // `agy` streams its own retry notices while it backs off; nothing else
+          // is produced, so the turn must not wait out the whole ladder.
+          writeUpstreamRetryEvidence(ws);
+          for (const attempt of [1, 2, 3]) {
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: {
+                  text: `\n⚠ API error (attempt ${attempt}): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n\n`,
+                },
+              },
+            });
+          }
+          setTimeout(() => ctx.cancelTurn(), 25);
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "storm");
+      const leaked = events
+        .filter((e) => e.type === "text_delta")
+        .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
+        .join("");
+      expect(leaked).toBe("");
+      expect(events.find((e) => e.type === "error")).toEqual({
+        type: "error",
+        status: 429,
+        errorType: "rate_limit_error",
+        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+      });
+      // Magpie reads error text for quota wording and holds the account on a
+      // match, so this message must stay outside both word families.
+      expect(TRANSIENT_LIMIT_FAILURE_MESSAGE).not.toMatch(/quota|rate.?limit/i);
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("delivers an answer whose last chunk looks like the start of a retry notice", async () => {
+    const ws = makeTempDir("worker-notice-tail-");
+    const worker = new AgySessionWorker(account, "diag-sess-tail", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          // `agy` notices begin with `API error (attempt`; a real answer can end
+          // with the same first characters (` A` after `Option`). It must be
+          // delivered, not held as a notice fragment and dropped.
+          writeUpstreamRetryEvidence(ws);
+          for (const chunk of ["The answer is Option", " A"]) {
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { text: chunk },
+              },
+            });
+          }
+          ctx.finishTurn();
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "tail");
+      const answer = events
+        .filter((e) => e.type === "text_delta")
+        .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
+        .join("");
+      expect(answer).toBe("The answer is Option A");
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("delivers a quoted retry notice when the turn's log shows no upstream retry", async () => {
+    const ws = makeTempDir("worker-notice-quoted-");
+    const quoted =
+      "⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n" +
+      "⚠ API error (attempt 2): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n" +
+      "That is what your log showed.";
+    const worker = new AgySessionWorker(account, "diag-sess-quoted", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          // No `Run: attempt N failed` line: the model is quoting the incident,
+          // not `agy` retrying, so every line belongs to the answer.
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: quoted },
+            },
+          });
+          ctx.finishTurn();
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "explain the incident");
+      const answer = events
+        .filter((e) => e.type === "text_delta")
+        .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
+        .join("");
+      expect(answer).toBe(quoted);
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("answers a single-retry termination with the transient 429, not a generic 500", async () => {
+    const ws = makeTempDir("worker-single-retry-log-");
+    const worker = new AgySessionWorker(account, "diag-sess-single", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          // `agy` retried once (info severity), then gave up with the terminal
+          // error marker. That record is the only evidence this turn has, so the
+          // answer must be the transient 429 a caller can fail over on.
+          ctx.terminateTurn({
+            name: "agy-acp.log.91010",
+            text: "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 4s\n",
+          });
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "single retry");
+      expect(events.find((e) => e.type === "error")).toEqual({
+        type: "error",
+        status: 429,
+        errorType: "rate_limit_error",
+        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+      });
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("keeps the transient 429 when agy settles the cancelled prompt as an error", async () => {
+    const ws = makeTempDir("worker-notice-cancel-error-");
+    const worker = new AgySessionWorker(account, "diag-sess-cancel", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          writeUpstreamRetryEvidence(ws);
+          for (const attempt of [1, 2]) {
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: {
+                  text: `\n⚠ API error (attempt ${attempt}): RESOURCE_EXHAUSTED (code 429).\n`,
+                },
+              },
+            });
+          }
+          // `agy` keeps streaming while the cancel travels, then settles the
+          // prompt as an error. Neither may turn this turn into a generic 500 or
+          // leak a chunk ahead of the 429.
+          setTimeout(() => {
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { text: "Recovered answer" },
+              },
+            });
+          }, 10);
+          setTimeout(() => ctx.failTurn("context canceled", -32800), 25);
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "cancel error");
+      const leaked = events
+        .filter((e) => e.type === "text_delta")
+        .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
+        .join("");
+      expect(leaked).toBe("");
+      expect(events.find((e) => e.type === "error")).toEqual({
+        type: "error",
+        status: 429,
+        errorType: "rate_limit_error",
+        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+      });
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("strips a retry notice split across two chunks once the log corroborates it", async () => {
+    const ws = makeTempDir("worker-notice-split-");
+    const worker = new AgySessionWorker(account, "diag-sess-split", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          writeUpstreamRetryEvidence(ws);
+          for (const chunk of [
+            "\n⚠ API error (attempt ",
+            "1): RESOURCE_EXHAUSTED (code 429).\n",
+            "\n⚠ API error (attempt 2): RESOURCE_EXHAUSTED (code 429).\n",
+          ]) {
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { text: chunk },
+              },
+            });
+          }
+          setTimeout(() => ctx.cancelTurn(), 25);
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "split");
+      const leaked = events
+        .filter((e) => e.type === "text_delta")
+        .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
+        .join("");
+      expect(leaked).toBe("");
+      expect(events.find((e) => e.type === "error")).toEqual({
+        type: "error",
+        status: 429,
+        errorType: "rate_limit_error",
+        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+      });
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("still guards a retry storm when the log record lands one chunk late", async () => {
+    const ws = makeTempDir("worker-notice-late-log-");
+    const worker = new AgySessionWorker(account, "diag-sess-late", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          const emit = (text: string) =>
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { text },
+              },
+            });
+
+          // The first notice arrives before `agy` has flushed its log line, and the
+          // record stays unreadable through the second chunk (a split notice). It
+          // must be held, not delivered as answer text: delivering it would mark
+          // the turn as having produced work and blind the guard for good.
+          emit("\n⚠ API error (attempt ");
+          emit("1): RESOURCE_EXHAUSTED (code 429).\n");
+          writeUpstreamRetryEvidence(ws);
+          emit("\n⚠ API error (attempt 2): RESOURCE_EXHAUSTED (code 429).\n");
+          setTimeout(() => ctx.cancelTurn(), 25);
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "late log");
+      const leaked = events
+        .filter((e) => e.type === "text_delta")
+        .map((e) => (e as Extract<TurnStreamEvent, { type: "text_delta" }>).text)
+        .join("");
+      expect(leaked).toBe("");
+      expect(events.find((e) => e.type === "error")).toEqual({
+        type: "error",
+        status: 429,
+        errorType: "rate_limit_error",
+        message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+      });
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
   test("diagnoses current-turn RPC Unauthenticated in a newly spawned numbered worker log as 401", async () => {
     const ws = makeTempDir("worker-auth-401-");
 
@@ -741,13 +1155,28 @@ describe("AgySessionWorker diagnostics integration", () => {
 
     // regression #3: a numbered worker log written during the turn, before content.
     {
-      name: "regression #3: numbered worker log HTTP 429 before first content returns 429 JSON",
+      name: "regression #3: a bare numbered worker log HTTP 429 returns the transient 429 JSON",
       workspacePrefix: "worker-http-429-",
       sessionId: "diag-http-429",
       script: (ctx) => {
         ctx.terminateTurn({
           name: "agy-acp.log.91001",
           text: "E1113 20:17:00.000001     910 http.go:100] HTTP 429\n",
+        });
+      },
+      status: 429,
+      signInHeader: null,
+      errorType: "rate_limit_error",
+      message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+    },
+    {
+      name: "regression #3: a numbered worker log naming an exhausted quota returns the account-quota 429 JSON",
+      workspacePrefix: "worker-http-quota-429-",
+      sessionId: "diag-http-quota-429",
+      script: (ctx) => {
+        ctx.terminateTurn({
+          name: "agy-acp.log.91005",
+          text: "E1113 20:17:00.500001     910 errorreport.go:273] rpc error: code = ResourceExhausted desc = You have exhausted your quota for this model.\n",
         });
       },
       status: 429,

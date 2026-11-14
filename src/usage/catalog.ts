@@ -1,5 +1,5 @@
 import type { AccountDescriptor, EffortLevel, OfferedModelVariant } from "../types";
-import { execAgyBounded } from "../accounts/env";
+import { execAgyBounded, getAgyBinaryFingerprint } from "../accounts/env";
 
 export const EFFORT_ORDER: EffortLevel[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -496,13 +496,23 @@ interface CatalogLookup {
   fellBack: boolean;
 }
 
+interface CachedCatalogEntry {
+  catalog: AccountCatalog;
+  fetchedAt: number;
+  binaryFingerprint: string;
+}
+interface InFlightCatalogRefresh {
+  promise: Promise<CatalogLookup>;
+  binaryFingerprint: string;
+}
+
 /**
  * Per-account CatalogService with 5-minute TTL, single-flight refresh,
  * and fast-return static fallback if initial probe exceeds 1500ms.
  */
 export class CatalogService {
-  private cache = new Map<string, { catalog: AccountCatalog; fetchedAt: number }>();
-  private inFlight = new Map<string, Promise<CatalogLookup>>();
+  private cache = new Map<string, CachedCatalogEntry>();
+  private inFlight = new Map<string, InFlightCatalogRefresh>();
 
   /**
    * Drops long-dead catalogs before each lookup. The TTL is deliberately far
@@ -552,18 +562,17 @@ export class CatalogService {
    */
   private async fetchAccountCatalog(
     account: AccountDescriptor,
-    signal?: AbortSignal
   ): Promise<CatalogLookup> {
     const cacheScopeKey = CatalogService.cacheScopeKey(account);
     const res = await execAgyBounded(account, ["models"], {
       timeoutMs: 10_000,
-      signal,
     });
 
     if (res.exitCode !== 0 || !res.stdout.trim()) {
       const existing = this.cache.get(cacheScopeKey);
       return {
-        catalog: existing?.catalog ?? getStaticFallbackCatalog(),
+        catalog: existing && Date.now() - existing.fetchedAt < CATALOG_MAX_STALE_AGE_MS
+          ? existing.catalog : getStaticFallbackCatalog(),
         fellBack: true,
       };
     }
@@ -572,7 +581,8 @@ export class CatalogService {
     if (rawList.length === 0) {
       const existing = this.cache.get(cacheScopeKey);
       return {
-        catalog: existing?.catalog ?? getStaticFallbackCatalog(),
+        catalog: existing && Date.now() - existing.fetchedAt < CATALOG_MAX_STALE_AGE_MS
+          ? existing.catalog : getStaticFallbackCatalog(),
         fellBack: true,
       };
     }
@@ -595,58 +605,62 @@ export class CatalogService {
     this.pruneStaleCache(now);
     const cached = this.cache.get(cacheScopeKey);
 
-    if (!options?.forceRefresh && cached && now - cached.fetchedAt < CATALOG_TTL_MS) {
+    const fallback = (): CatalogLookup => {
+      const existing = this.cache.get(cacheScopeKey);
+      return {
+        catalog: existing && Date.now() - existing.fetchedAt < CATALOG_MAX_STALE_AGE_MS
+          ? existing.catalog : getStaticFallbackCatalog(),
+        fellBack: true,
+      };
+    };
+    if (options?.signal?.aborted) return fallback();
+    const currentFingerprint = getAgyBinaryFingerprint();
+    if (!options?.forceRefresh && cached && cached.binaryFingerprint === currentFingerprint &&
+        now - cached.fetchedAt < CATALOG_TTL_MS) {
       return { catalog: cached.catalog, fellBack: false };
     }
 
-    let refresh = this.inFlight.get(cacheScopeKey);
-    if (!refresh) {
-      refresh = this.fetchAccountCatalog(account, options?.signal)
+    let flight = this.inFlight.get(cacheScopeKey);
+    if (!flight || flight.binaryFingerprint !== currentFingerprint) {
+      const record: InFlightCatalogRefresh = {
+        binaryFingerprint: currentFingerprint,
+        promise: undefined!,
+      };
+      record.promise = this.fetchAccountCatalog(account)
         .then((lookup) => {
-          if (!lookup.fellBack) {
-            this.cache.set(cacheScopeKey, { catalog: lookup.catalog, fetchedAt: Date.now() });
+          if (!lookup.fellBack && getAgyBinaryFingerprint() === currentFingerprint &&
+              this.inFlight.get(cacheScopeKey) === record) {
+            this.cache.set(cacheScopeKey, {
+              catalog: lookup.catalog, fetchedAt: Date.now(), binaryFingerprint: currentFingerprint,
+            });
           }
           return lookup;
         })
-        .catch(() => {
-          const prev = this.cache.get(cacheScopeKey);
-          return {
-            catalog: prev?.catalog ?? getStaticFallbackCatalog(),
-            fellBack: true,
-          };
-        })
+        .catch(fallback)
         .finally(() => {
-          if (this.inFlight.get(cacheScopeKey) === refresh) {
+          if (this.inFlight.get(cacheScopeKey) === record) {
             this.inFlight.delete(cacheScopeKey);
-            // Trim only once this key leaves `inFlight`: `pruneStaleCache` skips
-            // in-flight keys, so pruning during a concurrent refresh burst would
-            // leave every settled entry counted (200 refreshes -> 200 entries).
             this.pruneStaleCache(Date.now());
           }
         });
-
-      this.inFlight.set(cacheScopeKey, refresh);
+      this.inFlight.set(cacheScopeKey, record);
+      flight = record;
     }
 
-    let timer: NodeJS.Timeout | undefined;
-    const timeoutPromise = new Promise<"timed_out">((resolve) => {
-      timer = setTimeout(() => resolve("timed_out"), CATALOG_FAST_WAIT_MS);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const localFallback = new Promise<CatalogLookup>((resolve) => {
+      timer = setTimeout(() => resolve(fallback()), CATALOG_FAST_WAIT_MS);
+      onAbort = () => resolve(fallback());
+      options?.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options?.signal?.aborted) onAbort();
     });
-
     try {
-      const winner = await Promise.race([refresh, timeoutPromise]);
-      if (winner !== "timed_out") {
-        return winner;
-      }
+      return await Promise.race([flight.promise, localFallback]);
     } finally {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
+      if (onAbort) options?.signal?.removeEventListener("abort", onAbort);
     }
-
-    // Refresh timed out: return cached catalog if available, or static fallback while refreshing in background
-    return {
-      catalog: cached?.catalog ?? getStaticFallbackCatalog(),
-      fellBack: true,
-    };
   }
 
   /**
