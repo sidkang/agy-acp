@@ -41,18 +41,36 @@ bounded loss.
 
 - A service-level `403 PERMISSION_DENIED` carrying "This service has been disabled in
   this account for violation of Terms of Service. Please submit an appeal to continue
-  using this product."
-- Not quota exhaustion, not geo or age ineligibility, not account verification. Reports
-  of those four are frequently confused; only the sentence above is the terms ban.
-- The ban covers Antigravity, Gemini CLI and Code Assist, not the whole Google account:
-  web Gemini keeps working in the reports, and a Google employee said other services
-  were unaffected (Varun Mohan, 2026-02-23, quoted in VentureBeat).
-- No advance notice. One self-serve appeal; the form's own wording says repeated
-  violations lead to permanent suspension, and asks the user to confirm the third-party
-  tool was removed. Restorations in 24-72 hours are commonly reported.
+  using this product." This is the only shape observed in the reports below.
+- Different from quota exhaustion, geo or age ineligibility, and account verification.
+  The four are frequently confused in threads; only this sentence is the terms ban.
+- Reported to cover Antigravity, Gemini CLI and Code Assist rather than the whole Google
+  account: web Gemini kept working in several reports, and a Google employee said other
+  services were unaffected (Varun Mohan, 2026-02-23).
+- No advance notice appears in any report consulted. Google's Terms of Service allow
+  action without notice where notice would "compromise the operation, integrity, or
+  security of our services". One self-serve appeal is reported; the form's own wording
+  says repeated violations lead to permanent suspension and asks the user to confirm the
+  third-party tool was removed. Restorations in 24-72 hours are reported.
 - Named in reports as grounds: OpenClaw, OpenCode, Claude Code, Codex wrappers,
-  CLIProxyAPI, CPA, 9router, and Antigravity Manager behind a reverse proxy. Paid Pro
-  and Ultra plans are not immune.
+  CLIProxyAPI, CPA, 9router, and Antigravity Manager behind a reverse proxy. Paid Pro and
+  Ultra plans are reported as not immune. These are user reports; Google does not publish
+  per-account reasons.
+
+### Sources for the enforcement claims
+
+Terms quoted above, fetched 2026-11-14:
+[antigravity.google/terms](https://antigravity.google/terms/),
+[antigravity.google/docs/faq](https://antigravity.google/docs/faq/),
+[geminicli.com/docs/resources/faq](https://geminicli.com/docs/resources/faq/),
+[policies.google.com/terms](https://policies.google.com/terms).
+
+Enforcement reports and staff statements consulted: gemini-cli discussion 20632
+(maintainer, 2026-02-27), gemini-cli issue 29759 (2026-10-15), openclaw issue 14203
+(2026-02-11), and threads on discuss.ai.google.dev 123014, 140740, 198483, 198531,
+198859, 199777, plus V2EX and linux.do threads from February to November 2026. Varun
+Mohan's statement is his X post of 2026-02-23, quoted by VentureBeat the same day. The
+appeal-form wording is quoted in gemini-cli issue 29759 and in the linux.do threads.
 
 ## One disabled account, in numbers
 
@@ -91,7 +109,11 @@ The only safety-typed records are 771 `agy_tool_safety triggered=true` lines for
 "unsupported MCP tool", each followed by a `sir_flash_lite triggered=false` decision:
 none became a policy verdict.
 
-### What the numbers rule out
+### What these numbers do not support as the explanation
+
+Each of these is present on the accounts that still work, so none of them separates the
+disabled account from the others. That is not the same as excluding a contributing
+cause: these are two accounts observed after the fact, not a controlled comparison.
 
 - Concurrency: the disabled account peaked at 5 overlapping HTTP requests, a working
   account at 8.

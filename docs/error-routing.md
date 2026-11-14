@@ -189,8 +189,10 @@ A live probe of `agy 1.5.9` found a suspended account answering with the vendor'
 sentence as the turn's content and `stopReason: end_turn`. Nothing errors and no log line is
 written, so a bridge that only reads the result answers `200` with that sentence and Magpie
 keeps choosing the dead account. It was observed on the account that was later suspended; the
-next probe ran on a different login, so this is a permanently dead account, not a flaky turn,
-which is why the class must rotate the account instead of delivering an answer. The sentence is
+next probe ran on a different login, so the sentence reports the state of that account rather than
+a transient turn failure, which is why the class must rotate the account instead of delivering the
+sentence as an answer. These probes do not establish that the suspension is permanent: appeals do
+restore accounts ([account safety](account-safety.md)). The sentence is
 a terminal marker (`AGENT_TERMINAL_MARKERS`), taken at its word only when it is the whole
 answer: a model writing it after prose is quoting it.
 

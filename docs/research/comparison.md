@@ -16,20 +16,20 @@ repository (`agy-acp:` paths, current working tree at 0.1.10, line numbers check
 | Axis | tianzuo555 | fdkevin0 | estebanforge | zacbemis | agy-acp 0.1.10 |
 |---|---|---|---|---|---|
 | Host | pi provider extension | pi provider extension | pi provider extension | pi provider extension | Magpie / OpenCode plugin serving Anthropic Messages HTTP |
-| Upstream | user's `agy`, print-mode stream-json | user's `agy`, `agy acp --process-per-session` | user's `agy`: `agy acp` (default) or stream-json, latched at load | managed `agy_acp_server` runtime from a signed manifest, under a Node supervisor | user's `agy`, `agy acp --worker --disable-telemetry` (`agy-acp:src/runtime/worker.ts:650-651`) |
+| Upstream | user's `agy`, print-mode stream-json | user's `agy`, `agy acp --process-per-session` | user's `agy`: `agy acp` (default) or stream-json, latched at load | managed `agy_acp_server` runtime from a signed manifest, under a Node supervisor | user's `agy`, `agy acp --worker --disable-telemetry` (`agy-acp:src/runtime/worker.ts:646-652`) |
 | Processes | one persistent child per pi session, recycled on fingerprint change | one front per runtime; `agy` forks session workers | one persistent child per engine | two per session binding (supervisor + server), fresh pairs for side operations | one worker process per session, per-account pools and a global scheduler |
-| Agent isolation | Pi-tools mode only: generated agent, `tools: []` | generated `pi-bridge` agent, `tools: []`, isolated home | ACP: none per turn; stream-json: staged agent file with an explicit tool list | client capabilities fs/terminal off; no agent file | generated `magpie-bridge` agent, `tools: []`, `subagent: false`, no inherited MCP or customizations (`agy-acp:src/runtime/worker.ts:581-592`) |
+| Agent isolation | Pi-tools mode only: generated agent, `tools: []` | generated `pi-bridge` agent, `tools: []`, isolated home | ACP: none per turn; stream-json: staged agent file with an explicit tool list | client capabilities fs/terminal off; no agent file | generated `magpie-bridge` agent, `tools: []`, `subagent: false`, no inherited MCP or customizations (`agy-acp:src/runtime/worker.ts:587-596`) |
 | MCP registration | private `mcp_config.json` via `--add-dir`, server `pi-<12 hex>` | ACP `mcpServers`, path tenant + Bearer header | ACP `mcpServers` with header array; private MCP home; global config only as fallback | ACP `mcpServers`, Bearer header | ACP `mcpServers`, secret URL path token |
 | MCP auth | `x-pi-bridge-token` header | 16-byte tenant path + 24-byte Bearer, constant-time; no Host/Origin check | per-process UUID in `x-bridge-token`, constant-time | dashless UUID Bearer, constant-time; no bridge Host/Origin check | 32-byte random URL token, constant-time, loopback Host/Origin enforced (`agy-acp:src/mcp/http-server.ts:15,126-132`) |
 | MCP reply shape | JSON | SSE: headers first, keepalive every 15 s, progress notifications | JSON | JSON, stateless transport per POST | one JSON body after the broker settles (`agy-acp:src/mcp/http-server.ts:168-178`) |
 | Long tool calls | fail-closed cap 480 s | 85 s "still running" relay + `pi_await_result` | 20 s `STILL RUNNING` + `bridge_poll_result` (120 s for delegation-shaped names) | parked; watchdog held | parked up to 15 minutes, authentic `toolu_` ids, no synthetic "still running" (`agy-acp:src/mcp/broker.ts:9-11,57`) |
-| Thinking text | none (stream-json); synthetic `Thought for <n>s, <k> tokens` label | ACP thought chunks; history drops reasoning | ACP thought chunks; stream-json count only | ACP thought chunks; tool_call/plan rendered as thinking | ACP `agent_thought_chunk` (`agy-acp:src/runtime/worker.ts:955`) |
+| Thinking text | none (stream-json); synthetic `Thought for <n>s, <k> tokens` label | ACP thought chunks; history drops reasoning | ACP thought chunks; stream-json count only | ACP thought chunks; tool_call/plan rendered as thinking | ACP `agent_thought_chunk` (`agy-acp:src/runtime/worker.ts:956-963`) |
 | Thinking signature | none | none | none (declared field unused) | none | UUID-shaped, SHA-256 of session and text (`agy-acp:src/protocol/anthropic.ts:1030`); see [`claude-bridge-parity.md`](../claude-bridge-parity.md) |
 | Error surface | pi `stopReason` + free text | 13 codes, 7 from a regex ladder; pi markers `context_length_exceeded:` / `quota exceeded:` | free text; `OK | ERROR | UNKNOWN` outcome | 9 typed codes, not transmitted; redacted text | HTTP status + `error.type` + wording chosen for Magpie's router ([`error-routing.md`](../error-routing.md)) |
 | 429 vs quota | not modeled | `RATE_LIMIT` tested first; `429 ... quota` stays rate limit | none in the turn path | exact "Usage Limit Reached" notice on zero-token or refusal replies | named window -> `quota`, bare 429 -> `rate_limit`; "Usage Limit Reached ... reset in" recognized |
 | Retry hints | none | none | none | none | `Retry-After` from the last wait named; `x-should-retry: false` on 400/401/404 |
 | `agy` notices | stream "was interrupted" downgrade | retry notice dropped; output-cap notice drop/hold/emit; no terminal notices | `<SYSTEM_MESSAGE>` echo stripping | none | retry notices stripped with log corroboration; three terminal notices and the suspension sentence recognized |
-| Turn timeout | 600 s logical deadline; byte-level stall ladder (120 s / 300 s + graces) | none on `session/prompt`, no watchdog | turn cap (TTY-aware 0 / 20 min) + 5 min stall cap, park time excluded | inactivity: 10 min idle / 60 min with work outstanding | inactivity: 10 min generating / 60 min awaiting tools; 60 min `session/prompt` backstop (`agy-acp:src/runtime/worker.ts:74-77,1563-1566`) |
+| Turn timeout | 600 s logical deadline; byte-level stall ladder (120 s / 300 s + graces) | none on `session/prompt`, no watchdog | turn cap (TTY-aware 0 / 20 min) + 5 min stall cap, park time excluded | inactivity: 10 min idle / 60 min with work outstanding | inactivity: 10 min generating / 60 min awaiting tools; 60 min `session/prompt` backstop (`agy-acp:src/runtime/worker.ts:74-77,1564-1572`) |
 | Session reuse | `--conversation <id>`; history replay only when fresh | system digest + exact message-id prefix | `--conversation` or `session/load` | `session/resume -> load -> new`; exact count + prefix + assistant fingerprints | transcript ledger prefix match tolerating `tool_use.input` and stripped media (`agy-acp:src/sessions/ledger.ts:272-276`); `session/resume` from a persisted shelf |
 | History budget | 240,000 chars, tail drop | 160,000 bytes newest-first | not replayed (last user message only) | 32,000 UTF-16 units, labelled sections | 112 KiB prompt + 512 KiB `systemPrompt.append`; raw oversized turn refused with the overflow 400 |
 | System prompt | labelled user block | `systemPrompt.append` | stream-json agent file; ACP inline in first turn | resource block, never truncated (256 KiB) | `systemPrompt.append` on `session/new` / `session/resume`, inline fallback |
@@ -37,7 +37,7 @@ repository (`agy-acp:` paths, current working tree at 0.1.10, line numbers check
 | Usage source | stream step usage | prompt result, divided by model calls | prompt result (exact since `agy` 1.5.3) | `_meta.quota.token_count` | prompt result; SQLite step rows for tool batches and as fallback (`agy-acp:src/usage/tracker.ts:168`) |
 | Accounts | one ambient identity | one | one | one at a time | pooled accounts, isolated per-account homes, quota-aware routing |
 | Version gate | 1.1.22 minimum, classified preflight | 1.4.12 minimum | 1.1.22 (stream-json), 1.5.3 (ACP) | signed manifest approval | none beyond refusing an explicit `mcpCapabilities.http: false` (`agy-acp:src/runtime/worker.ts:732-736`) |
-| Cancel | signal-based (no stop channel) | abort drain 5 s | notification, teardown after 10 s | notification, close after 1.5 s | notification, broker calls cancelled, retire after 1.5 s (`agy-acp:src/runtime/worker.ts:1319-1328,1706-1712`) |
+| Cancel | signal-based (no stop channel) | abort drain 5 s | notification, teardown after 10 s | notification, close after 1.5 s | notification, broker calls cancelled, retire after 1.5 s (`agy-acp:src/runtime/worker.ts:1319-1328,1716-1730`) |
 | stdout frame bound | 8 MiB unterminated line | none found | 32 MiB (string length), kill on breach | 32 MiB, fail on breach | none: uncapped `stdoutRemainder` (`agy-acp:src/runtime/acp-connection.ts:159,176-177`) |
 
 No sibling uses `--ide-mcp-port` / `nc`; that seam is specific to the Magpie community plugin
@@ -69,12 +69,15 @@ linked documents.
   source). This repository's probes on `agy 1.5.9` show the shape and its gaps
   ([`claude-bridge-parity.md`](../claude-bridge-parity.md), usage accounting); they ran on two
   different host logins, so nothing in them describes one account over time.
-- The ~25 KB silent prompt drop was measured on `agy 1.2.14` over stream-json; whether ACP has a
-  size limit on 1.5.8 is unverified, including for this plugin's own render budget, which is
-  policy. The `systemPrompt.append` limits this repository measured are in
-  [`error-routing.md`](../error-routing.md) section 8.
-- `agy` abandoning an MCP `tools/call` at about 180 s is reported by fdkevin0 (source comment)
-  and estebanforge (two observations, 2026-09-05); it has not been reproduced on 1.5.8.
+- The ~25 KB silent prompt drop was measured on `agy 1.2.14` over stream-json and does not
+  transfer to ACP. ACP does have a size effect: a single `session/prompt` message is silently
+  truncated around 178 KB on 1.5.8, and `systemPrompt.append` fails hard instead
+  ([`error-routing.md`](../error-routing.md), section 8). This plugin's 112 KiB render budget is a
+  policy bound below that, not a measurement.
+- `agy` abandons an MCP `tools/call` at 180 s: fdkevin0 relays at 85 s for it, estebanforge
+  reports two abandonments at 180.000 s (2026-09-05), and it was measured again on `agy 1.5.9`
+  (aborted at 180.004 s, then `notifications/cancelled`, then the timeout written as ordinary
+  assistant text and a normal `end_turn`); see [`plan.md`](../plan.md) item 1.
 - `agentCapabilities.mcpCapabilities` is `null` on `agy 1.5.9`.
 
 ## 4. Ideas from the siblings, and their status here

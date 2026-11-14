@@ -62,11 +62,13 @@ in neutral terms) lives in its own section at the end.
 
 ## Language
 
-English only, ASCII prose. The only places Chinese may appear are `README.zh-CN.md`,
-`package.json` `magpie.summary.zh`, and the localization fields in `src/` (`src/options.ts`
-labels and descriptions, `src/accounts/auth.ts` `IMPORT_FROMS`). `bun scripts/check-release.mjs`
-enforces this for every file in the repository. Verbatim upstream strings (log lines, notices) may be
-quoted exactly inside code spans. No emoji.
+English only, ASCII prose, as a rule for new writing. The only places Chinese may appear are
+`README.zh-CN.md`, `package.json` `magpie.summary.zh`, and the localization fields in `src/`
+(`src/options.ts` labels and descriptions, `src/accounts/auth.ts` `IMPORT_FROMS`).
+`bun scripts/check-release.mjs` rejects CJK and fullwidth characters in the text files it scans
+outside those allowances; it does not enforce ASCII generally, it skips some paths and binary
+files, and it does not exempt a code span, so a Chinese upstream notice is cited, not pasted.
+No emoji.
 
 ## Placing a new document
 
