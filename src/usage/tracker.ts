@@ -61,12 +61,22 @@ export interface ReadUnseenStepsOptions {
   isClosed?: () => boolean;
 }
 
+/** A prompt cannot have more steps than this without the rows being long gone. */
+const MAX_ABSORBED_PENDING = 16;
+
 export class StepUsageTracker {
   private lastReportedStepIdx = -1;
   private stepCountInPrompt = 1;
   private unreported: TokenUsageSummary = emptyUsage();
   /** Usage this turn already handed the caller, from a tool-batch settlement. */
   private turnReported: TokenUsageSummary = emptyUsage();
+  /**
+   * Steps a prompt result already accounted for whose step rows had not landed
+   * yet. `agy` commits those rows a moment after the prompt settles, so the cursor
+   * taken at settlement cannot cover them; without this, the next turn reads them
+   * as its own work and reports a prompt's usage twice.
+   */
+  private absorbedPending = 0;
 
   /** Index of the newest step already accounted for, `-1` before the first. */
   get lastStepIdx(): number {
@@ -99,10 +109,17 @@ export class StepUsageTracker {
     if (!nativeSessionId) return [];
     const steps = readConversationStepUsages(account, nativeSessionId);
     const unseen = steps.filter((s) => s.idx > this.lastReportedStepIdx);
-    if (unseen.length > 0) {
-      this.lastReportedStepIdx = unseen[unseen.length - 1]!.idx;
+    if (unseen.length === 0) return [];
+    // Rows ordered by idx, so the ones a settled prompt was already paid for are
+    // the oldest unseen ones. They are dropped rather than reported again.
+    let reported = unseen;
+    if (this.absorbedPending > 0) {
+      const absorbed = Math.min(this.absorbedPending, unseen.length);
+      this.absorbedPending -= absorbed;
+      reported = unseen.slice(absorbed);
     }
-    return unseen;
+    this.lastReportedStepIdx = unseen[unseen.length - 1]!.idx;
+    return reported;
   }
 
   /**
@@ -172,22 +189,31 @@ export class StepUsageTracker {
   ): TokenUsageSummary {
     const settled = subtractUsage(usage, this.turnReported);
     this.turnReported = emptyUsage();
+    const steps = this.stepCountInPrompt;
     this.stepCountInPrompt = 1;
-    this.skipUnseenSteps(account, nativeSessionId);
+    const landed = this.skipUnseenSteps(account, nativeSessionId);
+    this.absorbedPending = Math.min(
+      MAX_ABSORBED_PENDING,
+      this.absorbedPending + Math.max(0, steps - landed),
+    );
     return settled;
   }
 
-  /** Moves the cursor past `agy`'s rows without reporting them. */
+  /**
+   * Moves the cursor past `agy`'s rows without reporting them, and says how many
+   * rows that covered: the prompt result paid for the steps whose rows are still
+   * on their way as well, and those are counted in `absorbedPending`.
+   */
   private skipUnseenSteps(
     account: AccountDescriptor,
     nativeSessionId: string,
-  ): void {
-    if (!nativeSessionId) return;
+  ): number {
+    if (!nativeSessionId) return 0;
     const steps = readConversationStepUsages(account, nativeSessionId);
-    const last = steps[steps.length - 1];
-    if (last && last.idx > this.lastReportedStepIdx) {
-      this.lastReportedStepIdx = last.idx;
-    }
+    const unseen = steps.filter((s) => s.idx > this.lastReportedStepIdx);
+    if (unseen.length === 0) return 0;
+    this.lastReportedStepIdx = unseen[unseen.length - 1]!.idx;
+    return unseen.length;
   }
 
   /**

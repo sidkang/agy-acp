@@ -345,11 +345,14 @@ export class AcpConnection {
         timeoutTimer = setTimeout(() => {
           this.pendingRequests.delete(id);
           const stderrTail = this.getStderrTail();
-          reject(
-            new Error(
-              `ACP request '${method}' (id: ${id}) timed out after ${timeoutMs}ms. Stderr tail:\n${stderrTail}`,
-            ),
+          // Marked so a caller can tell "the CLI said nothing" from "we stopped
+          // waiting": nothing was cancelled upstream, so the prompt may still be
+          // generating and the worker must not be reused.
+          const timeoutError = new Error(
+            `ACP request '${method}' (id: ${id}) timed out after ${timeoutMs}ms. Stderr tail:\n${stderrTail}`,
           );
+          (timeoutError as { acpTimeout?: boolean }).acpTimeout = true;
+          reject(timeoutError);
         }, timeoutMs);
       }
 

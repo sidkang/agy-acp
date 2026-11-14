@@ -1800,6 +1800,14 @@ export class AgySessionWorker {
       this.setState("IDLE");
     }
     this.turn.pendingPrompt = null;
+
+    if ((err as { acpTimeout?: boolean })?.acpTimeout) {
+      // A local deadline, not an upstream answer: `agy` may still be generating
+      // this prompt, and a tool result arriving later would start a second
+      // `session/prompt` on the same native session. Retire the worker so the
+      // next turn gets a clean one; the shelf keeps the conversation.
+      void this.close("prompt_timeout");
+    }
   }
 
   private async handleClientAbort(): Promise<void> {

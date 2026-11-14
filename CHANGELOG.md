@@ -15,6 +15,14 @@ Version in `package.json`; no `v0.1.10` tag exists yet. Work dated 2026-11-14.
   still walked the pool; a warm worker kept the `account_failover` it was built with, so turning
   the option off now reaches it (`setAccountFailover`); and the "another signed-in account can
   answer this turn" wording promised switching that is no longer done.
+- A step row that lands *after* a prompt's result is no longer read as the next turn's work. The
+  cursor taken at settlement could not cover rows `agy` commits a moment later, so the next
+  turn reported a prompt's usage twice; the tracker now remembers how many steps the settled
+  prompt covered and absorbs that many rows when they appear.
+- A local `session/prompt` timeout retires the worker. The deadline deletes the request without
+  cancelling anything upstream, so `agy` may still be generating; reusing the session let a later
+  tool result start a second prompt on it. The connection marks the error (`acpTimeout`) and the
+  worker closes instead of returning to `IDLE`.
 - The tool-call relay hands a result over when it lands between the "still running" notice and the
   model's `await_result`: it was kept for the next prompt, which is not where a model still in this
   prompt can read it. An already-aborted request now settles on the abort instead of waiting out

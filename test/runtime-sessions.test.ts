@@ -108,6 +108,24 @@ describe("AcpConnection", () => {
     child.kill();
   });
 
+  test("a local timeout carries a marker so the worker is not reused", async () => {
+    // Reads and writes nothing: no answer can settle the request but the deadline.
+    const child = spawn("sleep", ["5"], { stdio: ["pipe", "pipe", "pipe"] });
+    const conn = new AcpConnection(child);
+
+    let caught: { acpTimeout?: boolean; message?: string } | undefined;
+    try {
+      await conn.request("session/prompt", { sessionId: "s" }, 20);
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+    // Nothing was cancelled upstream: an answer may still be on its way, so a
+    // caller must retire the session rather than start another prompt on it.
+    expect(caught?.acpTimeout).toBe(true);
+    expect(String(caught?.message)).toContain("timed out after 20ms");
+    child.kill();
+  });
+
   test("captures bounded stderr in ring buffer up to 16 KiB", () => {
     const child = spawn("cat", {
       stdio: ["pipe", "pipe", "pipe"],

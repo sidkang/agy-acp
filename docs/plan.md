@@ -109,25 +109,20 @@ the recommended decision and how to accept it. When an item ships, delete it her
 
 ## 8b. Findings from the 0.1.10 review left open
 
-- Problem: four defects are real and still unfixed, each needing more than a one-line change.
+- Problem: two defects from the review are still open; the usage double count and the reused
+  prompt after a local timeout are fixed in 0.1.10.
 - Evidence: the `gpt-6-astra` and `deepseek-flash` passes over `v0.1.9..HEAD`, 2026-11-14.
-  - `src/usage/tracker.ts` `skipUnseenSteps`: a step row that becomes visible *after* an
-    ACP-settled turn is read by the next turn, so it is reported twice. The existing test inserts
-    the row before settlement, which is not that case. A fix needs a boundary that a one-time
-    read cannot establish; the conservative version is "once a session is ACP-accounted, stop
-    reading rows for it".
   - `bankSuppressedPromptTurn` still divides the old way and ignores `turnReported`, so a
     suppressed turn that already reported a batch banks too much. Reusing
-    `settlePromptTurnFromAcp` for the ACP case is the fix.
-  - The 60-minute backstop clears `pendingPrompt` without cancelling the native prompt
-    (`src/runtime/worker.ts`), so a long tool chain can leave `agy` generating while the bridge
-    starts another prompt on the same session. The backstop should retire the worker.
+    `settlePromptTurnFromAcp` for the ACP case is the fix; a test needs a steering cancel that
+    carries a prompt result.
   - A caller tool named `await_result` is shadowed by the relay tool; the internal name is not
-    reserved in `src/mcp/schema/sanitizer.ts`.
+    reserved in `src/mcp/schema/sanitizer.ts`. Either reserve the name (renaming the caller's tool
+    is a visible change to their MCP catalog) or skip the relay for that session and say so.
 - Also unverified: whether `session/prompt`'s `usage` includes the tokens of tool steps. The ACP
-  path subtracts what batches reported, which is only right if it does; one probe with a tool call
-  settles it.
-- Decision: fix in this order (usage, backstop, name collision), each with a reproduction.
+  path subtracts what batches reported (`src/usage/tracker.ts`), which is only right if it does;
+  one probe with a tool call settles it.
+- Decision: fix in that order, each with a reproduction.
 - Acceptance: a test per defect that fails before the fix.
 
 ## 9. Ask Magpie for a "do not fail this turn over" signal

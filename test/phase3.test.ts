@@ -1515,6 +1515,45 @@ describe("Phase 3: ARCH-2 TurnContext, StepUsageTracker, worker.pin(), scheduler
     expect(AsyncEventQueue).toBeDefined();
   });
 
+  test("a step row that lands after the prompt result is not read as the next turn's work", async () => {
+    const convDir = makeTempDir("agy-tracker-late-wal-");
+    await withConversationsDir(convDir, () => {
+      const acct = makeAccount("late");
+      const nativeId = "conv-late-1";
+      const db = new Database(path.join(convDir, `${nativeId}.db`));
+      db.run("PRAGMA journal_mode = WAL;");
+      db.run("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);");
+      const insert = db.prepare(
+        "INSERT INTO gen_metadata (idx, data) VALUES (?, ?)",
+      );
+
+      const tracker = new StepUsageTracker();
+      // A tool batch ended step 1, so this prompt covers two steps — and it settles
+      // before either row is visible, which is the case a one-time cursor read
+      // cannot cover.
+      tracker.incrementPromptStepCount();
+      expect(tracker.readUnseenStepsSync(acct, nativeId)).toEqual([]);
+      tracker.settlePromptTurnFromAcp(acct, nativeId, {
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      });
+
+      // Both rows land a moment later.
+      insert.run(1, encodeGenMetadataBlob({ input: 60, output: 10, read: 0 }));
+      insert.run(2, encodeGenMetadataBlob({ input: 40, output: 10, read: 0 }));
+
+      // They were already paid for by the prompt result.
+      expect(tracker.readUnseenStepsSync(acct, nativeId)).toEqual([]);
+
+      // The following turn's own row still reports.
+      insert.run(3, encodeGenMetadataBlob({ input: 7, output: 3, read: 0 }));
+      expect(tracker.readUnseenStepsSync(acct, nativeId).map((s) => s.idx)).toEqual([3]);
+      db.close();
+    });
+  });
+
   test("ACP prompt usage is authoritative: subtracted from batch reports, and the rows skipped", async () => {
     const convDir = makeTempDir("agy-tracker-acp-");
     await withConversationsDir(convDir, () => {
