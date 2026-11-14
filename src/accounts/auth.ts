@@ -635,6 +635,22 @@ async function startLoopbackCallbackServer(
  * Writes `agy`'s file-backed OAuth credential (`FileTokenStorage`) atomically
  * with `0600` permissions inside an isolated account home directory.
  */
+/**
+ * The address `agy acp --login` reports on success.
+ *
+ * Dots are ordinary characters in an address: excluding them (`[^\s.]+`) turned
+ * `alice@example.com` into `alice@example` and made a dotted local part such as
+ * `sid.kang0129@outlook.com` not match at all, so the account was labelled
+ * wrongly and the email index missed it.
+ */
+export function detectLoggedInEmail(output: string): string | undefined {
+  const match =
+    /Logged in as\s+([^\s@<>()\[\],;:'"]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/i.exec(
+      String(output ?? ""),
+    );
+  return match?.[1]?.trim();
+}
+
 export function writeIsolatedAgyOAuthToken(
   isolatedHomeDir: string,
   params: {
@@ -1119,11 +1135,62 @@ async function provisionIsolatedAccountFromTokens(
       const stamp = fs.existsSync(diskStamp) ? fs.readFileSync(diskStamp, "utf8").trim() : "";
       if (!batchEntry.stamps.has(stamp)) batchEntry.externallyTouched = true;
     }
-    let previousTokenBytes: Buffer | null = null;
-    if (dirExistedBefore && fs.existsSync(tokenFile)) {
+    // Both files this import writes are snapshotted, not only the token: an
+    // account directory can exist with no token in it (its credentials were
+    // removed while the directory stayed), and the old rollback had nothing to
+    // restore in that case — so a failed or cancelled import left the new refresh
+    // token on disk for an existing slot to use.
+    const acpStateFile = path.join(
+      expectedDir,
+      ".gemini",
+      "antigravity-cli",
+      "cache",
+      "acp-auth-state.json"
+    );
+    interface FileSnapshot {
+      existed: boolean;
+      bytes: Buffer | null;
+    }
+    const snapshotOf = (file: string): FileSnapshot => {
+      if (!fs.existsSync(file)) return { existed: false, bytes: null };
       try {
-        previousTokenBytes = fs.readFileSync(tokenFile);
+        return { existed: true, bytes: fs.readFileSync(file) };
+      } catch {
+        return { existed: true, bytes: null };
+      }
+    };
+    const restoreFile = (file: string, snap: FileSnapshot) => {
+      if (!snap.existed) {
+        try {
+          fs.rmSync(file, { force: true });
+        } catch {}
+        return;
+      }
+      if (snap.bytes === null) return;
+      try {
+        const tmp = `${file}.rollback.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+        fs.writeFileSync(tmp, snap.bytes, { mode: 0o600 });
+        fs.renameSync(tmp, file);
       } catch {}
+    };
+    const before = {
+      token: snapshotOf(tokenFile),
+      acpState: snapshotOf(acpStateFile),
+    };
+    // Without a copy of what is there now, a rollback could not put it back: say
+    // so before overwriting it rather than half-way through.
+    const unreadable = [before.token, before.acpState].some(
+      (snap) => snap.existed && snap.bytes === null
+    );
+    if (unreadable) {
+      return {
+        outcome: {
+          type: "failed",
+          error:
+            "Existing credentials for this account could not be read for backup; refusing to overwrite them",
+          accountId: verifiedEmail,
+        },
+      };
     }
 
     const isolatedHomeDir = resolveIsolatedHomeDir(accountRef);
@@ -1134,13 +1201,12 @@ async function provisionIsolatedAccountFromTokens(
         try {
           fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
         } catch {}
-      } else if (previousTokenBytes !== null) {
-        try {
-          const tmp = `${tokenFile}.rollback.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-          fs.writeFileSync(tmp, previousTokenBytes, { mode: 0o600 });
-          fs.renameSync(tmp, tokenFile);
-        } catch {}
+        return;
       }
+      // The directory stays (it existed before): put back exactly what this
+      // import replaced, and remove the files it created.
+      restoreFile(tokenFile, before.token);
+      restoreFile(acpStateFile, before.acpState);
     };
 
     try {
@@ -1878,8 +1944,7 @@ export function createAuthMethods(deps?: AuthRuntimeDeps) {
                 );
               }
 
-              const loggedInMatch = /Logged in as\s+([^\s.\r\n]+@[^\s.\r\n]+)/i.exec(out);
-              const detectedEmail = loggedInMatch?.[1]?.trim();
+              const detectedEmail = detectLoggedInEmail(out);
               // The host cancelled (or the flow timed out) while the login process
               // was finishing: never commit a cancelled sign-in.
               if (flowAbandonReason) {

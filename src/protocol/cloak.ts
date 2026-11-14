@@ -217,14 +217,19 @@ export function cloakSystemPrompt(system: string | undefined | null, enabled = t
   return rewordSystemPrompt(cloaked);
 }
 
+// The wording of these hints goes to Magpie in a `400` body, and Magpie reads
+// the whole body for the words that mean a spent window (`quotaWords`,
+// `usedUpWords`): it does not read a negation, so "not an account quota limit"
+// still answers failQuota and rests a healthy account. Say what happened without
+// any of them.
 const HINT =
-  "Antigravity rejected this request's system prompt (Claude Code / Claude Agent SDK trigger) with a prompt-level 429 refusal, not an account quota limit; enable cloak_prompts or use another provider for this prompt.";
+  "Antigravity turned this request away because of its system prompt (Claude Code / Claude Agent SDK wording), not because of this account: reword or drop that line, or use another provider for this prompt.";
 const CODEX_HINT =
-  "Antigravity rejected Codex's GPT-5 system prompt with a prompt-level 429 refusal, not an account quota limit; enable cloak_prompts or start a fresh chat on this model.";
+  "Antigravity turned this request away because of the system prompt Codex uses for GPT-5 models, not because of this account: start a fresh chat on this model, or use another provider for it.";
 const HERMES_HINT =
-  "Antigravity rejected Hermes Agent's legacy default persona prompt with a prompt-level 429 refusal, not an account quota limit.";
+  "Antigravity turned this request away because of the system prompt Hermes Agent used by default, not because of this account: put it in SOUL.md, or use another provider for this prompt.";
 const RFC_HINT =
-  "Antigravity rejected the RFC 2119 system-prompt trigger line with a prompt-level 429 refusal, not an account quota limit.";
+  "Antigravity turned this request away because of the RFC 2119 line in its system prompt, not because of this account: drop that line, or use another provider for this prompt.";
 
 export function refusalHint(system: string | undefined | null): string {
   const hit = triggerMatches(String(system ?? ""));

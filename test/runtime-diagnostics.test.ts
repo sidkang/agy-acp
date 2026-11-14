@@ -68,10 +68,13 @@ function makeTempDir(prefix: string): string {
  * Stages the log line `agy` writes when it retries upstream. The plugin only
  * treats notice-shaped stream text as diagnostic when this evidence exists.
  */
-function writeUpstreamRetryEvidence(workspaceDir: string): void {
+function writeUpstreamRetryEvidence(
+  workspaceDir: string,
+  failure = "RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).",
+): void {
   fs.writeFileSync(
     path.join(workspaceDir, "agy-acp.log.90001"),
-    "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 4s\n",
+    `I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (${failure}), retrying in 4s\n`,
   );
 }
 
@@ -1101,6 +1104,52 @@ describe("AgySessionWorker diagnostics integration", () => {
     }
   });
 
+  test("a quoted credit notice stays text even when the turn has an unrelated error", async () => {
+    // The old corroboration only asked whether *some* error had been logged, so an
+    // unrelated line promoted a quoted notice into a 402 and rested a healthy
+    // account for half an hour.
+    const ws = makeTempDir("worker-quoted-credit-unrelated-");
+    const worker = new AgySessionWorker(account, "diag-sess-quoted-credit", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          fs.writeFileSync(
+            path.join(ws, "agy-acp.log.91032"),
+            "E1114 18:41:00.000001     400 run.go:315] UNAUTHENTICATED: request had no credentials\n",
+          );
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "That line means the account ran out of credits." },
+            },
+          });
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "\n⚠ Your AI credits balance is too low to continue.\n" },
+            },
+          });
+          ctx.finishTurn();
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "what does that error mean?");
+      expect(events.some((e) => e.type === "error")).toBe(false);
+      const text = events
+        .filter((e): e is Extract<TurnStreamEvent, { type: "text_delta" }> => e.type === "text_delta")
+        .map((e) => e.text)
+        .join("");
+      expect(text).toContain("ran out of credits");
+      expect(text).toContain("credits balance is too low");
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
   test("a retry note split across two chunks is still stripped", async () => {
     const ws = makeTempDir("worker-split-note-");
     const worker = new AgySessionWorker(account, "diag-sess-split-note", mcpServer, {
@@ -1134,6 +1183,84 @@ describe("AgySessionWorker diagnostics integration", () => {
         .join("");
       expect(text).not.toContain("Model produced invalid");
       expect(text).toContain("The answer.");
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("a storm caused by an outage answers 503, not a throttle", async () => {
+    // The storm guard used to answer every storm as a transient 429, so a vendor
+    // outage was counted as a rate failure and rested as one.
+    const ws = makeTempDir("worker-storm-outage-");
+    const notice =
+      "\n⚠ API error (attempt {n}): UNAVAILABLE (code 503): The service is currently unavailable.\n\n";
+    const worker = new AgySessionWorker(account, "diag-sess-storm-outage", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          writeUpstreamRetryEvidence(
+            ws,
+            "UNAVAILABLE (code 503): The service is currently unavailable.",
+          );
+          for (const attempt of [1, 2, 3]) {
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { text: notice.replace("{n}", String(attempt)) },
+              },
+            });
+          }
+          setTimeout(() => ctx.cancelTurn(), 25);
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "storm outage");
+      expectErrorEvent(events, {
+        status: 503,
+        errorType: "api_error",
+        message: UPSTREAM_BUSY_FAILURE_MESSAGE,
+      });
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("a storm caused by a spent window keeps the quota answer", async () => {
+    const ws = makeTempDir("worker-storm-quota-");
+    const notice =
+      "\n⚠ API error (attempt {n}): RESOURCE_EXHAUSTED (code 429): exhausted your quota for gemini-4-carbon.\n\n";
+    const worker = new AgySessionWorker(account, "diag-sess-storm-quota", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          writeUpstreamRetryEvidence(
+            ws,
+            "RESOURCE_EXHAUSTED (code 429): exhausted your quota for gemini-4-carbon",
+          );
+          for (const attempt of [1, 2, 3]) {
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { text: notice.replace("{n}", String(attempt)) },
+              },
+            });
+          }
+          setTimeout(() => ctx.cancelTurn(), 25);
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "storm quota");
+      expectErrorEvent(events, {
+        status: 429,
+        errorType: "rate_limit_error",
+        message: "Account quota exhausted",
+      });
     } finally {
       await worker.close("test_done");
     }
@@ -1415,6 +1542,12 @@ describe("AgySessionWorker diagnostics integration", () => {
       workspacePrefix: "worker-credit-marker-",
       sessionId: "diag-credit-marker",
       script: (ctx) => {
+        // The turn's log names the same failure: a quoted notice alone is answer
+        // text, and promoting one is a 402 that rests the account for half an hour.
+        fs.writeFileSync(
+          path.join(ctx.workspaceDir, "agy-acp.log.91031"),
+          "E1114 18:40:00.000001     400 run.go:315] Your AI credits balance is too low to continue.\n",
+        );
         ctx.emitUpdate({
           sessionId: NATIVE_SESSION_ID,
           update: {

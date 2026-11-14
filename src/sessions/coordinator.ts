@@ -467,6 +467,24 @@ export class SessionCoordinator {
 
     // Case 3: Session in AWAITING_TOOL_RESULTS
     if (existingWorker && existingWorker.state === "AWAITING_TOOL_RESULTS") {
+      if (!systemPromptsMatch(existingWorker.systemPrompt, req.system)) {
+        // The pending call belongs to a native session opened under other
+        // instructions, and a continuation delivers tool results without ever
+        // applying `req.system`: the request would answer under the old prompt.
+        // Cold-replay under the requested one, as a workspace change does.
+        this.removeActiveWorker(existingWorker);
+        this.scheduler.unregisterWorker(existingWorker);
+        await existingWorker.close("system_prompt_changed");
+        yield* this.executeFreshSessionTurn(
+          account,
+          req,
+          modelSelection,
+          options,
+          sessionKey,
+          signal,
+        );
+        return;
+      }
       if (
         normalizeWorkDir(existingWorker.workDir) !==
         normalizeWorkDir(req.workDir)
@@ -564,9 +582,13 @@ export class SessionCoordinator {
     }
     if (incomingToolUseIds.size === 0) return undefined;
 
-    for (const candidate of this.activeWorkers.values()) {
+    for (const [key, candidate] of this.activeWorkers) {
       if (candidate.pinned) continue;
       if (candidate.state !== "AWAITING_TOOL_RESULTS") continue;
+      // A subagent's conversation is its own: without this, a forked transcript
+      // carrying another subagent's pending tool-use id adopts that subagent's
+      // live worker and resolves its call.
+      if (subagentIdFromSessionKey(key) !== (req.subagentId ?? undefined)) continue;
       if (
         candidate.account.slotKey !== account.slotKey ||
         candidate.account.accountRef !== account.accountRef

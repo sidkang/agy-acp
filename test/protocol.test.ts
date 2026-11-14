@@ -17,6 +17,7 @@ import {
 } from "../src/protocol/anthropic";
 import {
   cloakSystemPrompt,
+  refusalHint,
   stripVolatileMessageText,
   stripVolatileSystem,
   turnsAway,
@@ -2222,6 +2223,25 @@ describe("encodeAnthropicSseResponse: backpressure", () => {
 // ---------------------------------------------------------------------------
 
 describe("cloak.ts", () => {
+  test("a prompt-refusal hint carries none of the words Magpie reads as a spent window", () => {
+    // The hint goes to Magpie inside a `400` body, and Magpie matches the whole
+    // body: it reads no negation, so "not an account quota limit" answered
+    // failQuota and rested a healthy account for its window.
+    const limitWords =
+      /quota|insufficient|balance|credit|billing|budget|exceeded|overload|rate[ _-]?limit|usage[ _-]?limit|too many requests|limit/i;
+    const systems = [
+      "x-anthropic-billing-header: cch=abc",
+      "you are codex, an agent based on gpt-5",
+      "you are codex, a coding agent based on gpt-5",
+      "hermes agent, an intelligent ai assistant created by nous research",
+      "RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL.",
+      "an ordinary system prompt",
+    ];
+    for (const system of systems) {
+      expect(refusalHint(system)).not.toMatch(limitWords);
+    }
+  });
+
   test("turnsAway flags known third-party harness trigger phrases only", () => {
     expect(turnsAway("X-Anthropic-Billing-Header: cch=abc")).toBe(true);
     expect(turnsAway("You are Codex, an agent based on GPT-5.")).toBe(true);

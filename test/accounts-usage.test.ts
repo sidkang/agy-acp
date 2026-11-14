@@ -17,6 +17,7 @@ import {
 import {
   accountRefFromEmail,
   createAuthMethods,
+  detectLoggedInEmail,
   extractAuthorizationCode,
   importAccountFiles,
   parseImportedAccounts,
@@ -514,6 +515,21 @@ describe("src/accounts/env.ts", () => {
   });
 });
 
+describe("detectLoggedInEmail", () => {
+  test("reads an address with dots on both sides of the @", () => {
+    // The old pattern excluded dots, so a dotted local part never matched and the
+    // account was labelled and indexed wrongly.
+    expect(detectLoggedInEmail("Logged in as alice@example.com\n")).toBe("alice@example.com");
+    expect(detectLoggedInEmail("Logged in as sid.kang0129@outlook.com")).toBe(
+      "sid.kang0129@outlook.com"
+    );
+    expect(detectLoggedInEmail("Logged in as   bob@mail.example.co.uk.  ")).toBe(
+      "bob@mail.example.co.uk"
+    );
+    expect(detectLoggedInEmail("no identity here")).toBeUndefined();
+  });
+});
+
 describe("src/accounts/auth.ts", () => {
   test("resolveAccountDescriptor defaults to host mode for empty or host auth", () => {
     const defaultDesc = resolveAccountDescriptor("agy", null);
@@ -780,6 +796,35 @@ describe("src/accounts/auth.ts", () => {
     );
     expect(reimportFail[0]?.type).toBe("failed");
     expect(fs.readFileSync(sameAccountTokenPath, "utf-8")).toBe(beforeFailReimport);
+
+    // 4b. An account directory that exists *without* a token (its credentials were
+    //     removed while the directory stayed) must not keep the token a failed
+    //     import just wrote: the old rollback had nothing to restore there and
+    //     reported failure while leaving the new refresh token on disk.
+    fs.rmSync(sameAccountTokenPath, { force: true });
+    const acpStatePath = path.join(
+      resolveIsolatedHomeDir((reimportOk[0] as any).metadata.accountRef),
+      ".gemini",
+      "antigravity-cli",
+      "cache",
+      "acp-auth-state.json"
+    );
+    const stateBefore = fs.existsSync(acpStatePath)
+      ? fs.readFileSync(acpStatePath, "utf-8")
+      : null;
+    const reimportFailNoToken = await importAccountFiles(
+      [JSON.stringify({ refresh_token: "1//04file_a1" })],
+      undefined,
+      {
+        fetchFn: mockFetch,
+        verifyAccountFn: async () => ({ ok: false, error: "simulated CLI check fail" }),
+      }
+    );
+    expect(reimportFailNoToken[0]?.type).toBe("failed");
+    expect(fs.existsSync(sameAccountTokenPath)).toBe(false);
+    expect(fs.existsSync(acpStatePath) ? fs.readFileSync(acpStatePath, "utf-8") : null).toBe(
+      stateBefore
+    );
 
     // 5. Truncated JSON starting with '{' fails cleanly instead of falling through to plain lines
     expect(() => parseImportedAccounts('{"refresh_token":"1//04trunc",')).toThrow("Invalid JSON");

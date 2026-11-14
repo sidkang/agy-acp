@@ -184,6 +184,7 @@ export class TurnContext {
   private prompt: Promise<any> | null = null;
   private delivered = false;
   private retryNotices = 0;
+  private retryNoticeText = "";
   private noticeTail = "";
 
   /**
@@ -231,6 +232,11 @@ export class TurnContext {
   }
 
   /** `agy` retry notices seen in this turn's stream so far. */
+  /** The last retry notice `agy` wrote in this turn, as it wrote it. */
+  get upstreamRetryNoticeText(): string {
+    return this.retryNoticeText;
+  }
+
   get upstreamRetryNotices(): number {
     return this.retryNotices;
   }
@@ -240,9 +246,15 @@ export class TurnContext {
    * complete notices of the chunk that just arrived.
    */
   absorbRetryNotices(chunk: string): { text: string; notices: number } {
-    const scan = splitAgentRetryNotices(this.noticeTail + chunk);
+    const raw = this.noticeTail + chunk;
+    const scan = splitAgentRetryNotices(raw);
     this.noticeTail = scan.hold;
     this.retryNotices += scan.count;
+    // The vendor's own words are the only record of *which* failure `agy` is
+    // retrying through: the turn's log keeps an outage record at `I` severity,
+    // which the evidence filter drops, so a storm with no notice text to read
+    // would answer a generic 500.
+    if (scan.count > 0) this.retryNoticeText = raw.trim();
     return { text: scan.text, notices: scan.count };
   }
 
@@ -307,6 +319,7 @@ export class TurnContext {
     this.held = "";
     this.delivered = false;
     this.retryNotices = 0;
+    this.retryNoticeText = "";
     this.noticeTail = "";
     const queue = new AsyncEventQueue<TurnStreamEvent>({
       maxBufferedBytes: options.maxBufferedBytes,

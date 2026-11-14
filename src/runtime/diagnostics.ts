@@ -445,6 +445,10 @@ function hasVerdictSignal(text: string): boolean {
     VENDOR_POLICY_RE.test(text) ||
     MODEL_UNSERVED_RE.test(text) ||
     UPSTREAM_BUSY_RE.test(text) ||
+    // `extractErrorEvidence` runs on its own output: a spent-credit record names
+    // no generic failure word, so without this its second pass lost the verdict
+    // and the turn answered 500.
+    CREDIT_EXHAUSTED_RE.test(text) ||
     AUTH_RE.test(text) ||
     isQuotaSignal(text) ||
     INVALID_REQUEST_RE.test(text)

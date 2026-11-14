@@ -965,14 +965,25 @@ export class AgySessionWorker {
    * written by the per-session worker into its own numbered log.
    */
   /**
-   * A model can quote one of `agy`'s notices (a caller asking what the error
-   * means), so held words only become the turn's failure when the turn said
-   * nothing else first, or when the turn's own log carries the same failure. The
-   * same rule keeps a quoted notice from resting a healthy account.
+   * A model can quote one of `agy`'s notices — a caller asking what an error
+   * means gets the notice back as the whole answer — so the held words only
+   * become this turn's failure when the turn's own log names the *same* failure.
+   * Nothing having preceded them is no proof, and any error line is not the same
+   * error: either mistake rests a healthy account (402 is a 30-minute credit
+   * rest) and hides the answer.
    */
-  private terminalNoticeIsEvidence(): boolean {
-    if (!this.turn.deliveredWork) return true;
-    return this.currentTurnLogEvidence() !== "";
+  private terminalNoticeIsEvidence(notice: string): boolean {
+    const fromNotice = classifyAgentFailure("", notice);
+    // What a false positive costs decides how much corroboration is needed. The
+    // generic marker answers a 500 and the dead-connection one a 503, which rests
+    // the model for 30 seconds and counts no failure: both are the vendor saying
+    // the turn died, so they are taken at their word even when the log is empty.
+    if (fromNotice === "internal" || fromNotice === "upstream_busy") return true;
+    // A false 402 rests the account for half an hour, so the spent-credit notice
+    // needs the turn's own log to name the same failure first.
+    const evidence = this.currentTurnLogEvidence();
+    if (!evidence) return false;
+    return classifyAgentFailure(evidence, "") === fromNotice;
   }
 
   private currentTurnLogEvidence(): string {
@@ -1227,6 +1238,13 @@ export class AgySessionWorker {
     // turn would report a generic 500 and climb the caller's failure backoff.
     // Taking the queue also means nothing `agy` streams while the cancel travels
     // can reach the caller ahead of the `429`.
+    // Read the failure before cancelling: the cancel writes its own
+    // `context canceled` records, and what the storm is about is the attempt that
+    // just failed. Its class is kept — a 503 stays a 503, a named spent window
+    // stays a spent window — instead of answering every storm as a throttle.
+    const diagnosed = this.diagnoseTerminationError(
+      this.turn.upstreamRetryNoticeText || undefined,
+    );
     const queue = this.turn.takeQueue();
     const prompt = this.turn.pendingPrompt;
     this.turn.nextPromptEpoch();
@@ -1244,7 +1262,7 @@ export class AgySessionWorker {
       const settled = await this.settleOrTimeout(prompt, 1500);
       this.turn.pendingPrompt = null;
       if (queue) {
-        queue.push(this.transientLimitError());
+        queue.push(diagnosed);
         queue.close();
       }
       if (!settled) {
@@ -1501,7 +1519,7 @@ export class AgySessionWorker {
     }
 
     const terminal = agentTerminalCore(this.turn.heldText);
-    if (terminal !== null && this.terminalNoticeIsEvidence()) {
+    if (terminal !== null && this.terminalNoticeIsEvidence(this.turn.heldText)) {
       // The notice's own words are this turn's evidence: `agy` writes it instead
       // of an answer, and each wording is a different failure.
       const errorEvent = this.diagnoseTerminationError(this.turn.heldText);

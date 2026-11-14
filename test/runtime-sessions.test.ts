@@ -436,6 +436,183 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(worker?.state).toBe("IDLE");
   });
 
+  test("2b. A changed system prompt on a tool continuation cold-replays", async () => {
+    const sessionId = `test-tool-sys-${Date.now()}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Get weather for a location",
+        inputSchema: { type: "object", properties: { city: { type: "string" } } },
+      },
+    ];
+    const selection = sel("gemini-3.8-flash");
+    const firstMessage = {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: "Please TRIGGER_TOOL_CALL" }],
+    };
+    const req1 = makeReq([firstMessage], {
+      model: "gemini-3.8-flash",
+      system: "Answer in English",
+      tools,
+      sessionId,
+    });
+
+    const events1: TurnStreamEvent[] = [];
+    for await (const event of coordinator.executeTurn(testAccount, req1, selection)) {
+      events1.push(event);
+    }
+    const toolUse = events1.find((e) => e.type === "tool_use");
+    const toolCallId = (toolUse as any)?.id;
+    expect(typeof toolCallId).toBe("string");
+
+    const sessionKey = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}`;
+    const worker = coordinator.getActiveWorker(sessionKey);
+    expect(worker?.state).toBe("AWAITING_TOOL_RESULTS");
+
+    // The result comes back with different instructions. A continuation delivers
+    // tool results without ever applying `req.system`, so continuing here would
+    // answer under the old prompt; the native session is retired instead.
+    const req2 = makeReq(
+      [
+        firstMessage,
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: toolCallId, name: "get_weather", input: { city: "Berlin" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              toolUseId: toolCallId,
+              isError: false,
+              content: [{ type: "text", text: "Rainy" }],
+            },
+          ],
+        },
+      ],
+      {
+        model: "gemini-3.8-flash",
+        system: "Answer in Korean",
+        tools,
+        sessionId,
+      },
+    );
+
+    const events2: TurnStreamEvent[] = [];
+    for await (const event of coordinator.executeTurn(testAccount, req2, selection)) {
+      events2.push(event);
+    }
+
+    expect(events2.some((e) => e.type === "error")).toBe(false);
+    expect(worker?.closed).toBe(true);
+    const replayed = coordinator.getActiveWorker(sessionKey);
+    expect(replayed).not.toBe(worker);
+
+    // Hand the shared scheduler its slot back: this suite runs at two workers per
+    // account, and a worker left behind here starves the later cases.
+    if (replayed) {
+      (coordinator as any).removeActiveWorker(replayed);
+      scheduler.unregisterWorker(replayed);
+      await replayed.close("test_done");
+    }
+  });
+
+  test("2c. A pending tool call is not adopted across subagent boundaries", async () => {
+    const sessionId = `test-tool-sub-${Date.now()}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Get weather for a location",
+        inputSchema: { type: "object", properties: { city: { type: "string" } } },
+      },
+    ];
+    const selection = sel("gemini-3.8-flash");
+    const firstMessage = {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: "Please TRIGGER_TOOL_CALL" }],
+    };
+    const req1 = makeReq([firstMessage], {
+      model: "gemini-3.8-flash",
+      system: "Tool system prompt",
+      tools,
+      sessionId,
+      subagentId: "one",
+    });
+
+    const events1: TurnStreamEvent[] = [];
+    for await (const event of coordinator.executeTurn(testAccount, req1, selection)) {
+      events1.push(event);
+    }
+    const toolCallId = (events1.find((e) => e.type === "tool_use") as any)?.id;
+    expect(typeof toolCallId).toBe("string");
+
+    const keyOne = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}::sub:one`;
+    const workerOne = coordinator.getActiveWorker(keyOne);
+    expect(workerOne?.state).toBe("AWAITING_TOOL_RESULTS");
+
+    // A forked transcript carrying the *other* subagent's pending id: it must open
+    // its own conversation rather than take over subagent one's live worker.
+    const forkMessages = [
+      firstMessage,
+      {
+        role: "assistant" as const,
+        content: [
+          { type: "tool_use" as const, id: toolCallId, name: "get_weather", input: { city: "Oslo" } },
+        ],
+      },
+      {
+        role: "user" as const,
+        content: [
+          {
+            type: "tool_result" as const,
+            toolUseId: toolCallId,
+            isError: false,
+            content: [{ type: "text" as const, text: "Snowy" }],
+          },
+        ],
+      },
+    ];
+    const req2 = makeReq(forkMessages, {
+      model: "gemini-3.8-flash",
+      system: "Tool system prompt",
+      tools,
+      sessionId: `${sessionId}-two`,
+      subagentId: "two",
+    });
+
+    // Asked directly: the fork carries subagent one's pending id and a matching
+    // prefix, so the only thing keeping it out of that worker is the subagent
+    // boundary. (Driving a whole turn here would park on the fake CLI's tool call
+    // again, which is not what this case is about.)
+    const keyTwo = `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}-two::sub:two`;
+    const adopted = (coordinator as any).adoptAwaitingToolWorker(
+      testAccount,
+      req2,
+      keyTwo,
+      false,
+    );
+    expect(adopted).toBeUndefined();
+    expect(coordinator.getActiveWorker(keyOne)).toBe(workerOne);
+    expect(workerOne?.closed).toBe(false);
+    expect(workerOne?.state).toBe("AWAITING_TOOL_RESULTS");
+    // The same call *within* subagent one does adopt.
+    const adoptedSame = (coordinator as any).adoptAwaitingToolWorker(
+      testAccount,
+      { ...req2, subagentId: "one" } as NormalizedAnthropicRequest,
+      `${testAccount.slotKey}::${testAccount.accountRef}::${sessionId}-three::sub:one`,
+      false,
+    );
+    expect(adoptedSame).toBe(workerOne);
+    // Hand the shared coordinator back exactly as it was found: a worker left in
+    // its map, even closed, takes the next case's session key.
+    (coordinator as any).removeActiveWorker(workerOne);
+    if (workerOne) scheduler.unregisterWorker(workerOne);
+    await workerOne?.close("test_done");
+  });
+
   test("3. Parallel tool calls + late sibling tool call arriving 80ms after first batch", async () => {
     const sessionId = `test-parallel-${Date.now()}`;
     const tools = [
