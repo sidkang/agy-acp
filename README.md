@@ -38,7 +38,9 @@ A disabled account answers with "This service has been disabled in this account 
 
 `cloak_prompts` used to default to on. It rewrites system-prompt lines that identify a third-party harness so a vendor-side check stops refusing the request; that is a workaround for a vendor check, which the terms treat as circumvention, so it is off by default now and best left off.
 
-**Your account, your risk.** The maintainer cannot restore a disabled account.
+**Your account, your risk.** The maintainer cannot restore a disabled account. The
+clauses, the enforcement reports, and what one disabled account's logs showed are in
+[`docs/account-safety.md`](./docs/account-safety.md).
 
 ## Install & Sign In
 

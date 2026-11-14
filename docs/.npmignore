@@ -1,0 +1,4 @@
+# npm always packs README files, including this directory's. Only
+# docs/claude-bridge-parity.md may ship (package.json "files", enforced by
+# scripts/check-release.mjs), so keep the documentation index out of the tarball.
+README.md
