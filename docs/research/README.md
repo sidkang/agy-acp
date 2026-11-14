@@ -129,21 +129,22 @@ our decision, and this research does not argue against it.
 
 ## Ranked actions, and where they stand
 
-**Landed in 0.1.10** (see the commit that cites this file): the progress-armed
+**Landed in 0.1.10** (see the commits that cite this file): the progress-armed
 inactivity watchdog (action 2), failing instead of clipping an oversized raw turn
-(action 4), and the "Usage Limit Reached … reset in" window with its
-`Retry-After` (action 5).
+(action 4), the "Usage Limit Reached … reset in" window with its `Retry-After`
+(action 5), and reading a turn's usage from the prompt result (action 1).
 
-Still open:
+Landed, with what each one had to get right:
 
-1. **Read usage from ACP before reading SQLite — confirmed available.** Probed on
-   `agy 1.5.9`. A generating turn returns
+1. ~~Read usage from ACP before reading SQLite.~~ **Done, with a fallback.** A
+   generating turn returns
    `{"stopReason":"end_turn","usage":{"inputTokens":8886,"outputTokens":30,
    "cachedReadTokens":0,"cachedWriteTokens":0,"thoughtTokens":29,"totalTokens":8916}}`,
-   with `cachedReadTokens` populated on a warm turn. The one `usage_update` session
-   update is context occupancy (`{"used":8916,"size":1048576}`: the turn's
-   `totalTokens` against the window), not a token breakdown. Moving usage onto the
-   prompt result removes the delayed-row double count instead of patching it.
+   with `cachedReadTokens` populated on a warm turn, and the prompt result covers
+   the whole turn, tool steps included: what a batch already reported is
+   subtracted, and the step rows are skipped so a row that lands late is never
+   read as the next turn's work. The one `usage_update` session update is context
+   occupancy (`{"used":8916,"size":1048576}`), not a token breakdown.
 
    Two caveats from the probes: **a turn that produces no generation returns
    `{"stopReason"}` and no `usage` at all** (seen when the account answered with
@@ -159,6 +160,8 @@ only on an explicit `false`, never on silence.
 2. ~~Replace the 30-minute wall clock with a progress-armed inactivity
    watchdog.~~ Done: 10 minutes silent while generating, 60 minutes while a tool
    call is outstanding, and the wall clock demoted to a backstop.
+**Still open:**
+
 3. **Give a long tool call a progress or relay path.** The upstream abandons a
    `tools/call` before our 15-minute park expires (`fdkevin0`
    `src/mcp-bridge.ts:6-9`), and two siblings already handle it.

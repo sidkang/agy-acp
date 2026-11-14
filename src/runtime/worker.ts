@@ -43,7 +43,7 @@ import {
   refusalHint,
   cloakSystemPrompt,
 } from "../protocol/cloak";
-import { settleStepUsage } from "../usage/step-usage";
+import { settleStepUsage, usageFromAcpPromptResult } from "../usage/step-usage";
 import { StepUsageTracker, emptyUsage } from "../usage/tracker";
 import {
   spawnAgy,
@@ -1405,6 +1405,8 @@ export class AgySessionWorker {
       }
     } catch {}
 
+    this.usage.noteTurnReported(toolStepUsage);
+
     try {
       q.push({
         type: "finish",
@@ -1621,11 +1623,20 @@ export class AgySessionWorker {
       }
     }
 
-    const promptUsage: TokenUsageSummary = this.usage.settlePromptTurn(
-      this.account,
-      this.nativeSessionId,
-      result?.usage,
-    );
+    // The prompt result states the turn's exact usage; the step rows are only a
+    // fallback for a turn that reported none (a refusal, an empty answer).
+    const acpUsage = usageFromAcpPromptResult(result?.usage);
+    const promptUsage: TokenUsageSummary = acpUsage
+      ? this.usage.settlePromptTurnFromAcp(
+          this.account,
+          this.nativeSessionId,
+          acpUsage,
+        )
+      : this.usage.settlePromptTurn(
+          this.account,
+          this.nativeSessionId,
+          result?.usage,
+        );
 
     if (this._state === "GENERATING") {
       this.broker.markHttpTurnClosed();

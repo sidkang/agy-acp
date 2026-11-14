@@ -31,6 +31,24 @@ export function emptyUsage(): TokenUsageSummary {
   };
 }
 
+function subtractUsage(
+  total: TokenUsageSummary,
+  reported: TokenUsageSummary,
+): TokenUsageSummary {
+  return {
+    inputTokens: Math.max(0, total.inputTokens - reported.inputTokens),
+    outputTokens: Math.max(0, total.outputTokens - reported.outputTokens),
+    cacheReadInputTokens: Math.max(
+      0,
+      total.cacheReadInputTokens - reported.cacheReadInputTokens,
+    ),
+    cacheCreationInputTokens: Math.max(
+      0,
+      total.cacheCreationInputTokens - reported.cacheCreationInputTokens,
+    ),
+  };
+}
+
 function addUsage(into: TokenUsageSummary, usage: TokenUsageSummary): void {
   into.inputTokens += usage.inputTokens;
   into.outputTokens += usage.outputTokens;
@@ -47,6 +65,8 @@ export class StepUsageTracker {
   private lastReportedStepIdx = -1;
   private stepCountInPrompt = 1;
   private unreported: TokenUsageSummary = emptyUsage();
+  /** Usage this turn already handed the caller, from a tool-batch settlement. */
+  private turnReported: TokenUsageSummary = emptyUsage();
 
   /** Index of the newest step already accounted for, `-1` before the first. */
   get lastStepIdx(): number {
@@ -131,6 +151,45 @@ export class StepUsageTracker {
     return total;
   }
 
+  /** Records usage a tool batch already reported this turn. */
+  noteTurnReported(usage: TokenUsageSummary): void {
+    addUsage(this.turnReported, usage);
+  }
+
+  /**
+   * Settles a prompt whose exact usage the protocol reported.
+   *
+   * The prompt result covers the whole turn, tool steps included, so what the
+   * batches already reported is subtracted rather than reported twice. The step
+   * rows are then skipped outright: a row that lands after the prompt finished
+   * used to be read as the next turn's work, which is how a prompt's usage was
+   * reported twice.
+   */
+  settlePromptTurnFromAcp(
+    account: AccountDescriptor,
+    nativeSessionId: string,
+    usage: TokenUsageSummary,
+  ): TokenUsageSummary {
+    const settled = subtractUsage(usage, this.turnReported);
+    this.turnReported = emptyUsage();
+    this.stepCountInPrompt = 1;
+    this.skipUnseenSteps(account, nativeSessionId);
+    return settled;
+  }
+
+  /** Moves the cursor past `agy`'s rows without reporting them. */
+  private skipUnseenSteps(
+    account: AccountDescriptor,
+    nativeSessionId: string,
+  ): void {
+    if (!nativeSessionId) return;
+    const steps = readConversationStepUsages(account, nativeSessionId);
+    const last = steps[steps.length - 1];
+    if (last && last.idx > this.lastReportedStepIdx) {
+      this.lastReportedStepIdx = last.idx;
+    }
+  }
+
   /**
    * The usage of a prompt that just finished: the exact step measurement when
    * `agy` has written one, else the prompt's total divided across its steps.
@@ -147,6 +206,7 @@ export class StepUsageTracker {
       unseen.length > 0 ? unseen : undefined,
     );
     this.stepCountInPrompt = 1;
+    this.turnReported = emptyUsage();
     return settled;
   }
 
@@ -167,6 +227,7 @@ export class StepUsageTracker {
         unseen.length > 0 ? unseen : undefined,
       );
       this.stepCountInPrompt = 1;
+      this.turnReported = emptyUsage();
       this.bankUnreported(settled);
     } catch {}
   }

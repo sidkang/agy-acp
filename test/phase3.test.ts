@@ -53,6 +53,7 @@ import {
   TurnContext,
 } from "../src/runtime/turn-context";
 import { StepUsageTracker } from "../src/usage/tracker";
+import { usageFromAcpPromptResult } from "../src/usage/step-usage";
 import { GlobalScheduler } from "../src/runtime/scheduler";
 import { AgySessionWorker, type ModelSelection } from "../src/runtime/worker";
 import { SessionCoordinator } from "../src/sessions/coordinator";
@@ -1486,6 +1487,74 @@ describe("Phase 3: ARCH-2 TurnContext, StepUsageTracker, worker.pin(), scheduler
     expect(tc.activeQueue).toBeNull();
     await expect(q3.next()).rejects.toThrow("boom");
     expect(AsyncEventQueue).toBeDefined();
+  });
+
+  test("ACP prompt usage is authoritative: subtracted from batch reports, and the rows skipped", async () => {
+    const convDir = makeTempDir("agy-tracker-acp-");
+    await withConversationsDir(convDir, () => {
+      const acct = makeAccount("acp");
+      const nativeId = "conv-acp-1";
+      const dbPath = path.join(convDir, `${nativeId}.db`);
+      const db = new Database(dbPath);
+      db.run("PRAGMA journal_mode = WAL;");
+      db.run("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);");
+      const insert = db.prepare(
+        "INSERT INTO gen_metadata (idx, data) VALUES (?, ?)",
+      );
+      insert.run(0, encodeGenMetadataBlob({ input: 100, output: 20, read: 50 }));
+
+      const tracker = new StepUsageTracker();
+      // The prompt result states the turn's whole usage, tool steps included.
+      expect(
+        usageFromAcpPromptResult({
+          inputTokens: 8886,
+          outputTokens: 30,
+          cachedReadTokens: 0,
+          cachedWriteTokens: 0,
+          thoughtTokens: 29,
+          totalTokens: 8916,
+        }),
+      ).toEqual({
+        inputTokens: 8886,
+        outputTokens: 30,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      });
+      // No usage at all means "the agent said nothing", so the rows keep deciding.
+      expect(usageFromAcpPromptResult(undefined)).toBeNull();
+      expect(usageFromAcpPromptResult({ stopReason: "end_turn" })).toBeNull();
+
+      // A tool batch already reported 60/10/0 this turn.
+      tracker.noteTurnReported({
+        inputTokens: 60,
+        outputTokens: 10,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      });
+      const settled = tracker.settlePromptTurnFromAcp(acct, nativeId, {
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadInputTokens: 50,
+        cacheCreationInputTokens: 0,
+      });
+      expect(settled).toEqual({
+        inputTokens: 40,
+        outputTokens: 10,
+        cacheReadInputTokens: 50,
+        cacheCreationInputTokens: 0,
+      });
+
+      // The row that was already accounted for must never surface as the next
+      // turn's work: this is the delayed-WAL double count.
+      expect(tracker.readUnseenStepsSync(acct, nativeId)).toEqual([]);
+      expect(tracker.lastStepIdx).toBe(0);
+
+      // A second turn's own row still reports normally.
+      insert.run(1, encodeGenMetadataBlob({ input: 300, output: 40 }));
+      const next = tracker.readUnseenStepsSync(acct, nativeId);
+      expect(next.map((s) => s.idx)).toEqual([1]);
+      expect(next[0]?.input).toBe(300);
+    });
   });
 
   test("StepUsageTracker advances cursor on SQLite DB and avoids double-counting suppressed steers", async () => {

@@ -397,6 +397,35 @@ export function normalizeRawAcpUsage(usage: any): {
   };
 }
 
+/**
+ * The prompt result's own usage, when the agent reported one.
+ *
+ * `session/prompt` returns
+ * `{stopReason, usage: {inputTokens, outputTokens, cachedReadTokens,
+ * cachedWriteTokens, thoughtTokens, totalTokens}}` on a turn that generated, and
+ * only `{stopReason}` on a turn that produced nothing. `null` means "the agent
+ * said nothing about tokens", so the step rows keep deciding.
+ */
+export function usageFromAcpPromptResult(
+  rawAcpUsage: unknown,
+): TokenUsageSummary | null {
+  const normalized = normalizeRawAcpUsage(rawAcpUsage);
+  if (
+    normalized.input === 0 &&
+    normalized.output === 0 &&
+    normalized.read === 0 &&
+    normalized.write === 0
+  ) {
+    return null;
+  }
+  return {
+    inputTokens: normalized.input,
+    outputTokens: normalized.output,
+    cacheReadInputTokens: normalized.read,
+    cacheCreationInputTokens: normalized.write,
+  };
+}
+
 export function settleStepUsage(
   rawAcpUsage: any,
   stepCountInPrompt: number,
