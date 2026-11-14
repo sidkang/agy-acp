@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { policyBlockedMessage, resetPolicyBlocks } from "../src/accounts/policy-block";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -1929,6 +1930,7 @@ describe("AgySessionWorker diagnostics integration", () => {
 
   /** Runs one table row: worker → response, asserting every declared field. */
   async function expectDiagnosedTurn(turnCase: DiagnosedTurnCase): Promise<void> {
+    resetPolicyBlocks();
     const ws = makeTempDir(turnCase.workspacePrefix);
     const worker = new AgySessionWorker(account, turnCase.sessionId, mcpServer, {
       workspaceDir: ws,
@@ -1957,6 +1959,19 @@ describe("AgySessionWorker diagnostics integration", () => {
       if (turnCase.message !== undefined) {
         // The fixed sentence first; the vendor's own words may follow it.
         expect(String(body.error?.message ?? "").startsWith(turnCase.message)).toBe(true);
+      }
+
+      // A vendor policy refusal is remembered, so the next turn for this account
+      // fails fast instead of spawning `agy` to be refused again; any other
+      // outcome leaves the account usable.
+      const blocked = policyBlockedMessage(account.accountRef);
+      if (
+        turnCase.status === 403 &&
+        turnCase.message === VENDOR_DISABLED_FAILURE_MESSAGE
+      ) {
+        expect(blocked).toBe(VENDOR_DISABLED_FAILURE_MESSAGE);
+      } else {
+        expect(blocked).toBeNull();
       }
     } finally {
       await worker.close("test_done");

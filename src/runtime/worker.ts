@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { clearPolicyBlock, markPolicyBlocked } from "../accounts/policy-block";
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -1110,6 +1111,12 @@ export class AgySessionWorker {
     // may therefore state auth in wording that a log must not trust.
     const verdict = classifyAgentFailure(evidence, redactedRawErr);
 
+    // A suspended account refuses every prompt the same way, so remember it and
+    // let later turns fail fast instead of spawning `agy` to be refused again.
+    if (verdict === "vendor_restricted") {
+      markPolicyBlocked(this.account.accountRef, VENDOR_DISABLED_FAILURE_MESSAGE);
+    }
+
     // The vendor's own words, appended after the fixed sentence: the verdict is
     // what Magpie routes on, the detail is what a human reads. Bounded, one line,
     // secrets already redacted above.
@@ -1578,6 +1585,10 @@ export class AgySessionWorker {
   }
 
   private handlePromptSuccess(result: any, seq?: number): void {
+    // The account answered: whatever refusal it gave earlier is over (an appeal
+    // can restore an account), so the fast-fail record no longer applies.
+    clearPolicyBlock(this.account.accountRef);
+
     this.stopTurnIdleWatchdog();
     if (this.turn.isSuppressedOrStale(seq)) {
       // A cancelled steer turn still spent tokens; bank them so the next

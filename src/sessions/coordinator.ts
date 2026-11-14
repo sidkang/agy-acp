@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { policyBlockedMessage } from "../accounts/policy-block";
 import {
   BridgeHttpError,
   type AccountDescriptor,
@@ -245,6 +246,14 @@ export class SessionCoordinator {
     options?: TurnExecutionOptions,
     signal?: AbortSignal,
   ): AsyncGenerator<TurnStreamEvent> {
+    // The vendor disabled this account on a previous turn. Magpie fails a `403`
+    // over to another account, which is what should happen here too — without
+    // spawning `agy` again for an account that cannot answer.
+    const blocked = policyBlockedMessage(account.accountRef);
+    if (blocked) {
+      throw new BridgeHttpError(403, "permission_error", blocked);
+    }
+
     const sessionKey = req.sessionId
       ? `${account.slotKey}::${account.accountRef}::${req.sessionId}${req.subagentId ? "::sub:" + req.subagentId : ""}`
       : null;

@@ -25,6 +25,13 @@ import {
   encodeAnthropicSseResponse,
 } from "../src/protocol/anthropic";
 import { getSharedMcpServer } from "../src/mcp/http-server";
+import {
+  POLICY_BLOCK_TTL_MS,
+  clearPolicyBlock,
+  markPolicyBlocked,
+  policyBlockedMessage,
+  resetPolicyBlocks,
+} from "../src/accounts/policy-block";
 import { settleStepUsage } from "../src/usage/step-usage";
 import { FAKE_ACP_PATH, spawnFakeAcp } from "./fixtures/helpers";
 
@@ -274,6 +281,65 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     await scheduler.closeAll();
     scheduler.destroy();
     mcpServer.stop();
+  });
+
+  test("0. A policy-blocked account fails fast instead of spawning agy again", async () => {
+    resetPolicyBlocks();
+
+    // The record itself: read back, outlive a restart of nothing, expire on time.
+    const ref = "22222222-2222-4222-8222-222222222222";
+    expect(policyBlockedMessage(ref)).toBeNull();
+    markPolicyBlocked(ref, "suspended", 1_000);
+    expect(policyBlockedMessage(ref, 1_000 + POLICY_BLOCK_TTL_MS - 1)).toBe("suspended");
+    expect(policyBlockedMessage(ref, 1_000 + POLICY_BLOCK_TTL_MS)).toBeNull();
+    markPolicyBlocked(ref, "suspended", 1_000);
+    clearPolicyBlock(ref);
+    expect(policyBlockedMessage(ref)).toBeNull();
+    markPolicyBlocked("", "suspended");
+    expect(policyBlockedMessage("")).toBeNull();
+
+    let spawns = 0;
+    const guardScheduler = new GlobalScheduler({
+      maxGlobalWorkers: 2,
+      maxPerAccountWorkers: 1,
+      idleTimeoutMs: 10_000,
+    });
+    const guardCoordinator = new SessionCoordinator({
+      scheduler: guardScheduler,
+      mcpServer: getSharedMcpServer(),
+      spawnFn: ((account: any, args: any, opts: any) => {
+        spawns += 1;
+        return spawnFakeAcp(account, args, opts);
+      }) as any,
+    });
+    const blockedAccount: AccountDescriptor = {
+      ...testAccount,
+      slotKey: "agy#blocked",
+      accountRef: ref,
+    };
+    const prompt = "This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.";
+    markPolicyBlocked(ref, prompt);
+
+    const req = makeReq([{ role: "user", content: [{ type: "text", text: "hello" }] }], {
+      model: "gemini-3.8-flash",
+      sessionId: `blocked-${Date.now()}`,
+    });
+    const run = async () => {
+      for await (const _event of guardCoordinator.executeTurn(
+        blockedAccount,
+        req,
+        sel("gemini-3.8-flash", "low"),
+      )) {
+        // drain
+      }
+    };
+    await expect(run()).rejects.toThrow(/violation of Terms of Service/);
+    // The point: no `agy` was spawned for an account that cannot answer.
+    expect(spawns).toBe(0);
+
+    resetPolicyBlocks();
+    await guardScheduler.closeAll();
+    guardScheduler.destroy();
   });
 
   test("1. Multi-turn warm session reuse + mid-session model/effort switch", async () => {
