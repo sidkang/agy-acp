@@ -239,7 +239,7 @@ function sweepStaleWorkspacesOnce(): void {
 export function buildEffectiveSystemText(
   systemPrompt: string | undefined,
   workDir: string | undefined,
-  cloak = true,
+  cloak = false,
 ): string {
   let systemWithWorkDir = systemPrompt ?? "";
   if (workDir && !/[\r\n\0]/.test(workDir)) {
@@ -248,8 +248,19 @@ export function buildEffectiveSystemText(
       ? `${systemWithWorkDir}\n\n${dirNote}`
       : dirNote;
   }
+  // A tool that outlives the relay delay answers "still running"; the model has
+  // to know the wait protocol up front, not discover it from the notice alone.
+  if (systemWithWorkDir.trim()) {
+    systemWithWorkDir = `${systemWithWorkDir.trim()}\n\n${STILL_RUNNING_PROTOCOL_NOTE}`;
+  } else {
+    systemWithWorkDir = STILL_RUNNING_PROTOCOL_NOTE;
+  }
   return cloakSystemPrompt(systemWithWorkDir, cloak);
 }
+
+const STILL_RUNNING_PROTOCOL_NOTE =
+  "When a tool result says the bridge is still running, call mcp_magpie_await_result with the call id it gave. " +
+  "Do not repeat the original call, and do not end the turn before the result arrives.";
 
 function buildWorkDirDisambiguationNote(callerWorkDir: string): string {
   return `The caller's working directory is ${JSON.stringify(callerWorkDir)}. The environment the caller describes (working directory, platform, OS, shell, git status) is where every tool runs. The bridge's temporary workspace only holds its agent configuration; where an environment given elsewhere in this conversation differs, go by the caller's instructions without checking. Never write artifacts, reports, or scratch files to <appDataDir>/brain on the bridge host; all file reads and writes must target the caller's workspace through the provided tools.`;
@@ -742,7 +753,7 @@ export class AgySessionWorker {
       const effectiveSystem = buildEffectiveSystemText(
         this.options.systemPrompt,
         this.options.workDir,
-        this.options.cloakPrompts !== false,
+        this.options.cloakPrompts === true,
       );
       this.effectiveSystemPrompt = effectiveSystem;
 
@@ -1551,6 +1562,31 @@ export class AgySessionWorker {
         "invalid_request_error",
         `Cannot start prompt turn in state ${this._state}`,
       );
+    }
+
+    // A model that ended its turn instead of asking again never saw these
+    // results; hand them over now, labelled, instead of silently dropping them.
+    const strandedAll = this.broker.takeStrandedResults();
+    // The transcript may already carry a result the caller re-sent; a note about
+    // it would be the same fact twice.
+    const promptText = Array.isArray(prompt)
+      ? prompt.map((part: any) => (part?.type === "text" ? String(part.text ?? "") : "")).join("\n")
+      : String(prompt ?? "");
+    const stranded = strandedAll.filter((entry) => !promptText.includes(entry.callId));
+    if (stranded.length > 0) {
+      const lines = stranded.map((entry) => {
+        const text = entry.result.content
+          .map((part: any) => (part.type === "text" ? String(part.text) : `[${part.mimeType} image]`))
+          .join("\n");
+        return `- ${entry.callId} (${entry.name})${entry.result.isError ? " [error]" : ""}: ${text}`;
+      });
+      const note = [
+        "[bridge] A previous turn ended before these tool results were retrieved. They are given again; do not repeat the calls that produced them.",
+        ...lines,
+      ].join("\n").slice(0, 16 * 1024);
+      prompt = Array.isArray(prompt)
+        ? [{ type: "text", text: note }, ...prompt]
+        : `${note}\n\n${prompt}`;
     }
 
     this.broker.openTurnWindow();

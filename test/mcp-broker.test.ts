@@ -538,7 +538,9 @@ describe("broker JSON-RPC surface", () => {
 
     const list = await readBody(await rpc(bridge.url, { jsonrpc: "2.0", id: 11, method: "tools/list" }))
     const listed = (list.result?.tools ?? []) as Array<Record<string, unknown>>
-    expect(listed).toHaveLength(1)
+    // The caller's tools, plus the still-running wait the relay protocol needs.
+    expect(listed).toHaveLength(2)
+    expect(listed[1]?.name).toBe("await_result")
     expect(listed[0]?.name).toBe(tools[0]?.mcpName)
     expect(listed[0]?.description).toBe("dotted tool")
     expect(listed[0]?._meta).toEqual({ "antigravity/alwaysLoad": true })
@@ -764,7 +766,9 @@ describe("tool_choice none", () => {
     const after = await readBody(await rpc(bridge.url, { jsonrpc: "2.0", id: 2, method: "tools/list" }))
 
     expect(after.result?.tools).toEqual(before.result?.tools)
-    expect((after.result?.tools as unknown[]).length).toBe(2)
+    // Two caller tools plus `await_result`, which stays advertised on purpose:
+    // retrieving a result the caller already authorized is not new work.
+    expect((after.result?.tools as unknown[]).length).toBe(3)
 
     bridge.broker.openTurnWindow()
     const rejected = await readBody(await callTool(bridge.url, "echo_tool", { text: "hi" }))
@@ -819,7 +823,8 @@ describe("tool_choice tool and disable_parallel_tool_use", () => {
 
     // tools/list still advertises every tool, preserving the upstream prompt cache.
     const list = await readBody(await rpc(bridge.url, { jsonrpc: "2.0", id: 2, method: "tools/list" }))
-    expect((list.result?.tools as unknown[]).length).toBe(2)
+    // The caller's tools plus `await_result`.
+    expect((list.result?.tools as unknown[]).length).toBe(3)
 
     const pending = callTool(bridge.url, "echo_tool", { text: "right" }, 3)
     const batch = await waitFor(() => bridge.batches[0])
@@ -909,5 +914,90 @@ describe("tool_choice tool and disable_parallel_tool_use", () => {
     expect((await readBody(await first)).result).toEqual({ content: [{ type: "text", text: "one done" }] })
     expect((await readBody(await second)).result).toEqual({ content: [{ type: "text", text: "two done" }] })
     expect((await readBody(await third)).result).toEqual({ content: [{ type: "text", text: "three done" }] })
+  })
+})
+
+describe("still-running relay", () => {
+  test("relays before agy's deadline and await_result finishes the same call", async () => {
+    const bridge = startBridge({ relayAfterMs: 25 })
+    bridge.broker.setTools([{ name: "slow_tool", inputSchema: echoToolSchema }])
+    bridge.broker.openTurnWindow()
+
+    const pending = callTool(bridge.url, "slow_tool", {}, 7)
+    const exposed = await waitFor(() => bridge.batches[0]?.[0])
+    const relayed = await readBody(await pending)
+
+    // A notice, not a failure, and it names the tool as `agy` shows it.
+    expect((relayed.result as any).isError).toBeUndefined()
+    const notice = String((relayed.result as any).content[0].text)
+    expect(notice).toContain("still running")
+    expect(notice).toContain("mcp_magpie_await_result")
+    expect(notice).toContain(exposed!.id)
+
+    // The model asks again; the caller's result arrives while it waits.
+    const awaited = callTool(bridge.url, "await_result", { call_id: exposed!.id }, 8)
+    await sleep(10)
+    bridge.broker.deliverToolResults([
+      { toolUseId: exposed!.id, isError: false, content: [{ type: "text", text: "the answer" }] },
+    ])
+
+    const done = await readBody(await awaited)
+    expect((done.result as any)).toEqual({ content: [{ type: "text", text: "the answer" }] })
+    // The relay is a transport event: the call never became a second tool use.
+    expect(bridge.batches).toHaveLength(1)
+  })
+
+  test("an unknown call id says so instead of hanging", async () => {
+    const bridge = startBridge({ relayAfterMs: 25 })
+    bridge.broker.setTools([{ name: "slow_tool", inputSchema: echoToolSchema }])
+
+    const body = await readBody(await callTool(bridge.url, "await_result", { call_id: "toolu_nope" }, 3))
+    expect((body.result as any).isError).toBe(true)
+    expect(String((body.result as any).content[0].text)).toContain("may have finished")
+  })
+
+  test("notifications/cancelled ends the wait but keeps the result deliverable", async () => {
+    const bridge = startBridge({ relayAfterMs: 5_000 })
+    bridge.broker.setTools([{ name: "slow_tool", inputSchema: echoToolSchema }])
+    bridge.broker.openTurnWindow()
+
+    const pending = callTool(bridge.url, "slow_tool", {}, 9)
+    const exposed = await waitFor(() => bridge.batches[0]?.[0])
+    await rpc(bridge.url, {
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId: 9 },
+    })
+
+    const body = await readBody(await pending)
+    expect((body.result as any).isError).toBe(true)
+    expect(String((body.result as any).content[0].text)).toContain("cancelled")
+
+    // Nothing was thrown away: the caller can still hand the result over.
+    const outcome = bridge.broker.deliverToolResults([
+      { toolUseId: exposed!.id, isError: false, content: [{ type: "text", text: "late result" }] },
+    ])
+    expect(outcome.allPendingResolved).toBe(true)
+  })
+
+  test("a result delivered after the model stopped asking is kept for the next prompt", async () => {
+    const bridge = startBridge({ relayAfterMs: 20 })
+    bridge.broker.setTools([{ name: "slow_tool", inputSchema: echoToolSchema }])
+    bridge.broker.openTurnWindow()
+
+    const pending = callTool(bridge.url, "slow_tool", {}, 11)
+    const exposed = await waitFor(() => bridge.batches[0]?.[0])
+    await readBody(await pending)
+
+    bridge.broker.deliverToolResults([
+      { toolUseId: exposed!.id, isError: false, content: [{ type: "text", text: "nobody asked" }] },
+    ])
+
+    const stranded = bridge.broker.takeStrandedResults()
+    expect(stranded).toHaveLength(1)
+    expect(stranded[0]!.callId).toBe(exposed!.id)
+    expect((stranded[0]!.result as any).content[0].text).toBe("nobody asked")
+    // Taking them empties the shelf.
+    expect(bridge.broker.takeStrandedResults()).toHaveLength(0)
   })
 })

@@ -165,7 +165,7 @@ export class LoopbackMcpServer {
       const bodies: unknown[] = []
       let status = 0
       for (const message of parsed) {
-        const result = await broker.handleJsonRpc(message)
+        const result = await broker.handleJsonRpc(message, { signal: request.signal })
         if (result.body === null) continue
         // Notifications inside a batch must not downgrade the batch status.
         if (!status) status = result.status
@@ -175,7 +175,7 @@ export class LoopbackMcpServer {
       return jsonResponse(status, bodies)
     }
 
-    const result = await broker.handleJsonRpc(parsed)
+    const result = await broker.handleJsonRpc(parsed, { signal: request.signal })
     if (result.body === null) return new Response(null, { status: result.status })
     return jsonResponse(result.status, result.body)
   }

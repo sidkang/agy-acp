@@ -46,6 +46,8 @@ export interface SessionToolBrokerOptions {
   onBatchReady?: (calls: ExposedToolCall[]) => void
   onFatalToolLoop?: (reason: string) => void
   onCallExpired?: (callId: string) => void
+  /** Delay before a parked call answers "still running". 0 disables the relay. */
+  relayAfterMs?: number
 }
 
 export interface JsonRpcResponse {
@@ -58,6 +60,14 @@ const DEFAULT_CALL_DEADLINE_MS = 15 * 60 * 1000
 const DEFAULT_MAX_REJECTED_NONE_CALLS = 3
 
 const TOOL_USE_ID_PREFIX = "toolu_"
+// `agy` abandons a `tools/call` at 180 s (measured on 1.5.9: the POST aborts at
+// 180.004 s). A parked call answers with a "still running" notice well before that
+// and lets the model ask for the result again, so the same tool execution keeps
+// running instead of being turned into a timeout the model has to write around.
+const RELAY_TOOL_NAME = "await_result"
+const DEFAULT_RELAY_AFTER_MS = 150_000
+const MAX_RELAY_WAITS = 20
+const MAX_STRANDED_RESULTS = 32
 const PROTOCOL_VERSION = "2024-11-05"
 const SERVER_INFO = { name: "magpie-bridge", version: "0.1.0" } as const
 const ALWAYS_LOAD_META = { "antigravity/alwaysLoad": true } as const
@@ -82,6 +92,10 @@ interface ParkedCall {
   promise: Promise<unknown>
   resolve: (result: unknown) => void
   deadlineTimer: ReturnType<typeof setTimeout> | null
+  /** "Still running" notices this call has answered with. */
+  relayWaits: number
+  /** MCP waits currently listening for this call's result. */
+  waiters: number
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -99,6 +113,33 @@ function errorResult(text: string): McpCallToolResult {
   return { isError: true, content: [{ type: "text", text }] }
 }
 
+const RELAY = Symbol("relay")
+const ABORTED = Symbol("aborted")
+
+export interface ToolCallContext {
+  signal?: AbortSignal
+}
+
+/**
+ * What the model is told when a parked call outlives the relay delay.
+ *
+ * Not an error: the execution is still running. It names the tool as `agy` shows
+ * it (`mcp_magpie_await_result`), because that is the name the model must call.
+ */
+function relayNotice(call: ParkedCall): McpCallToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          `The bridge is still running tool call ${call.id} (${call.name}). ` +
+          `Call mcp_magpie_${RELAY_TOOL_NAME} with {"call_id":"${call.id}"} to receive its result. ` +
+          `Do not repeat the original call, and do not end the turn before the result arrives.`,
+      },
+    ],
+  }
+}
+
 function createParkedCall(name: string, mcpName: string, input: Record<string, unknown>): ParkedCall {
   let resolveFn: (result: unknown) => void = () => {}
   const promise = new Promise<unknown>((resolve) => {
@@ -112,6 +153,8 @@ function createParkedCall(name: string, mcpName: string, input: Record<string, u
     promise,
     resolve: resolveFn,
     deadlineTimer: null,
+    relayWaits: 0,
+    waiters: 0,
   }
 }
 
@@ -142,6 +185,7 @@ export class SessionToolBroker {
   private readonly onBatchReady?: (calls: ExposedToolCall[]) => void
   private readonly onFatalToolLoop?: (reason: string) => void
   private readonly onCallExpired?: (callId: string) => void
+  private readonly relayAfterMs: number
 
   private normalizedTools: NormalizedToolDef[] = []
   private mcpToOriginal = new Map<string, string>()
@@ -156,6 +200,13 @@ export class SessionToolBroker {
   /** Late parallel siblings that arrived after the previous HTTP turn closed. */
   private queuedUnexposed: ParkedCall[] = []
 
+  /** Every call this turn parked, so `await_result` can find it again. */
+  private callsById = new Map<string, ParkedCall>()
+  /** The wait listening on each in-flight JSON-RPC request id. */
+  private waitersById = new Map<string | number, AbortController>()
+  /** Results that arrived after their wait was abandoned, for the next prompt. */
+  private stranded: Array<{ callId: string; name: string; result: McpCallToolResult }> = []
+
   private batchTimer: ReturnType<typeof setTimeout> | null = null
   private turnOutputOpen = true
 
@@ -166,6 +217,7 @@ export class SessionToolBroker {
     this.onBatchReady = options.onBatchReady
     this.onFatalToolLoop = options.onFatalToolLoop
     this.onCallExpired = options.onCallExpired
+    this.relayAfterMs = options.relayAfterMs ?? DEFAULT_RELAY_AFTER_MS
   }
 
   setTools(rawTools: NormalizedAnthropicRequest["tools"]): NormalizedToolDef[] {
@@ -237,7 +289,15 @@ export class SessionToolBroker {
       if (!call) continue
       this.clearDeadline(call)
       this.exposedPending.delete(delivery.toolUseId)
-      call.resolve(toMcpResult(delivery))
+      this.callsById.delete(delivery.toolUseId)
+      const resolved = toMcpResult(delivery)
+      // The model may have ended its turn instead of asking again: keep the
+      // result for the next prompt rather than resolving into nobody.
+      if (call.relayWaits > 0 && call.waiters === 0) {
+        this.stranded.push({ callId: call.id, name: call.name, result: resolved })
+        if (this.stranded.length > MAX_STRANDED_RESULTS) this.stranded.shift()
+      }
+      call.resolve(resolved)
     }
 
     if (this.exposedPending.size === 0 && this.queuedUnexposed.length > 0) {
@@ -268,6 +328,16 @@ export class SessionToolBroker {
     return { allPendingResolved: true, remainingExposedIds: [], newlyExposedCalls: [] }
   }
 
+  /**
+   * Results that arrived after their wait was abandoned, oldest first. Taking
+   * them is what lets a later prompt tell the model what it never received.
+   */
+  takeStrandedResults(): Array<{ callId: string; name: string; result: McpCallToolResult }> {
+    const taken = this.stranded
+    this.stranded = []
+    return taken
+  }
+
   /** Resolve every parked MCP call so `agy`'s HTTP client exits cleanly. */
   cancelAll(reason?: string): void {
     const text = reason || "Cancelled"
@@ -277,13 +347,20 @@ export class SessionToolBroker {
     this.exposedPending.clear()
     this.clearBatchTimer()
     this.turnOutputOpen = false
+    // Resolve the calls before aborting their waits: a waiter that aborts first
+    // would win the race and report "cancelled" over the caller's real reason.
     for (const call of parked) {
       this.clearDeadline(call)
       call.resolve(errorResult(text))
     }
+    for (const [id, controller] of this.waitersById) {
+      this.waitersById.delete(id)
+      controller.abort()
+    }
+    this.callsById.clear()
   }
 
-  async handleJsonRpc(msg: unknown): Promise<JsonRpcResponse> {
+  async handleJsonRpc(msg: unknown, ctx?: ToolCallContext): Promise<JsonRpcResponse> {
     if (!isObject(msg)) {
       return { status: 400, body: { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } } }
     }
@@ -294,6 +371,7 @@ export class SessionToolBroker {
 
     // Notifications (and anything without an id) are answered with 202 and no body.
     if (id === undefined || id === null) {
+      if (method === "notifications/cancelled") this.cancelWait(params)
       return { status: 202, body: null }
     }
 
@@ -334,17 +412,37 @@ export class SessionToolBroker {
             jsonrpc: "2.0",
             id,
             result: {
-              tools: this.normalizedTools.map((tool) => ({
-                name: tool.mcpName,
-                description: tool.description,
-                inputSchema: tool.inputSchema,
-                _meta: ALWAYS_LOAD_META,
-              })),
+              tools: [
+                ...this.normalizedTools.map((tool) => ({
+                  name: tool.mcpName,
+                  description: tool.description,
+                  inputSchema: tool.inputSchema,
+                  _meta: ALWAYS_LOAD_META,
+                })),
+                // Advertised from the first `tools/list`: `agy` caches the catalog,
+                // so a tool that appears only after a relay may never be seen.
+                {
+                  name: RELAY_TOOL_NAME,
+                  description:
+                    "Wait for the result of a tool call that answered that it is still running. Call this only when a tool result tells you to, passing the call_id it gave.",
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      call_id: {
+                        type: "string",
+                        description: "The call id from the still-running notice.",
+                      },
+                    },
+                    required: ["call_id"],
+                  },
+                  _meta: ALWAYS_LOAD_META,
+                },
+              ],
             },
           },
         }
       case "tools/call":
-        return await this.handleToolCall(id, params)
+        return await this.handleToolCall(id, params, ctx)
       default:
         return {
           status: 200,
@@ -357,8 +455,13 @@ export class SessionToolBroker {
     }
   }
 
-  private async handleToolCall(id: unknown, params: Record<string, unknown>): Promise<JsonRpcResponse> {
+  private async handleToolCall(
+    id: unknown,
+    params: Record<string, unknown>,
+    ctx?: ToolCallContext,
+  ): Promise<JsonRpcResponse> {
     const mcpName = typeof params.name === "string" ? params.name : ""
+    if (mcpName === RELAY_TOOL_NAME) return await this.handleAwaitCall(id, params, ctx)
     const originalName = this.mcpToOriginal.get(mcpName)
     if (!originalName) {
       return { status: 200, body: { jsonrpc: "2.0", id, result: errorResult(`Unknown tool: ${mcpName}`) } }
@@ -386,13 +489,129 @@ export class SessionToolBroker {
     }
 
     const call = this.parkCall(originalName, mcpName, ensureObject(params.arguments))
-    // A parked call is only ever resolved (never rejected), so nothing to catch.
-    const result = await call.promise
-    return { status: 200, body: { jsonrpc: "2.0", id, result } }
+    return await this.answerParkedCall(id, call, ctx)
+  }
+
+  /**
+   * Answers a `tools/call`, waiting for the caller's result but giving up the
+   * transport after `relayAfterMs` so `agy` never reaches its 180 s deadline.
+   */
+  private async answerParkedCall(
+    id: unknown,
+    call: ParkedCall,
+    ctx?: ToolCallContext,
+  ): Promise<JsonRpcResponse> {
+    if (call.relayWaits >= MAX_RELAY_WAITS) {
+      return {
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id,
+          result: errorResult(
+            `The bridge stopped waiting for tool call ${call.id} (${call.name}) after ${MAX_RELAY_WAITS} waits. ` +
+            `It may still be running, and its result will not arrive here. Do not repeat the call.`,
+          ),
+        },
+      }
+    }
+    const outcome = await this.waitForCall(id, call, ctx)
+    if (outcome === RELAY) {
+      call.relayWaits += 1
+      return { status: 200, body: { jsonrpc: "2.0", id, result: relayNotice(call) } }
+    }
+    if (outcome === ABORTED) {
+      return {
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id,
+          result: errorResult("The bridge stopped waiting: the tool call request was cancelled."),
+        },
+      }
+    }
+    return { status: 200, body: { jsonrpc: "2.0", id, result: outcome } }
+  }
+
+  /**
+   * `mcp_magpie_await_result`: the model asking again for a result it has not
+   * received. Handled inside the broker, so it never becomes a `tool_use`.
+   */
+  private async handleAwaitCall(
+    id: unknown,
+    params: Record<string, unknown>,
+    ctx?: ToolCallContext,
+  ): Promise<JsonRpcResponse> {
+    const args = ensureObject(params.arguments)
+    const callId = typeof args.call_id === "string" ? args.call_id.trim() : ""
+    const call = callId ? this.callsById.get(callId) : undefined
+    if (!call) {
+      return {
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id,
+          result: errorResult(
+            `No tool call "${callId}" is waiting. It may have finished before you asked, in which case its result is the tool result you already received. Do not repeat the original call.`,
+          ),
+        },
+      }
+    }
+    return await this.answerParkedCall(id, call, ctx)
+  }
+
+  /** Races one parked call against the relay delay and the request's abort. */
+  private async waitForCall(
+    id: unknown,
+    call: ParkedCall,
+    ctx?: ToolCallContext,
+  ): Promise<unknown> {
+    const controller = new AbortController()
+    const onAbort = () => controller.abort()
+    if (ctx?.signal) {
+      if (ctx.signal.aborted) controller.abort()
+      else ctx.signal.addEventListener("abort", onAbort, { once: true })
+    }
+    const tracked = typeof id === "string" || typeof id === "number"
+    if (tracked) this.waitersById.set(id as string | number, controller)
+
+    call.waiters += 1
+    let timer: ReturnType<typeof setTimeout> | null = null
+    try {
+      const racers: Array<Promise<unknown>> = [call.promise]
+      if (this.relayAfterMs > 0) {
+        racers.push(
+          new Promise<unknown>((resolve) => {
+            timer = setTimeout(() => resolve(RELAY), this.relayAfterMs)
+          }),
+        )
+      }
+      racers.push(
+        new Promise<unknown>((resolve) => {
+          controller.signal.addEventListener("abort", () => resolve(ABORTED), { once: true })
+        }),
+      )
+      return await Promise.race(racers)
+    } finally {
+      if (timer !== null) clearTimeout(timer)
+      call.waiters -= 1
+      ctx?.signal?.removeEventListener("abort", onAbort)
+      if (tracked && this.waitersById.get(id as string | number) === controller) {
+        this.waitersById.delete(id as string | number)
+      }
+    }
+  }
+
+  /** `notifications/cancelled` names the JSON-RPC request that is no longer wanted. */
+  private cancelWait(params: Record<string, unknown>): void {
+    const requestId = params.requestId
+    if (typeof requestId !== "string" && typeof requestId !== "number") return
+    this.waitersById.get(requestId)?.abort()
+    this.waitersById.delete(requestId)
   }
 
   private parkCall(name: string, mcpName: string, input: Record<string, unknown>): ParkedCall {
     const call = createParkedCall(name, mcpName, input)
+    this.callsById.set(call.id, call)
     this.armDeadline(call)
     if (this.turnOutputOpen) {
       this.currentBatch.push(call)
