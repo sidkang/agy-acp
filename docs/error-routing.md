@@ -177,8 +177,9 @@ Log and stderr text passes through filters before any keyword is matched:
   that is not a guess. An absolute form (`reset on Sep 4, 2026 12:30 UTC`) is classified but
   yields no header (open: [plan](plan.md)).
 - `rate_limit` answers with `TRANSIENT_LIMIT_FAILURE_MESSAGE`: a plain `429` whose text contains
-  neither `quota` nor `rate limit`, so Magpie holds the account briefly and asks the next one
-  instead of holding it for a window.
+  neither `quota` nor `rate limit`, so Magpie reads it as a brief rate rest rather than a spent
+  window. With `account_failover` off it answers `409` instead (§1.1), so nothing is rested and
+  nobody is asked in its place.
 - `quota` is for a 429/403 whose own words say a quota is spent, which Magpie should hold
   until the window renews.
 

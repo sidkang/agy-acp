@@ -150,8 +150,8 @@ What this plugin does about the mechanism, without claiming the motive:
   failure may still reach another account. Magpie's own group routing can stop that for
   every provider: `AffinityStrict` keeps a conversation on the account that answered it,
   and a `Manual` group sends only to the member the user picked
-  (`internal/provider/group.go:54-90`). Asking Magpie for a "do not fail this turn over"
-  signal is the durable fix; a plugin can only choose a status the router does not follow.
+  (`internal/provider/group.go:54-90`). A plugin can only choose a status the router does not
+  follow; it cannot veto a retry any other way.
 
 ## Standing decisions
 
