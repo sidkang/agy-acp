@@ -1190,6 +1190,49 @@ describe("AgySessionWorker diagnostics integration", () => {
     }
   });
 
+  test("the suspension sentence after real prose stays answer text", async () => {
+    // A caller can ask what that sentence means, and the model writes it back. It
+    // is promoted only when it is the whole answer.
+    const ws = makeTempDir("worker-tos-quoted-");
+    const worker = new AgySessionWorker(account, "diag-sess-tos-quoted", mcpServer, {
+      workspaceDir: ws,
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "Your account shows this sentence:" },
+            },
+          });
+          ctx.emitUpdate({
+            sessionId: NATIVE_SESSION_ID,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: {
+                text: "\n⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.\n",
+              },
+            },
+          });
+          ctx.finishTurn();
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "what does this sentence mean?");
+      expect(events.some((e) => e.type === "error")).toBe(false);
+      const text = events
+        .filter((e): e is Extract<TurnStreamEvent, { type: "text_delta" }> => e.type === "text_delta")
+        .map((e) => e.text)
+        .join("");
+      expect(text).toContain("Your account shows this sentence:");
+      expect(text).toContain("violation of Terms of Service");
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
   test("a retry note split across two chunks is still stripped", async () => {
     const ws = makeTempDir("worker-split-note-");
     const worker = new AgySessionWorker(account, "diag-sess-split-note", mcpServer, {
@@ -1665,6 +1708,29 @@ describe("AgySessionWorker diagnostics integration", () => {
           name: "agy-acp.log.91023",
           text: "E1114 18:31:00.000003 400 run.go:315] PERMISSION_DENIED: this service has been disabled in this account for violation of Terms of Service\n",
         });
+      },
+      status: 403,
+      signInHeader: null,
+      errorType: "permission_error",
+      message: VENDOR_DISABLED_FAILURE_MESSAGE,
+    },
+    {
+      name: "a suspended account's answer is the vendor sentence, not an answer",
+      workspacePrefix: "worker-tos-answer-",
+      sessionId: "diag-tos-answer",
+      script: (ctx) => {
+        // Measured on `agy 1.5.9`: `stopReason: end_turn` with this sentence as
+        // the whole content, so nothing fails and no log line is written.
+        ctx.emitUpdate({
+          sessionId: NATIVE_SESSION_ID,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              text: "\n⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.\n",
+            },
+          },
+        });
+        ctx.finishTurn();
       },
       status: 403,
       signInHeader: null,

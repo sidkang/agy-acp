@@ -135,6 +135,11 @@ export const AGENT_TERMINAL_MARKERS: ReadonlyArray<string> = [
   "\n⚠ Agent execution terminated due to error.\n",
   "\n⚠ There was a network issue connecting to the server, please try again.\n",
   "\n⚠ Your AI credits balance is too low to continue.\n",
+  // Measured on `agy 1.5.9`: a suspended account's turn answers with this
+  // sentence as its whole content and `stopReason: end_turn`. Nothing fails, so a
+  // bridge that only reads the result delivers it as a 200 answer and the dead
+  // account keeps being chosen, one wasted turn at a time.
+  "\n⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.\n",
 ];
 
 /** agy's own "retry me" note, not a terminal failure: the turn goes on. */

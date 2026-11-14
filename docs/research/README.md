@@ -136,11 +136,26 @@ inactivity watchdog (action 2), failing instead of clipping an oversized raw tur
 
 Still open:
 
-1. **Read usage from ACP before reading SQLite.** A prompt response carries
-   exact counts on current builds (`estebanforge` `src/acp/connection.ts:558-577`).
-   If `agy 1.5.8` reports them, the WAL row becomes a cross-check and the
-   delayed-row double count (a 0.1.10 review finding) disappears. Needs one probe
-   against our own build first.
+1. **Read usage from ACP before reading SQLite — confirmed available.** Probed on
+   `agy 1.5.9`. A generating turn returns
+   `{"stopReason":"end_turn","usage":{"inputTokens":8886,"outputTokens":30,
+   "cachedReadTokens":0,"cachedWriteTokens":0,"thoughtTokens":29,"totalTokens":8916}}`,
+   with `cachedReadTokens` populated on a warm turn. The one `usage_update` session
+   update is context occupancy (`{"used":8916,"size":1048576}`: the turn's
+   `totalTokens` against the window), not a token breakdown. Moving usage onto the
+   prompt result removes the delayed-row double count instead of patching it.
+
+   Two caveats from the probes: **a turn that produces no generation returns
+   `{"stopReason"}` and no `usage` at all** (seen when the account answered with
+   the vendor's suspension sentence), and the two probes ran on **different host
+   logins** (the first on the account that was suspended, the second after the
+   account was switched), so nothing here is a statement about one account's
+   behaviour over time.
+
+**Corrected from the first pass:** `agentCapabilities.mcpCapabilities` is `null`
+on 1.5.9 — the agent does not advertise HTTP MCP at all, so the 0.1.9 guard fires
+only on an explicit `false`, never on silence.
+
 2. ~~Replace the 30-minute wall clock with a progress-armed inactivity
    watchdog.~~ Done: 10 minutes silent while generating, 60 minutes while a tool
    call is outstanding, and the wall clock demoted to a backstop.

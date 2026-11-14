@@ -1041,6 +1041,10 @@ export class AgySessionWorker {
     // the model for 30 seconds and counts no failure: both are the vendor saying
     // the turn died, so they are taken at their word even when the log is empty.
     if (fromNotice === "internal" || fromNotice === "upstream_busy") return true;
+    // The vendor's suspension sentence is what a suspended account answers with,
+    // and nothing else in the turn corroborates it. It is taken at its word only
+    // when it is the whole answer: a model writing it after prose is quoting it.
+    if (fromNotice === "vendor_restricted" && !this.turn.deliveredWork) return true;
     // A false 402 rests the account for half an hour, so the spent-credit notice
     // needs the turn's own log to name the same failure first.
     const evidence = this.currentTurnLogEvidence();
