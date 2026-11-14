@@ -1,13 +1,20 @@
 # Research: four sibling Antigravity bridges
 
 Four third-party bridges were cloned and read on 2026-11-14 to compare their
-choices with `magpie-agy-acp` 0.1.10. One file per project:
+choices with `magpie-agy-acp` 0.1.10. Each project has three files:
 
-- [`tianzuo555-pi-antigravity.md`](tianzuo555-pi-antigravity.md) — `@tian.zuo/pi-antigravity` 0.12.1, stream-json.
-- [`fdkevin0-pi-agy-acp.md`](fdkevin0-pi-agy-acp.md) — `pi-agy-acp` 0.1.3, ACP.
-- [`estebanforge-pi-antigravity-bridge.md`](estebanforge-pi-antigravity-bridge.md) — `@estebanforge/pi-antigravity-bridge` 1.10.6, ACP + stream-json, with a live-verified ACP reference.
-- [`zacbemis-pi-antigravity-acp-provider.md`](zacbemis-pi-antigravity-acp-provider.md) — `pi-antigravity-acp-provider` 0.1.19, ACP, signed runtime manifest, inactivity watchdog.
-  - deeper extraction: [`zacbemis-pi-antigravity-acp-provider-deep-dive.md`](zacbemis-pi-antigravity-acp-provider-deep-dive.md) — its upstream is Google's downloadable `agy_acp_server` runtime rather than the `agy` CLI, its loopback MCP endpoint authenticates with a bearer header, warm-session identity is an exact history fingerprint, instructions are never truncated (it throws `invalid_input`), a quota reply is rejected before it is persisted, and the session store is guarded by `proper-lockfile`.
+| project | package | upstream | extraction | second pass (independent) | verdict pass (audit) |
+|---|---|---|---|---|---|
+| `TianZuo555/pi-extensions` | `@tian.zuo/pi-antigravity` 0.12.1 | `agy` stream-json | [`…md`](tianzuo555-pi-antigravity.md) | [`…-pass-ds.md`](tianzuo555-pi-antigravity-pass-ds.md) | [`…-pass-gpt.md`](tianzuo555-pi-antigravity-pass-gpt.md) |
+| `fdkevin0/pi-agy-acp` | `pi-agy-acp` 0.1.3 | `agy acp` | [`…md`](fdkevin0-pi-agy-acp.md) | [`…-pass-ds.md`](fdkevin0-pi-agy-acp-pass-ds.md) | [`…-pass-gpt.md`](fdkevin0-pi-agy-acp-pass-gpt.md) |
+| `EstebanForge/pi-extensions` | `@estebanforge/pi-antigravity-bridge` 1.10.6 | `agy acp` (default) + stream-json | [`…md`](estebanforge-pi-antigravity-bridge.md) | [`…-pass-ds.md`](estebanforge-pi-antigravity-bridge-pass-ds.md) | [`…-pass-gpt.md`](estebanforge-pi-antigravity-bridge-pass-gpt.md) |
+| `zacbemis/pi-antigravity-acp-provider` | `pi-antigravity-acp-provider` 0.1.19 | managed `agy_acp_server` | [`…md`](zacbemis-pi-antigravity-acp-provider.md) | [`…-pass-ds.md`](zacbemis-pi-antigravity-acp-provider-pass-ds.md) | [`…-pass-gpt.md`](zacbemis-pi-antigravity-acp-provider-pass-gpt.md) |
+
+The `-pass-gpt.md` files audit the extraction claim by claim (`confirmed` /
+`wrong` / `unverifiable`) with the line checked. **Where they disagree, the
+verdict pass wins**; the first extractions keep their errors on purpose, as a
+record of what a single reading gets wrong. `zacbemis` also has an
+[extra deep dive](zacbemis-pi-antigravity-acp-provider-deep-dive.md).
 
 None of them is a Magpie plugin. All four plug into **pi** as a provider
 extension, which decides several of their choices before they start.
@@ -16,52 +23,93 @@ extension, which decides several of their choices before they start.
 
 | | them (pi provider) | us (Magpie plugin, Anthropic HTTP) |
 |---|---|---|
-| thinking transport | a pi message part; no signature field exists | a `thinking` block whose `signature` the real API verifies |
-| error surface | a typed exception (`LlmError`, code enum) | HTTP status + `error.type` + body wording a router reads |
-| retry policy | pi's, per provider | Magpie's `retryable()`/`failure()`/`restID()`, by status *and* wording |
-| multi-account | absent in all four | the reason this plugin exists |
+| thinking transport | a pi message part; **no signature field exists in any of the four** | a `thinking` block whose `signature` the real API verifies |
+| error surface | `errorMessage` string plus `stopReason`; no HTTP statuses | HTTP status + `error.type` + body wording a router reads |
+| retry policy | pi's, or none at all | Magpie's `retryable()`/`failure()`/`restID()`, by status *and* wording |
+| multi-account | **absent in all four** | the reason this plugin exists |
 
-So the signature problem this repository spent 0.1.9 on is **ours alone**: it is
-created by the Anthropic shape, not by `agy`. `tianzuo555` says it outright —
-"agy never streams thought text (print mode exposes counts only)"
-(`tianzuo555` `src/provider.ts:162-164`) — while the ACP-based ones forward
-thought text as pi reasoning (`fdkevin0` `src/conversation.ts:258-261`,
-`estebanforge` `docs/ENGINES.md:26-30`).
+The signature problem and the wording problem are **ours alone**: they are
+created by the Anthropic shape, not by `agy`. Every sibling can answer "no
+signature exists here" because pi never asks for one.
 
-The error problem is also ours alone, and it is the harder one: every sibling
-can throw one exception. We have to choose a status and words that a router
-reads *as a budget claim*, which is exactly the mechanism of the 2026-11-14
-incident.
+The four reasoning surfaces still differ, and the difference is worth knowing:
+`tianzuo555` reserves a thinking slot and fills it with a synthetic label,
+`Thought for <n>s, <k> tokens` (`src/provider.ts:606-648`); `fdkevin0` forwards
+thought text but **drops historical reasoning from the replay transcript**
+(`src/history.ts:139-145`); `zacbemis` forwards thought deltas and renders
+`tool_call`/`plan` text as thinking; `estebanforge` renders native tool cards,
+with thinking labels as a fallback (`src/provider.ts:1186-1258`). None of them
+has the problem 0.1.9 solved with a UUID-shaped signature.
 
-## Transport: two engines, and what they disagree about
+## ACP facts: what the siblings actually established
 
-- **stream-json** (`tianzuo555`, `estebanforge`'s alt engine) runs one `agy` per
-  turn with `--conversation <id>` and `--print`, and has a **~25KB prompt-line
-  cap**: a longer single prompt is dropped with SUCCESS, an empty response, and
-  no error, and a conversation whose turn was dropped never answers again
-  (`estebanforge` `CHANGELOG.md:247`). Their fix is to stage the system block as
-  an `agy` agent file and pass `--agent`, since agent files are read from disk.
-- **ACP** carries no such cap — "ACP keeps the inline block: the JSON-RPC
-  transport has no cap" (`estebanforge` `CHANGELOG.md:247`). Our 112 KiB render
-  budget in `src/sessions/prompt-render.ts` is therefore a **policy choice for
-  lens and cost, not an upstream limit**; the review's complaint about silent
-  clipping stands on its own merits, not on a hidden cap.
+Three claims from the first extraction round did **not** survive audit, and they
+matter because this repository used two of them as design inputs:
 
-Two live ACP facts worth keeping, from `estebanforge`'s captured reference
-(`docs/ACP-PROTOCOL-REFERENCE.md:269-300`):
+- **`session/cancel` answering `-32601`** was observed on one build
+  (`agy_acp_server_20260818_01_RC01`, Linux, 2026-09-03) for an **id-bearing
+  request**; the reference itself retires that guidance, and current code sends a
+  **notification** (`estebanforge` `docs/ACP-PROTOCOL-REFERENCE.md:3,269-282`).
+  Treat a cancel as best-effort and close on an unsettled turn, but do not
+  restate "cancel does not exist" as a rule.
+- **ACP carrying no usage fields** was an RC01 observation. Since at least agy
+  1.5.3 the prompt response carries exact usage — `inputTokens`, `outputTokens`,
+  `totalTokens`, optional `thoughtTokens`, `cachedReadTokens`
+  (`estebanforge` `docs/ENGINES.md:7`, `src/acp/connection.ts:328-343,558-577`).
+  Our SQLite step rows are therefore a choice, not the only source; see action 1.
+- **The ~25 KB prompt-line cap** was measured on **agy 1.2.14 over stream-json**
+  (`estebanforge` `CHANGELOG.md:247-248`, `src/sysprompt-agent.ts:1-10`). ACP
+  deliberately keeps the inline block. Whether ACP has any size limit on 1.5.8 is
+  **unverified** — including in our own render budget, which is our policy.
 
-- `session/cancel` answers `-32601 Method not found` on the RC01 build, and an
-  in-flight `session/prompt` **cannot be stopped over the protocol** — a 3000
-  number stream ran to completion after the cancel returned. Anything that
-  depends on a cancel settling must also close the connection.
-- ACP reported **no usage fields anywhere** (`initialize`, `session/new`,
-  `agent_message_chunk`, prompt results) on that build, which is why our usage
-  comes from `agy`'s SQLite step rows rather than from the protocol.
+## Tool channel: all four use MCP, at three different seams
+
+| project | seam |
+|---|---|
+| `fdkevin0` | loopback HTTP MCP, 16-byte tenant key + 24-byte bearer, constant-time compare; lifetime is the ACP session (`src/runtime.ts:761-778`, `src/mcp-bridge.ts:74-120`) |
+| `zacbemis` | loopback MCP with `Authorization: Bearer` + `timingSafeEqual`, a schema projection that **drops a tool it cannot project** instead of widening it (`src/mcp/bridge.ts:107-142`, `src/mcp/schema.ts:14-40`) |
+| `estebanforge` | ACP `mcpServers` with a header array plus a sanitized private MCP home; global MCP registration is now a fallback (`extensions/index.ts:316-353,964-975`) |
+| `tianzuo555` | per-instance `pi-<12 hex>` MCP server name in a private config (`lib/mcp-config.ts:7-11`) |
+
+Our seam (ACP `mcpServers` + loopback URL token) is the same one `estebanforge`
+and `fdkevin0` use. Nobody here uses `--ide-mcp-port`/`nc`; that is specific to
+the Magpie community plugin `agy-cli`.
+
+## Long tool calls: the upstream gives up first
+
+Both ACP bridges work around a deadline we currently ignore:
+
+- `fdkevin0` races every parked call against a **default 85-second relay timer**
+  and answers with a relay notice instead of blocking
+  (`src/runtime.ts:1447-1466`, `src/config.ts:42-43`), because `agy` abandons a
+  `tools/call` at roughly **180 seconds** (`src/mcp-bridge.ts:6-9`).
+- `estebanforge` sends `STILL RUNNING` at 20 seconds and a `bridge_poll_result`
+  escape, for the same reason (`docs/ACP-PROTOCOL-REFERENCE.md:355`).
+
+Our broker parks the HTTP call for up to 15 minutes with no progress event. If
+`agy 1.5.8` still abandons a tool call on a wall clock, the caller waits for a
+result nobody will consume. That is the strongest single argument for a
+progress/relay path, and it is cheaper than the "synthesize a result and ask the
+model to repeat its arguments" trick used elsewhere.
+
+## Timeouts: three of four bound inactivity, not total time
+
+`zacbemis` arms a watchdog on progress with two budgets, 10 minutes idle and 60
+minutes while work is outstanding (`src/acp/prompt-watchdog.ts`). `estebanforge`
+caps a turn (TTY-aware, 0/20 minutes) and separately a stall (5 minutes), and
+before failing it probes the transcript for an answer `agy` wrote but never
+streamed (`src/parked-turn.ts:39-79`, stream-json only). `tianzuo555` runs a
+stall ladder: bytes seen, a longer budget while a tool is active, positive `ps`
+evidence, a few graces, then an off-stream verdict (`lib/agy-driver.ts:650-712,
+736-787`). `fdkevin0` has **no** `session/prompt` timeout and no watchdog at all.
+
+Our 30-minute wall clock is the direct cause of the 0.1.10 review's watchdog
+defect. An inactivity watchdog is the shape that cannot have it.
 
 ## Quota: one of them parses the notice we treat as words
 
-`zacbemis` matches the fixed exhaustion notice in the response text and derives
-a reset time from it (`src/acp/quota.ts:1-22`):
+`zacbemis` matches the fixed exhaustion notice and derives a reset time
+(`src/acp/quota.ts:4-9`):
 
 ```
 Usage Limit Reached
@@ -69,68 +117,44 @@ Usage Limit Reached
 You have reached your current quota for this period. Your limit will reset in 2 hours, 30 minutes.
 ```
 
-It also accepts an absolute form (`Your limit will reset on Sep 4, 2026 12:30 UTC`).
-That is a **named spent window with a reset instant**: exactly the class our
-`quota` verdict wants, and a source for `Retry-After` that is better than
-guessing from `retrying in 4s`. Worth adopting the exact wording as an
-additional pattern (our current `EXHAUSTED_QUOTA_RE` does not match
-"Usage Limit Reached").
+That is a **named spent window with a reset instant**: our `quota` class, plus a
+`Retry-After` that does not have to be guessed. It only recognizes this after the
+reply, and only when `totalTokens === 0 || stopReason === "refusal"`
+(`src/runtime.ts:653-662`); if the wording changes it degrades to a normal empty
+answer, so it is a pattern to add, not a mechanism to trust alone.
 
-## Timeouts: two of them bound inactivity, not total time
-
-`zacbemis` `src/acp/prompt-watchdog.ts:1-25` arms on progress with two budgets —
-an idle one and a longer one while work is outstanding — and fires when nothing
-moves. `fdkevin0` keeps a per-turn deadline plus the CLI's `--print-timeout`
-(`lib`-equivalent `src/runtime.ts`). Our 30-minute wall clock is the direct
-cause of the defect the 0.1.10 review found (`worker.ts` watchdog expiring while
-awaiting tool results, then starting a second `session/prompt` on a live native
-session). An inactivity watchdog is the shape that does not have that failure.
-
-`estebanforge`'s "parked turn" probe is the complementary idea: when a turn
-falls silent, read the conversation transcript tail and settle with an answer
-that `agy` wrote but never streamed (`src/parked-turn.ts:1-30`). It is
-stream-json only, and their sweep found 96.6% of `PLANNER_RESPONSE` steps carry
-tool calls, so the probe requires the newest step to be a tool-free response.
-
-## Tool channel: all four use MCP, at three different seams
-
-| project | seam |
-|---|---|
-| `fdkevin0` | loopback HTTP MCP with a per-tenant bearer token, tool names `mcp_<server>_<tool>` (`src/mcp-bridge.ts:74-120`, `src/history.ts:17-20`) |
-| `zacbemis` | ACP MCP bridge plus a schema projection with explicit omission reasons (`src/mcp/schema.ts:14-29`) |
-| `estebanforge` | ACP: direct `mcpServers` + a sanitized private MCP home; stream-json: per-session MCP home via `--gemini_dir` (`docs/ENGINES.md:42-43`) |
-| `tianzuo555` | an MCP directory handed to the turn, `agy` calls through `call_mcp_tool` (`index.ts:407`, `src/provider.ts:212-224`) |
-
-Our choice (ACP `mcpServers` with a loopback URL) is the same seam as
-`estebanforge`'s ACP engine and `fdkevin0`. Nobody uses `--ide-mcp-port`/`nc`
-here — that trick is specific to `agy-cli` (the Magpie community plugin).
+`fdkevin0` is the counter-example: `429 … quota` still maps to `RATE_LIMIT`,
+with no quota override (`src/runtime.ts:1534-1537`). Splitting the two classes is
+our decision, and this research does not argue against it.
 
 ## Ranked actions this research suggests
 
-1. **Adopt the "Usage Limit Reached … Your limit will reset in …" notice** as a
-   named-spent-window pattern and as a `Retry-After` source (`zacbemis`
-   `src/acp/quota.ts`). Cheap, and it removes another way for a real window to be
-   answered as a plain `429`.
-2. **Replace the 30-minute wall clock with an inactivity watchdog** (two budgets,
-   progress-armed). It retires the 0.1.10 review's watchdog defect by design
-   rather than by patching (`zacbemis` `src/acp/prompt-watchdog.ts`).
-3. **Treat `session/cancel` as best-effort** and close the connection when it is
-   not settled, because some ACP builds answer `-32601` and keep generating
-   (`estebanforge` `docs/ACP-PROTOCOL-REFERENCE.md:269-283`).
-4. **Consider a parked-turn probe** for the "turn was answered but nothing
-   streamed" class, if it ever shows up in our own logs. It is transcript-shaped
-   and stream-json-specific, so it is a fallback, not a design.
-5. **Keep the ACP `mcpServers` seam**; the alternatives in the wild are the same
-   protocol at a different layer, with more moving parts.
+1. **Read usage from ACP before reading SQLite.** A prompt response carries
+   exact counts on current builds (`estebanforge` `src/acp/connection.ts:558-577`).
+   If `agy 1.5.8` reports them, the WAL row becomes a cross-check and the
+   delayed-row double count (a 0.1.10 review finding) disappears. Needs one probe
+   against our own build first.
+2. **Replace the 30-minute wall clock with a progress-armed inactivity
+   watchdog**, two budgets (`zacbemis` `src/acp/prompt-watchdog.ts`). It retires
+   the watchdog defect by design rather than by patching.
+3. **Give a long tool call a progress or relay path.** The upstream abandons a
+   `tools/call` before our 15-minute park expires (`fdkevin0`
+   `src/mcp-bridge.ts:6-9`), and two siblings already handle it.
+4. **Fail, never truncate, when the rendered prompt would lose information**
+   (`zacbemis` `src/stream/context.ts:19-25` throws `invalid_input` past 256 KiB).
+   This is the honest fix for silently clipped renders under a ledger that records
+   the full request.
+5. **Add the "Usage Limit Reached … reset in …" notice** as a named-window
+   pattern and a `Retry-After` source.
+6. **Keep the ACP `mcpServers` seam.** The alternatives are the same protocol at
+   a different layer, with more moving parts.
 
 ## Caveats
 
-Read-only: no sibling project was executed, no account or login state touched.
-Each per-project file states its own scope, and quotes only what was read. The
+Read-only: no sibling project was executed, no account or login state touched, no
+`agy` run. Every upstream observation they report is a dated probe on a specific
+build (`agy` 1.2.14 stream-json, `agy_acp_server` RC01, `agy` 1.5.3 ACP); none is
+a protocol guarantee, and none has been re-probed on our `agy 1.5.8`. The
 `*-comparison.md` files were written against 0.1.9 (`99de26c3`); 0.1.10 changed
 the terminal-notice corroboration, the prompt-refusal wording and the retry
-storm's class, so a claim there about those three is out of date by one
-release. The ACP `mcpServers` response shape, the quota notice and the
-inactivity watchdog below are unaffected.
-`tianzuo555` and `fdkevin0` were read at file level rather than line by line;
-their `lib/`-scale detail is only partially covered.
+storm's class, so a claim there about those three is one release out of date.
