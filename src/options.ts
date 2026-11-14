@@ -70,6 +70,25 @@ const OPTION_SPECS: readonly ProviderOptionSpec[] = [
     },
   },
   {
+    key: "account_failover",
+    stateKey: "accountFailover",
+    envName: "AGY_MAGPIE_ACCOUNT_FAILOVER",
+    // Off by default. Magpie follows a `401`, `402`, `403` or `429` to the next
+    // account of this provider, so one failed turn becomes a request from every
+    // account in the pool — and the vendor's terms call automating account rotation
+    // unsupported. Off, the failure comes back to you and you pick the account.
+    fallback: false,
+    label: "Switch accounts automatically after a failure",
+    description:
+      "Off by default. When off, a turn that fails on this account's quota, sign-in or policy returns its own error and nothing is tried on your behalf. Turn it on and Magpie may answer the same turn from another signed-in account — which the vendor's terms treat as automating account rotation.",
+    labels: {
+      zh: "失败后自动切换账号",
+    },
+    descriptions: {
+      zh: "默认关闭。关闭时，配额、登录或策略导致的失败会原样返回，不会代你尝试其它账号。开启后 Magpie 可能用另一个已登录账号重答同一请求——厂商条款把自动轮换账号视为不受支持。",
+    },
+  },
+  {
     key: "cloak_prompts",
     stateKey: "cloakPrompts",
     envName: "AGY_MAGPIE_CLOAK_PROMPTS",
@@ -160,6 +179,7 @@ export function readProviderOptions(
     minimalAgent: false,
     exposeThinking: false,
     cloakSaidAs: readSaidAs(pkgOptions),
+    accountFailover: false,
   };
 
   for (const spec of OPTION_SPECS) {

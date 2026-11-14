@@ -14,7 +14,7 @@ Magpie 社区共有三款 Google Antigravity 渠道插件。对于同一个 Goog
 | :--- | :--- | :--- | :--- |
 | **调用方式 / 后端** | 调用本机已安装的官方 `agy` CLI（`agy acp --worker`），零额外下载 | 调用本机已安装的官方 `agy` CLI（`agy acp`），零额外下载 | 直接请求 Google 内部 HTTP 接口（无需安装 CLI） |
 | **登录与凭据存储** | 独立隔离的 `0600` 目录（不改写系统钥匙串）：支持浏览器 OAuth、远程回调 URL 粘贴、Switcher / CLIProxyAPI JSON 批量导入，或一键接管本机现有 `agy` 登录 | 依赖在终端手动执行 `agy` 登录，凭据存于系统钥匙串 | 在 Magpie 内直接管理多账号 OAuth 令牌 |
-| **多账号与配额轮换** | 多账号池 + 配额感知自动切号（识别 5h/周限额窗口与 Google AI Pro/Ultra 等级标识） | 仅限单账号（`single: true`） | 支持多账号 |
+| **多账号与配额轮换** | 多账号池 + 配额感知（识别 5h/周限额窗口与 Google AI Pro/Ultra 等级标识）；自动切号**默认关闭**（`account_failover`） | 仅限单账号（`single: true`） | 支持多账号 |
 | **无头 / 远程服务器支持** | 原生支持粘贴回调链接与 JSON/`refresh_token` 批量导入 | 需手动完成本机 CLI 登录与钥匙串配置 | 支持内置 OAuth 流程 |
 | **客户端工具桥接** | 原生本地回环 HTTP MCP（`127.0.0.1`），不污染环境变量 | 在 `PATH` 前端注入伪造的 `nc` 脚本转发 stdio（`--ide-mcp-port`） | HTTP 请求体直接转换 |
 | **图片与长会话容错** | 自动压缩超限内联图片（`>2000px` / `>5 MiB`），并在遇到 `lostMedia` 时自动剥离过期历史图片以保留上下文 | 沿用 `agy` 默认处理 | HTTP 接口直传 |
@@ -71,7 +71,8 @@ magpie quota agy-acp
 
 | 开关 | 默认值 | 说明 |
 |---|---|---|
-| `quota_routing` | `true` | 将 5 小时 / 周配额接入 Magpie 路由，单账号耗尽时自动切到其他账号 |
+| `quota_routing` | `true` | 将 5 小时 / 周配额暴露给 Magpie 路由，额度在各账号上可见 |
+| `account_failover` | `false` | 失败后自动切换账号。默认关闭：配额、登录、额度或策略导致的失败会原样返回（`409`，Magpie 不会换号），由你选择下一个账号。开启后 Magpie 可能用另一个已登录账号重答同一请求，而条款把自动轮换账号视为不受支持。厂商整体 `5xx` 无论如何都会被重试 |
 | `cloak_prompts` | `false` | 改写会被上游按配额耗尽拒答的第三方客户端标识句。默认关闭：这是绕过上游检查 |
 | `minimal_agent` | `false` | 为隔离桥接 Agent 开启 `excludeDefaultComponents`，精简内置系统提示词开销 |
 | `expose_thinking` | `true` | 将 ACP 思考摘要作为 Anthropic `thinking` 块返回 |

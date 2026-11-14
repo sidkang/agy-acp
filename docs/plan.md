@@ -107,7 +107,26 @@ the recommended decision and how to accept it. When an item ships, delete it her
 - Acceptance: a test that the phrase is rewritten in the scope it was added for and left alone
   everywhere else; for (2), a `bun test` timing check with a 3,200-character U+FEFF run.
 
-## 9. Decisions not yet made
+## 9. Ask Magpie for a "do not fail this turn over" signal
+
+- Problem: a plugin can only choose a status Magpie's `retryable` does not list. `409` works for
+  an account's own failure, but every `5xx` is retryable and `400` is retried whenever its words
+  read as a quota, a refusal or an unserved model — so a vendor-wide outage, or a refusal worded
+  in one of those ways, still reaches another account. There is no header to veto a retry:
+  `x-should-retry` has no reader in Magpie.
+- Evidence: `internal/gateway/fallback.go:2039-2064` (`retryable`), `internal/gateway/gateway.go:5208-5223`
+  (rest then next candidate), and `internal/gateway/routing.go:610-634` (`failRate`/`failQuota`).
+  Both `403` and `429` retry, which is why a community write-up's "a `403` would stop the pool"
+  is wrong for Magpie.
+- Options: (a) ask upstream for a documented stop signal (header or body marker) plus an optional
+  per-request account-attempt budget; (b) map every status to `409` when failover is off, which
+  lies about `5xx` and `404`; (c) leave it, and document `AffinityStrict` and `Manual` group
+  routing as the user-side answer.
+- Decision: (a) as a Magpie issue, (c) meanwhile; (b) rejected.
+- Acceptance: an issue filed upstream describing the two statuses that cannot be stopped from a
+  plugin, with the `409` workaround stated as a workaround.
+
+## 10. Decisions not yet made
 
 Each needs a decision before any code; none is scheduled.
 

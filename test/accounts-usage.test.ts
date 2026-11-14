@@ -2081,6 +2081,7 @@ describe("src/options.ts", () => {
     const schemas = buildProviderOptionSchemas();
     expect(schemas.map((schema) => schema.key)).toEqual([
       "quota_routing",
+      "account_failover",
       "cloak_prompts",
       "minimal_agent",
       "expose_thinking",
@@ -2091,6 +2092,7 @@ describe("src/options.ts", () => {
     await withEnv(
       {
         AGY_MAGPIE_QUOTA_ROUTING: undefined,
+        AGY_MAGPIE_ACCOUNT_FAILOVER: undefined,
         AGY_MAGPIE_CLOAK_PROMPTS: undefined,
         AGY_MAGPIE_MINIMAL_AGENT: undefined,
         AGY_MAGPIE_EXPOSE_THINKING: undefined,
@@ -2099,6 +2101,8 @@ describe("src/options.ts", () => {
         const defaults = readProviderOptions({}, undefined);
         expect(defaults).toEqual({
           quotaRouting: true,
+          // The pool does not walk itself: a failed account's error comes back.
+          accountFailover: false,
           // Cloaking is off by default: it works around a vendor check.
           cloakPrompts: false,
           minimalAgent: false,
@@ -2110,6 +2114,7 @@ describe("src/options.ts", () => {
         expect(readProviderOptions({ magpie: { option: () => false } }).quotaRouting).toBe(false);
         const defaultByKey: Record<string, boolean> = {
           quota_routing: defaults.quotaRouting,
+          account_failover: defaults.accountFailover,
           cloak_prompts: defaults.cloakPrompts,
           minimal_agent: defaults.minimalAgent,
           expose_thinking: defaults.exposeThinking,

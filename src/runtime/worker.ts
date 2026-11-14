@@ -106,6 +106,12 @@ export interface WorkerOptions {
   minimalAgent?: boolean;
   exposeThinking?: boolean;
   cloakPrompts?: boolean;
+  /**
+   * `account_failover`: may Magpie answer this turn from another account of this
+   * provider after this one fails? Undefined keeps the retryable statuses (what a
+   * worker built on its own describes); the coordinator always resolves the option.
+   */
+  accountFailover?: boolean;
   workDir?: string;
   resumeSessionId?: string;
   resumeSystemHistorySeed?: string;
@@ -1167,21 +1173,20 @@ export class AgySessionWorker {
           ),
         };
       case "vendor_restricted":
-        // The account itself is suspended. A `403` is retryable in Magpie, and its
-        // words keep the vendor's own sentence so Magpie reads the suspension
-        // (`googleToS`) rather than walling the provider off for the request.
+        // The account itself is suspended. Its words keep the vendor's own sentence
+        // so Magpie reads the suspension (`googleToS`) rather than walling the
+        // provider off for the request.
         return {
           type: "error",
-          status: 403,
+          status: this.failoverStatus(403),
           errorType: "permission_error",
           message: withDetail(VENDOR_DISABLED_FAILURE_MESSAGE),
         };
       case "vendor_policy":
-        // Permission denied for the account, not the prompt: retryable, so the
-        // next signed-in account answers this turn.
+        // Permission denied for the account, not the prompt.
         return {
           type: "error",
-          status: 403,
+          status: this.failoverStatus(403),
           errorType: "permission_error",
           message: withDetail(VENDOR_POLICY_FAILURE_MESSAGE),
         };
@@ -1208,7 +1213,7 @@ export class AgySessionWorker {
       case "auth":
         return {
           type: "error",
-          status: 401,
+          status: this.failoverStatus(401),
           errorType: "authentication_error",
           message: withDetail(
             "Antigravity CLI authentication expired. Please sign in again.",
@@ -1216,17 +1221,11 @@ export class AgySessionWorker {
           signInExpired: true,
         };
       case "quota":
-        if (turnsAway(this.systemPrompt) && !this.options.cloakPrompts) {
-          return {
-            type: "error",
-            status: 400,
-            errorType: "invalid_request_error",
-            message: refusalHint(this.systemPrompt),
-          };
-        }
+        // A window named as spent is evidence about the account, so it is not
+        // read as a refused prompt (that answer names no window).
         return {
           type: "error",
-          status: 429,
+          status: this.failoverStatus(429),
           errorType: "rate_limit_error",
           message: withDetail("Account quota exhausted", rawDetail),
           ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
@@ -1236,7 +1235,10 @@ export class AgySessionWorker {
         // this is what a busy minute looks like. Reported as a plain `429` with
         // text free of quota wording, so Magpie rests the account briefly and
         // asks the next one instead of holding it for its whole window.
-        if (turnsAway(this.systemPrompt) && !this.options.cloakPrompts) {
+        // Nothing asked for the rewording to be off: a turned-away line here is
+        // the likeliest explanation, and cloaking that still met a `429` failed at
+        // it. Both answer `400`, which stops the next account from being asked.
+        if (turnsAway(this.systemPrompt)) {
           return {
             type: "error",
             status: 400,
@@ -1247,13 +1249,14 @@ export class AgySessionWorker {
         return this.transientLimitError(
           limitFreeDetail(upstreamText),
           retryAfterSeconds,
+          this.failoverStatus(429),
         );
       case "credit_exhausted":
         // A `402` is out of credit to Magpie: the account is held on that ladder
         // rather than a quota window's, and topping up is what clears it.
         return {
           type: "error",
-          status: 402,
+          status: this.failoverStatus(402),
           errorType: "api_error",
           message: withDetail(CREDIT_EXHAUSTED_FAILURE_MESSAGE, rawDetail),
           ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
@@ -1295,16 +1298,32 @@ export class AgySessionWorker {
   private transientLimitError(
     detail?: string,
     retryAfterSeconds?: number,
+    status = 429,
   ): Extract<TurnStreamEvent, { type: "error" }> {
     return {
       type: "error",
-      status: 429,
+      status,
       errorType: "rate_limit_error",
       message: detail
         ? `${TRANSIENT_LIMIT_FAILURE_MESSAGE} Upstream said: ${detail}`
         : TRANSIENT_LIMIT_FAILURE_MESSAGE,
       ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
+  }
+
+  /**
+   * The status Magpie's router reads for this account's own failure.
+   *
+   * A `401`, a `402`, a `403` and a `429` all let it ask the next account of this
+   * provider (`fallback.go` `retryable`), so one failure becomes a request to every
+   * account in the pool — which is what a prompt the vendor turns away draws, and
+   * what the terms call automating account rotation. With `account_failover` off
+   * (the default) the failure stops at the account that met it: `409`, which
+   * `retryable` does not list, carrying the same words and the same `error.type`
+   * (Magpie's own taxonomy reads the words, not the status).
+   */
+  private failoverStatus(normal: number): number {
+    return this.options.accountFailover === false ? 409 : normal;
   }
 
   /**
@@ -1622,10 +1641,6 @@ export class AgySessionWorker {
   }
 
   private handlePromptSuccess(result: any, seq?: number): void {
-    // The account answered: whatever refusal it gave earlier is over (an appeal
-    // can restore an account), so the fast-fail record no longer applies.
-    clearPolicyBlock(this.account.accountRef);
-
     this.stopTurnIdleWatchdog();
     if (this.turn.isSuppressedOrStale(seq)) {
       // A cancelled steer turn still spent tokens; bank them so the next
@@ -1653,6 +1668,12 @@ export class AgySessionWorker {
     // A notice fragment held back for the next chunk belongs to the answer when
     // the stream ends here, so it is flushed with the rest of the held text.
     this.turn.heldText = this.turn.heldText + this.turn.flushRetryNoticeHold();
+
+    // Answered for real: whatever the account said earlier is over (an appeal can
+    // restore it), so the fast-fail record no longer applies. Later than the top of
+    // this method on purpose — a cancelled turn returns above without answering,
+    // and a terminal notice returns its own verdict, which may be the same block.
+    clearPolicyBlock(this.account.accountRef);
 
     if (this.turn.heldText) {
       this.turn.pushEvent({ type: "text_delta", text: this.turn.heldText });

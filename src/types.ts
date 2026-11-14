@@ -30,6 +30,11 @@ export interface ProviderOptionsState {
    * the built-in lines. Empty when the caller set none.
    */
   cloakSaidAs: string;
+  /**
+   * May Magpie answer a failed turn from another account of this provider? Off by
+   * default: the user picks the next account instead of the pool walking itself.
+   */
+  accountFailover: boolean;
 }
 
 export type EffortLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

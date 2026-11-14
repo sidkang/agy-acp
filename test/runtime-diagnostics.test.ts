@@ -1375,6 +1375,119 @@ describe("AgySessionWorker diagnostics integration", () => {
     }
   });
 
+  test("an account's own failure stops at that account unless failover was asked for", async () => {
+    const runWith = async (accountFailover: boolean) => {
+      const ws = makeTempDir("worker-failover-");
+      const worker = new AgySessionWorker(account, "diag-sess-failover", mcpServer, {
+        workspaceDir: ws,
+        accountFailover,
+        spawnFn: () =>
+          createScriptedFakeAcpChild(ws, (ctx) => {
+            ctx.terminateTurn({
+              name: "agy-acp.log.91011",
+              text: "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 4s\n",
+            });
+          }),
+      });
+      try {
+        await worker.start();
+        return await runTurn(worker, "single retry");
+      } finally {
+        await worker.close("test_done");
+      }
+    };
+
+    // Off (what the coordinator resolves by default): `409` is not in Magpie's
+    // `retryable` list, so the next account is the user's choice. The words and the
+    // error type are the same either way — Magpie reads those for its taxonomy.
+    expectErrorEvent(await runWith(false), {
+      status: 409,
+      errorType: "rate_limit_error",
+      message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+    });
+
+    // Asked for: the retryable `429` a caller may fail over on.
+    expectErrorEvent(await runWith(true), {
+      status: 429,
+      errorType: "rate_limit_error",
+      message: TRANSIENT_LIMIT_FAILURE_MESSAGE,
+    });
+  });
+
+  test("a trigger line still stops the turn on a bare 429 with cloaking on", async () => {
+    const ws = makeTempDir("worker-refusal-cloaked-");
+    const worker = new AgySessionWorker(account, "diag-sess-cloaked", mcpServer, {
+      workspaceDir: ws,
+      // The rewording ran and this turn met the same `429` anyway: that is the one
+      // moment the next account must not be asked, so the branch cannot depend on
+      // cloaking being off.
+      cloakPrompts: true,
+      accountFailover: false,
+      systemPrompt: "You are Codex, an agent based on GPT-5.",
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          ctx.terminateTurn({
+            name: "agy-acp.log.91012",
+            text: "I1114 16:08:30.490505     370 run.go:315] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 4s\n",
+          });
+        }),
+    });
+
+    try {
+      await worker.start();
+      const events = await runTurn(worker, "single retry");
+      const err = events.find((e) => e.type === "error");
+      expect(err?.type === "error" && err.status).toBe(400);
+      expect(err?.type === "error" && err.errorType).toBe("invalid_request_error");
+      expect(err?.type === "error" && err.message).toContain("Codex wording");
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
+  test("a named spent window is not read as a refused prompt", async () => {
+    const ws = makeTempDir("worker-quota-named-");
+    const worker = new AgySessionWorker(account, "diag-sess-named", mcpServer, {
+      workspaceDir: ws,
+      accountFailover: true,
+      // The line the reports say draws a refusal, on a turn that names a spent
+      // window: that is evidence about the account, so it keeps its own answer
+      // instead of becoming the hint about the line.
+      systemPrompt: "You are Codex, an agent based on GPT-5.",
+      spawnFn: () =>
+        createScriptedFakeAcpChild(ws, (ctx) => {
+          // A window named as spent, in `agy`'s own notice and in the log line.
+          writeUpstreamRetryEvidence(
+            ws,
+            "RESOURCE_EXHAUSTED (code 429): exhausted your quota for gemini-4-carbon",
+          );
+          for (const attempt of [1, 2, 3]) {
+            ctx.emitUpdate({
+              sessionId: NATIVE_SESSION_ID,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: {
+                  text: `\n⚠ API error (attempt ${attempt}): RESOURCE_EXHAUSTED (code 429): exhausted your quota for gemini-4-carbon.\n`,
+                },
+              },
+            });
+          }
+          setTimeout(() => ctx.cancelTurn(), 25);
+        }),
+    });
+
+    try {
+      await worker.start();
+      expectErrorEvent(await runTurn(worker, "storm quota"), {
+        status: 429,
+        errorType: "rate_limit_error",
+        message: "Account quota exhausted",
+      });
+    } finally {
+      await worker.close("test_done");
+    }
+  });
+
   test("keeps the transient 429 when agy settles the cancelled prompt as an error", async () => {
     const ws = makeTempDir("worker-notice-cancel-error-");
     const worker = new AgySessionWorker(account, "diag-sess-cancel", mcpServer, {

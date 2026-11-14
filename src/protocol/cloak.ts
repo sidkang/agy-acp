@@ -300,7 +300,9 @@ const MAX_SAID_AS = 32;
 // list say the way to tell them apart is whether the same account still answers
 // other requests, which is advice for the reader, not knowledge held here.
 const ACCOUNT_STILL_WORKS = "If other requests on this account work,";
-const OTHERWISE_ACCOUNT = "if they fail too, it was the account.";
+// Not "then it was the account": a service-wide outage fails both, and this holds
+// no measurement either way. It says what to look at, and stops.
+const OTHERWISE_ACCOUNT = "if they fail too, check this account's sign-in and usage.";
 
 const HINT =
   "This request failed while its system prompt carried Claude Code / Claude Agent SDK wording. " +

@@ -246,12 +246,20 @@ export class SessionCoordinator {
     options?: TurnExecutionOptions,
     signal?: AbortSignal,
   ): AsyncGenerator<TurnStreamEvent> {
-    // The vendor disabled this account on a previous turn. Magpie fails a `403`
-    // over to another account, which is what should happen here too — without
-    // spawning `agy` again for an account that cannot answer.
+    // The vendor disabled this account on a previous turn: refuse before spawning
+    // `agy` again. The status decides whether Magpie asks another account: `403` it
+    // does, `409` (with `account_failover` off) it does not, and the user picks.
     const blocked = policyBlockedMessage(account.accountRef);
     if (blocked) {
-      throw new BridgeHttpError(403, "permission_error", blocked);
+      const failover =
+        options?.providerOptions?.accountFailover ??
+        this.providerOptions?.accountFailover ??
+        false;
+      throw new BridgeHttpError(
+        failover ? 403 : 409,
+        "permission_error",
+        blocked,
+      );
     }
 
     const sessionKey = req.sessionId
@@ -896,8 +904,13 @@ export class SessionCoordinator {
         ),
       ),
     );
+    const accountFailover =
+      options?.providerOptions?.accountFailover ??
+      this.providerOptions?.accountFailover ??
+      false;
     const workerOptions: WorkerOptions = {
       spawnFn,
+      accountFailover,
       minimalAgent:
         options?.providerOptions?.minimalAgent ??
         this.providerOptions?.minimalAgent ??
@@ -1368,6 +1381,10 @@ export class SessionCoordinator {
           false,
         exposeThinking: req.thinkingEnabled,
         cloakPrompts,
+        accountFailover:
+          options?.providerOptions?.accountFailover ??
+          this.providerOptions?.accountFailover ??
+          false,
         workDir: req.workDir,
         systemPrompt: req.system,
         systemHistorySeed: coldPlan.systemHistorySeed,

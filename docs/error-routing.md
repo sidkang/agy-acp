@@ -52,6 +52,45 @@ stderr tail; and this bridge's own saturation (`503`) resting the model on the a
 "ask nobody else, rest nobody" event, which fits one shared CLI but not per-account workers,
 where another account can genuinely answer.
 
+## 1.1 A failed account stops at that account
+
+Magpie's `retryable` (`internal/gateway/fallback.go:2039-2064`) is what turns one failure into
+requests from more accounts: `401`, `402`, `403`, `404`, `408`, `429` and every `5xx` answer
+"try another member", and `400`/`422` do too when their words read as a quota, a refusal or an
+unserved model. **A `403` is retryable as well**, so a vendor's policy refusal does not stop the
+router either, and no response header can veto a retry: Magpie reads none of them
+(`x-should-retry` is advice for a direct client).
+
+With `account_failover` off — the default — the verdicts that are about *this account* answer
+`409` instead of `401`/`402`/`403`/`429`:
+
+| Verdict | With failover | Default (`409`) |
+|---|---|---|
+| `vendor_restricted`, `vendor_policy` | `403` | `409` |
+| `auth` | `401` | `409` |
+| `credit_exhausted` | `402` | `409` |
+| `quota`, `rate_limit` | `429` | `409` |
+
+Words and `error.type` do not change: Magpie's taxonomy (`failure`, `quotaWords`, `failCredit`)
+reads the body, so the account is still recorded as out of quota or credit in the trace, and a
+direct client still sees `rate_limit_error` / `authentication_error`. What changes is routing:
+`409` is not in `retryable`, so the error reaches the agent and nothing is asked on its behalf.
+
+Two consequences worth stating:
+
+- **Magpie no longer rests the account on that turn.** The rest happens on the failover branch
+  (`gateway.go:5212-5223`), which the answer never enters. `/usage` polling still shows the spent
+  window, so the account's state in Magpie is right; it is simply not held out of routing for the
+  window's length.
+- **A vendor-wide failure still walks the pool.** Every `5xx` is retryable and a plugin cannot
+  change that, so an `upstream_busy` `503` or an `internal` `500` may still be asked of another
+  account. Those are not account-own failures, which is why they keep their status.
+
+A group's own routing can stop the walk for every provider, plugin or not, without this option:
+`AffinityStrict` keeps a conversation on the account that answered it, and a `Manual` group sends
+only to the member the user picked (`internal/provider/group.go:54-90`). Neither is settable from a
+plugin's manifest; the option here is the plugin's own answer.
+
 ### Magpie router behavior this mapping depends on
 
 Read from Magpie source:

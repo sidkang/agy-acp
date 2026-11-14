@@ -337,6 +337,36 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     // The point: no `agy` was spawned for an account that cannot answer.
     expect(spawns).toBe(0);
 
+    // Which status it refuses with decides whether Magpie asks the next account:
+    // `409` (account_failover off, the default) it does not, `403` it does.
+    const refusalStatus = async (accountFailover: boolean): Promise<number> => {
+      try {
+        for await (const _event of guardCoordinator.executeTurn(
+          blockedAccount,
+          req,
+          sel("gemini-3.8-flash", "low"),
+          {
+            providerOptions: {
+              quotaRouting: false,
+              cloakPrompts: false,
+              minimalAgent: false,
+              exposeThinking: false,
+              cloakSaidAs: "",
+              accountFailover,
+            },
+          },
+        )) {
+          // drain
+        }
+      } catch (err) {
+        return (err as { status?: number }).status ?? 0;
+      }
+      throw new Error("expected the turn to be refused");
+    };
+    expect(await refusalStatus(false)).toBe(409);
+    expect(await refusalStatus(true)).toBe(403);
+    expect(spawns).toBe(0);
+
     resetPolicyBlocks();
     await guardScheduler.closeAll();
     guardScheduler.destroy();
@@ -2352,6 +2382,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           minimalAgent: false,
           exposeThinking: false,
         cloakSaidAs: "",
+        accountFailover: false,
       },
       },
     )) {
@@ -2385,6 +2416,7 @@ describe("Runtime Sessions & Coordinator Integration", () => {
           minimalAgent: true,
           exposeThinking: false,
         cloakSaidAs: "",
+        accountFailover: false,
       },
       },
     )) {

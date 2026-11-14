@@ -45,6 +45,7 @@ const DEFAULT_OPTIONS: ProviderOptionsState = {
   exposeThinking: true,
   cloakPrompts: true,
   cloakSaidAs: "",
+  accountFailover: false,
 };
 
 const USAGE: TokenUsageSummary = {
@@ -410,17 +411,17 @@ describe("parseAnthropicRequest: thinking control", () => {
   test("disabled thinking always wins, otherwise exposeThinking decides", () => {
     expect(parse(requestBody({ thinking: { type: "disabled" } })).thinkingEnabled).toBe(false);
     expect(
-      parse(requestBody({ thinking: { type: "disabled" } }), { exposeThinking: true, cloakSaidAs: "" })
+      parse(requestBody({ thinking: { type: "disabled" } }), { exposeThinking: true, cloakSaidAs: "", accountFailover: false })
         .thinkingEnabled,
     ).toBe(false);
     expect(parse(requestBody({ thinking: { type: "enabled" } })).thinkingEnabled).toBe(true);
     expect(parse(requestBody({ thinking: { type: "adaptive" } })).thinkingEnabled).toBe(true);
     expect(parse(requestBody()).thinkingEnabled).toBe(true);
     expect(
-      parse(requestBody({ thinking: { type: "enabled" } }), { exposeThinking: false, cloakSaidAs: "" })
+      parse(requestBody({ thinking: { type: "enabled" } }), { exposeThinking: false, cloakSaidAs: "", accountFailover: false })
         .thinkingEnabled,
     ).toBe(false);
-    expect(parse(requestBody(), { exposeThinking: false, cloakSaidAs: "" }).thinkingEnabled).toBe(false);
+    expect(parse(requestBody(), { exposeThinking: false, cloakSaidAs: "", accountFailover: false }).thinkingEnabled).toBe(false);
   });
 });
 
@@ -2341,7 +2342,7 @@ describe("cloak.ts", () => {
         },
       }),
       new Headers(),
-      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false, cloakSaidAs: "" },
+      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false, cloakSaidAs: "", accountFailover: false },
     );
     const last = parsed.messages[parsed.messages.length - 1]!;
     const texts = last.content
@@ -2359,7 +2360,7 @@ describe("cloak.ts", () => {
         messages: [{ role: "user", content: "pwd" }],
       }),
       new Headers({ "x-magpie-work-dir": "%2FUsers%2Fexample%2FMy%20Project" }),
-      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false, cloakSaidAs: "" },
+      { quotaRouting: false, cloakPrompts: true, minimalAgent: false, exposeThinking: false, cloakSaidAs: "", accountFailover: false },
     );
     expect(parsed.workDir).toBe("/Users/example/My Project");
   });

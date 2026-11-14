@@ -8,6 +8,25 @@ repository's recorded history; where none is recorded, none is given.
 
 Version in `package.json`; no `v0.1.10` tag exists yet. Work dated 2026-11-14.
 
+- Account switching is off by default (`account_failover`). Why: Magpie follows a `401`, `402`,
+  `403` or `429` to the next account of this provider, so one failed turn became a request from
+  every account in the pool — the automation the vendor's terms say consumer plans do not support,
+  and the mechanism a community write-up describes as being baited by a `429` in place of a `403`.
+  Off, a turn that fails on this account's own quota, sign-in, credit or policy answers `409`
+  (words and `error.type` unchanged, so Magpie's trace still reads the reason), the error reaches
+  the agent, and the user picks the next account. Costs, both stated in `docs/error-routing.md`
+  §1.1: Magpie no longer rests the account on that turn (the rest lives on the failover branch),
+  and a vendor-wide `5xx` is retryable whatever a plugin sends.
+- The refusal branch no longer requires cloaking to be off, and no longer overrides a named spent
+  window. Why: a rewording that still met the refusal is the clearest case of the prompt being the
+  problem, so that is when failing over is most inviting; and a `429` that names which window is
+  spent is evidence about the account, so converting it into the prompt hint was a false
+  attribution.
+- The refusal hint no longer ends "if they fail too, it was the account": a service-wide outage
+  fails both. It says what to look at instead.
+- The six-hour fast-fail record is cleared only by a turn that actually answered. Why: it was
+  cleared at the top of `handlePromptSuccess`, before the cancelled-turn and terminal-notice
+  returns, so a cancelled turn carrying a suspension notice cleared it.
 - Turn watchdog: the 30-minute wall clock on `session/prompt` is replaced by a progress watchdog
   that retires a worker silent for 10 minutes while generating or 60 minutes while awaiting tool
   results; the wall clock stays as a 60-minute backstop. Why: the wall clock could expire in the

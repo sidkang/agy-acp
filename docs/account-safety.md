@@ -103,11 +103,55 @@ From the code comparison in [`research/comparison.md`](research/comparison.md):
    (`src/accounts/auth.ts:25-30`).
 2. Rewording system-prompt lines that identify a third-party harness so a vendor check
    stops refusing the request (`src/protocol/cloak.ts`). Off by default since 0.1.10.
-3. A multi-account pool that fails over on quota `429` and on policy or suspension `403`
-   (`src/index.ts:150-205`, `src/runtime/worker.ts:1150-1167`).
+3. A multi-account pool, and until 0.1.10 an automatic failover on quota `429` and on
+   policy or suspension `403` (`src/index.ts:150-205`, `src/runtime/worker.ts:1150-1230`).
+   Automatic failover is off by default now: `account_failover` decides it, and the router
+   stops at the account that failed (see below).
 4. Bulk refresh-token import, up to 100 accounts per batch (`src/accounts/auth.ts:50-54`).
 
 None of the four siblings does (1), (3) or (4) in the same way; none rewrites prompts.
+
+## Account rotation, and the claim that a `429` baits the pool
+
+A community write-up argues that Antigravity answers a third-party prompt with a `429`
+rather than the `403` a policy refusal would warrant, and that the point is to bait an
+account pool: a `429` reads as "rate limited, try the next account", so one refused request
+walks every idle account in the pool and hands the vendor a list to enforce against later.
+
+What is established, and what is not:
+
+- **Established by others**: since 11-14 the vendor's check sees through zero-width
+  character splitting and folded white space, and reworded equivalents pass
+  (`magpie-community/plugins@5bb4194`: 5 of 5 refused before, 10 of 10 after, on a real
+  account). `DylanLIiii/opencode-antigravity-bridge` issue #67 and PR #71 are that report.
+- **Not established**: a September start date, a rule that matches any `RFC 2119` fragment
+  rather than the complete sentence, the vendor omitting `Retry-After` on purpose, and
+  deliberate account collection. This repository has no observation either way: an
+  account's `agy` log records prompt length, never prompt text, so a refused prompt leaves
+  no line to count.
+- **One premise of the write-up is false for Magpie**: it says a `403` would stop the pool.
+  Magpie retries `403` too (`internal/gateway/fallback.go:2048`), and it reads no response
+  header that could veto a retry. Only a status it does not list stops the walk.
+
+What this plugin does about the mechanism, without claiming the motive:
+
+- **`account_failover` is off by default.** A turn that fails on this account's own quota,
+  sign-in, credit or policy answers `409`, which Magpie does not fail over, so one failure
+  no longer becomes a request from every account. See
+  [`error-routing.md`](error-routing.md) §1.1 for the mapping and its two costs.
+- **A bare `429` that names no spent window, on a prompt that carries a trigger line, is
+  answered `400` with a hint instead of a `429`** — whether or not cloaking was on, because
+  a rewording that still met a `429` failed at its job. This is the case the write-up
+  describes: the refusal is not read as the account's problem, and nobody is asked in its
+  place.
+- **A named spent window keeps its own answer.** A `429` that says which window is spent is
+  evidence about the account, not about the prompt, so it is not converted into that hint.
+- **Still open:** every `5xx` is retryable and a plugin cannot change that, so a vendor-wide
+  failure may still reach another account. Magpie's own group routing can stop that for
+  every provider: `AffinityStrict` keeps a conversation on the account that answered it,
+  and a `Manual` group sends only to the member the user picked
+  (`internal/provider/group.go:54-90`). Asking Magpie for a "do not fail this turn over"
+  signal is the durable fix; a plugin can only choose a status the router does not follow.
 
 ## Standing decisions
 
@@ -117,5 +161,8 @@ None of the four siblings does (1), (3) or (4) in the same way; none rewrites pr
 - An account the vendor disabled is recorded for six hours and later turns fail fast
   with the same `403` instead of spawning `agy` for a refusal
   (`src/accounts/policy-block.ts`).
-- Magpie fails a `403` over to another account, which is unchanged: the account pool is
-  the reason the plugin exists, and the rotation decision is the user's.
+- The pool does not walk itself: `account_failover` defaults to off, so a failed account's
+  error comes back and the user picks the next one. Turning it on is the user's call, and
+  the terms call that automation unsupported.
+- Prompt-refusal detection does not require cloaking to be off any more: a rewording that
+  still met the refusal is the clearest case of the prompt being the problem.
