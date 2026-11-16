@@ -2373,6 +2373,26 @@ describe("cloak.ts", () => {
     expect(cloakSystemPrompt(undefined)).toBe("");
   });
 
+  test("cloakSystemPrompt rewords Claude Code's opening line (#1)", () => {
+    const system =
+      "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+    const want =
+      "You are a coding assistant, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+
+    expect(turnsAway(system)).toBe(true);
+    expect(cloakSystemPrompt(system, true)).toBe(want);
+    expect(turnsAway(cloakSystemPrompt(system, true))).toBe(false);
+    expect(cloakSystemPrompt(system, false)).toBe(system);
+    expect(cloakSystemPrompt("You ​are Claude​ Code.", true)).toBe(
+      "You are a coding assistant.",
+    );
+
+    // Merely mentioning the client is not an identity line and stays untouched.
+    const mention = "I use Claude Code daily.";
+    expect(turnsAway(mention)).toBe(false);
+    expect(cloakSystemPrompt(mention, true)).toBe(mention);
+  });
+
   test("stripVolatileSystem drops billing headers and agent clock lines", () => {
     const text =
       "X-Anthropic-Billing-Header: cch=deadbeef\nCurrent date: 2026-02-13\n# Current time: 09:31\nBe brief.";

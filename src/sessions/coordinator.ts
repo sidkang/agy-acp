@@ -1095,7 +1095,7 @@ export class SessionCoordinator {
         : renderMessagesToPrompt(priorMessages, currentMessages, { cloakUser: cloakPrompts });
       appendToolChoiceReminder(promptParts, req);
 
-      if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
+      if (worker.effectiveSystemPrompt && !worker.appendClientSystemPrompt) {
         unshiftSystemInstructions(promptParts, worker.effectiveSystemPrompt);
       }
 
@@ -1258,11 +1258,16 @@ export class SessionCoordinator {
             req.messages,
             worker.committedMessages,
             worker.broker.getExposedPendingIds(),
-          )
+          ) ||
+          req.messages.length > 1
         ) {
           this.removeActiveWorker(worker);
           this.scheduler.unregisterWorker(worker);
-          await worker.close("compacted_during_tool_turn");
+          await worker.close(
+            req.messages.length > 1
+              ? "history_diverged_during_tool_turn"
+              : "compacted_during_tool_turn",
+          );
           handedOff = true;
           yield* this.executeFreshSessionTurn(
             worker.account,
@@ -1286,12 +1291,24 @@ export class SessionCoordinator {
       // Delta messages after the matched prefix.
       const deltaMessages = req.messages.slice(match.incomingPrefixLength);
       const lastMsg = deltaMessages[deltaMessages.length - 1];
-      if (!lastMsg || lastMsg.role !== "user") {
-        throw new BridgeHttpError(
-          400,
-          "invalid_request_error",
-          "Expected user message containing tool results",
+      const hasToolResults =
+        lastMsg?.role === "user" &&
+        lastMsg.content.some((p) => p.type === "tool_result");
+
+      if (!hasToolResults) {
+        this.removeActiveWorker(worker);
+        this.scheduler.unregisterWorker(worker);
+        await worker.close("user_interrupted_tool_turn");
+        handedOff = true;
+        yield* this.executeFreshSessionTurn(
+          worker.account,
+          req,
+          modelSelection,
+          options,
+          sessionKey,
+          signal,
         );
+        return;
       }
 
       const toolResults: ToolResultDelivery[] = [];
@@ -1481,7 +1498,7 @@ export class SessionCoordinator {
           })
         : renderMessagesToPrompt(priorMessages, currentMessages, { cloakUser: cloakPrompts });
       appendToolChoiceReminder(promptParts, req);
-      if (worker.effectiveSystemPrompt && !worker.appendSystemSupported) {
+      if (worker.effectiveSystemPrompt && !worker.appendClientSystemPrompt) {
         unshiftSystemInstructions(promptParts, worker.effectiveSystemPrompt);
       }
       for await (const event of worker.startPromptTurn(promptParts, signal)) {

@@ -923,6 +923,68 @@ describe("Runtime Sessions & Coordinator Integration", () => {
     expect(worker?.state).toBe("AWAITING_TOOL_RESULTS");
   });
 
+  test("5b. Graceful recovery when user interrupts or history diverges during AWAITING_TOOL_RESULTS", async () => {
+    const sessionId = `test-interrupt-${Date.now()}`;
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Weather",
+        inputSchema: { type: "object" },
+      },
+    ];
+
+    const req1 = makeReq(
+      [
+        {
+          role: "user",
+          content: [{ type: "text", text: "TRIGGER_TOOL_CALL" }],
+        },
+      ],
+      { model: "gemini-3.8-flash", system: "Interrupt test", tools, sessionId },
+    );
+
+    const selection = sel("gemini-3.8-flash");
+    let toolCallId = "";
+    for await (const event of coordinator.executeTurn(testAccount, req1, selection)) {
+      if (event.type === "tool_use") toolCallId = event.id;
+    }
+
+    // Now user sends a plain text "Continue anyway" in a multi-message context without tool_results
+    const reqInterrupt = makeReq(
+      [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Previous message" }],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: toolCallId, name: "get_weather", input: {} }],
+        },
+        {
+          role: "user",
+          content: [{ type: "text", text: "Continue anyway" }],
+        },
+      ],
+      { model: "gemini-3.8-flash", system: "Interrupt test", tools, sessionId },
+    );
+
+    let caughtError: any = null;
+    let gotResponse = false;
+    try {
+      for await (const event of coordinator.executeTurn(testAccount, reqInterrupt, selection)) {
+        if (event.type === "text_delta" || event.type === "tool_use" || event.type === "finish") {
+          gotResponse = true;
+          break;
+        }
+      }
+    } catch (err) {
+      caughtError = err;
+    }
+
+    expect(caughtError).toBeNull();
+    expect(gotResponse).toBe(true);
+  });
+
   test("6. Steer-in-session (tool_result + trailing user text)", async () => {
     const sessionId = `test-steer-${Date.now()}`;
     const tools = [

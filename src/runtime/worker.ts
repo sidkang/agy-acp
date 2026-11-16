@@ -42,6 +42,7 @@ import {
 } from "./diagnostics";
 import {
   turnsAway,
+  userTurnsAway,
   refusalHint,
   cloakSystemPrompt,
 } from "../protocol/cloak";
@@ -320,6 +321,7 @@ export class AgySessionWorker {
   nativeSessionId!: string;
   imageSupported: boolean = false;
   appendSystemSupported: boolean = false;
+  appendClientSystemPrompt: boolean = false;
   resumeSupported: boolean = false;
   resumedFromShelf: boolean = false;
   configOptions: any[] = [];
@@ -771,6 +773,11 @@ export class AgySessionWorker {
         (initRes as any)?.agentCapabilities?._meta?.antigravity?.systemPrompt
           ?.append,
       );
+      this.appendClientSystemPrompt =
+        this.appendSystemSupported &&
+        /^(?:1|true|on|yes)$/i.test(
+          process.env.AGY_BRIDGE_SYSTEM_APPEND || "",
+        );
       this.resumeSupported = Boolean(
         (initRes as any)?.agentCapabilities?.loadSession ||
           (initRes as any)?.agentCapabilities?.sessionCapabilities?.resume,
@@ -809,12 +816,14 @@ export class AgySessionWorker {
             ],
           };
           if (this.appendSystemSupported) {
-            const resumeSystem = [
-              effectiveSystem,
-              this.options.resumeSystemHistorySeed,
-            ]
-              .filter(Boolean)
-              .join("\n\n");
+            const appendParts: string[] = [];
+            if (this.appendClientSystemPrompt && effectiveSystem) {
+              appendParts.push(effectiveSystem);
+            }
+            if (this.options.resumeSystemHistorySeed) {
+              appendParts.push(this.options.resumeSystemHistorySeed);
+            }
+            const resumeSystem = appendParts.filter(Boolean).join("\n\n");
             if (resumeSystem) {
               resumeParams._meta = {
                 antigravity: {
@@ -850,12 +859,14 @@ export class AgySessionWorker {
         };
 
         if (this.appendSystemSupported) {
-          const newSessionSystem = [
-            effectiveSystem,
-            this.options.systemHistorySeed,
-          ]
-            .filter(Boolean)
-            .join("\n\n");
+          const appendParts: string[] = [];
+          if (this.appendClientSystemPrompt && effectiveSystem) {
+            appendParts.push(effectiveSystem);
+          }
+          if (this.options.systemHistorySeed) {
+            appendParts.push(this.options.systemHistorySeed);
+          }
+          const newSessionSystem = appendParts.filter(Boolean).join("\n\n");
           if (newSessionSystem) {
             newParams._meta = {
               antigravity: {
@@ -1283,7 +1294,10 @@ export class AgySessionWorker {
         // Nothing asked for the rewording to be off: a turned-away line here is
         // the likeliest explanation, and cloaking that still met a `429` failed at
         // it. Both answer `400`, which stops the next account from being asked.
-        if (turnsAway(this.systemPrompt)) {
+        const turns = this.appendClientSystemPrompt
+          ? turnsAway(this.systemPrompt)
+          : userTurnsAway(this.systemPrompt);
+        if (turns) {
           return {
             type: "error",
             status: 400,
